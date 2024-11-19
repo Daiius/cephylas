@@ -114,14 +114,22 @@ impl FromStr for CpuInfo {
     }
 }
 
-fn parse_next_token(tokens: &mut dyn Iterator<Item=&str>, name: &str) -> Result<i64, ParseCpuInfoError> {
+fn parse_next_token(
+    tokens: &mut dyn Iterator<Item=&str>, 
+    name: &str
+) -> Result<i64, ParseCpuInfoError> {
     let token = tokens
         .next()
-        .ok_or_else(|| ParseCpuInfoError::EntryNotFound(name.to_string()))?;
+        .ok_or_else(
+            || ParseCpuInfoError::EntryNotFound(name.to_string())
+        )?;
     parse_cpu_entry(name, token)
 }
 
-fn parse_next_token_optional(tokens: &mut dyn Iterator<Item=&str>, name: &str) -> Result<Option<i64>, ParseCpuInfoError> {
+fn parse_next_token_optional(
+    tokens: &mut dyn Iterator<Item=&str>, 
+    name: &str
+) -> Result<Option<i64>, ParseCpuInfoError> {
     tokens
         .next()
         .map(|t| parse_cpu_entry(name, t))
@@ -147,7 +155,7 @@ fn get_cpu_info() -> Result<CpuInfo, ParseCpuInfoError> {
     cpu_line.parse()
 }
 
-fn main() -> Result<()> {
+fn main() -> std::io::Result<()> {
     println!("Hello, world!");
 
     let mut thread_handles: Vec<std::thread::JoinHandle<()>> = vec!();
