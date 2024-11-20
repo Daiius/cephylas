@@ -66,7 +66,7 @@ fn main() -> Result<(), ApplicationError> {
     let diff_cpu = cpu_info_second - cpu_info_first;
     println!("cpu usage: {}%", cpu_info::calc_cpu_usage(&diff_cpu));
     let diff_net = net_info_second - net_info_first;
-    println!("net usage: RX {} bytes/s, TX {} bytes/s", diff_net.rx_bytes, diff_net.tx_bytes);
+    println!("net usage: RX {} bytes/s, TX {} bytes/s", diff_net.rx.bytes, diff_net.tx.bytes);
 
     Ok(())
 }
