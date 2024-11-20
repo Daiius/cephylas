@@ -1,17 +1,22 @@
 use std::thread;
 
+use mem_info::get_mem_info;
+
 mod cpu_info;
 mod net_info;
+mod mem_info;
 
 enum ApplicationError {
     CpuInfoError(cpu_info::CpuInfoError),
     NetInfoError(net_info::NetInfoError),
+    MemInfoError(mem_info::MemInfoError),
 }
 impl std::fmt::Display for ApplicationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ApplicationError::CpuInfoError(e) => write!(f, "CpuInfoError, {}", e),
             ApplicationError::NetInfoError(e) => write!(f, "NetInfoError, {}", e),
+            ApplicationError::MemInfoError(e) => write!(f, "MemInfoError, {}", e),
         }
     }
 }
@@ -29,6 +34,11 @@ impl From<cpu_info::CpuInfoError> for ApplicationError {
 impl From<net_info::NetInfoError> for ApplicationError {
     fn from(value: net_info::NetInfoError) -> Self {
         ApplicationError::NetInfoError(value)
+    }
+}
+impl From<mem_info::MemInfoError> for ApplicationError {
+    fn from(value: mem_info::MemInfoError) -> Self {
+        ApplicationError::MemInfoError(value)
     }
 }
 
@@ -64,9 +74,24 @@ fn main() -> Result<(), ApplicationError> {
     let net_info_second = net_info::get_net_info("eth0")?;
 
     let diff_cpu = cpu_info_second - cpu_info_first;
-    println!("cpu usage: {}%", cpu_info::calc_cpu_usage(&diff_cpu));
+    println!(
+        "cpu usage: {}%", 
+        cpu_info::calc_cpu_usage(&diff_cpu)
+    );
     let diff_net = net_info_second - net_info_first;
-    println!("net usage: RX {} bytes/s, TX {} bytes/s", diff_net.rx.bytes, diff_net.tx.bytes);
+    println!(
+        "net usage: RX {} bytes/s, TX {} bytes/s", 
+        diff_net.rx.bytes, 
+        diff_net.tx.bytes
+    );
+
+    let mem_info = get_mem_info()?;
+    println!(
+        "mem usage: total {} kB, free {} kB, available {} kB", 
+        mem_info.total, 
+        mem_info.free, 
+        mem_info.available
+    );
 
     Ok(())
 }
