@@ -77,8 +77,8 @@ impl std::fmt::Debug for CpuInfoError {
 impl std::error::Error for CpuInfoError {}
 
 fn parse_cpu_entry(name: &str, token: &str) -> Result<i64, CpuInfoError> {
-    token.parse() .map_err(|e| 
-        CpuInfoError::InvalidEntry(name.to_string(), e)
+    token.parse().map_err(
+        |e| CpuInfoError::InvalidEntry(name.to_string(), e)
     )
 }
 
@@ -122,22 +122,17 @@ impl std::str::FromStr for CpuInfo {
             ); 
         }
 
-        let user   = parse_next_token(&mut tokens, "user")?;       
-        let system = parse_next_token(&mut tokens, "system")?;
-        let nice   = parse_next_token(&mut tokens, "nice")?;
-        let idle   = parse_next_token(&mut tokens, "idle")?;
-
-        let iowait  = parse_next_token_optional(&mut tokens, "iowait")?;
-        let irq     = parse_next_token_optional(&mut tokens, "irq")?;
-        let softirq = parse_next_token_optional(&mut tokens, "softirq")?;
-        let steal      = parse_next_token_optional(&mut tokens, "steal")?;
-        let guest      = parse_next_token_optional(&mut tokens, "guest")?;
-        let guest_nice = parse_next_token_optional(&mut tokens, "guest_nice")?;
-
         Ok(CpuInfo { 
-            user, system, nice, idle,
-            iowait, irq, softirq, 
-            steal, guest, guest_nice,
+            user:       parse_next_token(&mut tokens, "user")?,
+            system:     parse_next_token(&mut tokens, "system")?,
+            nice:       parse_next_token(&mut tokens, "nice")?,
+            idle:       parse_next_token(&mut tokens, "idle")?,
+            iowait:     parse_next_token_optional(&mut tokens, "iowait")?,
+            irq:        parse_next_token_optional(&mut tokens, "irq")?, 
+            softirq:    parse_next_token_optional(&mut tokens, "softirq")?, 
+            steal:      parse_next_token_optional(&mut tokens, "steal")?, 
+            guest:      parse_next_token_optional(&mut tokens, "guest")?, 
+            guest_nice: parse_next_token_optional(&mut tokens, "guest_nice")?,
         })
     }
 }

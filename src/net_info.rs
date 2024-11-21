@@ -62,7 +62,7 @@ impl std::ops::Sub for NetTxInfo {
             fifo:       self.fifo - rhs.fifo,
             colls:      self.colls - rhs.colls,
             compressed: self.compressed - rhs.compressed,
-            carrier:  self.carrier - rhs.carrier,
+            carrier:    self.carrier - rhs.carrier,
         }
     }
 }
@@ -105,88 +105,43 @@ impl std::fmt::Debug for NetInfoError {
     }
 }
 
+fn parse_token(
+    tokens: &mut dyn Iterator<Item=&str>,
+    entry_name: &str
+) -> Result<i64, NetInfoError> {
+    tokens.next()
+        .ok_or(NetInfoError::EntryNotFound(entry_name.to_string()))?
+        .parse()
+        .map_err(|e| NetInfoError::InvalidEntry(entry_name.to_string(), e))
+}
+
 impl std::str::FromStr for NetInfo {
     type Err = NetInfoError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut tokens = s.split_ascii_whitespace();
         // omit first token (net device name)
         tokens.next();
-        let rx_bytes: i64 = tokens.next()
-            .ok_or_else(|| NetInfoError::EntryNotFound("rx_bytes".to_string()))?
-            .parse()
-            .map_err(|e| NetInfoError::InvalidEntry("rx_bytes".to_string(), e))?;
-        let rx_packets: i64 = tokens.next()
-            .ok_or_else(|| NetInfoError::EntryNotFound("rx_packets".to_string()))?
-            .parse()
-            .map_err(|e| NetInfoError::InvalidEntry("rx_packets".to_string(), e))?;
-        let rx_errs: i64 = tokens.next()
-            .ok_or_else(|| NetInfoError::EntryNotFound("rx_errs".to_string()))?
-            .parse()
-            .map_err(|e| NetInfoError::InvalidEntry("rx_errs".to_string(), e))?;
-        let rx_drop: i64 = tokens.next()
-            .ok_or_else(|| NetInfoError::EntryNotFound("rx_drop".to_string()))?
-            .parse()
-            .map_err(|e| NetInfoError::InvalidEntry("rx_drop".to_string(), e))?;
-        let rx_fifo: i64 = tokens.next()
-            .ok_or_else(|| NetInfoError::EntryNotFound("rx_fifo".to_string()))?
-            .parse()
-            .map_err(|e| NetInfoError::InvalidEntry("rx_fifo".to_string(), e))?;
-        let rx_frame: i64 = tokens.next()
-            .ok_or_else(|| NetInfoError::EntryNotFound("rx_frame".to_string()))?
-            .parse()
-            .map_err(|e| NetInfoError::InvalidEntry("rx_frame".to_string(), e))?;
-        let rx_compressed: i64 = tokens.next()
-            .ok_or_else(|| NetInfoError::EntryNotFound("rx_compressed".to_string()))?
-            .parse()
-            .map_err(|e| NetInfoError::InvalidEntry("rx_compressed".to_string(), e))?;
-        let rx_multicast: i64 = tokens.next()
-            .ok_or_else(|| NetInfoError::EntryNotFound("rx_multicast".to_string()))?
-            .parse()
-            .map_err(|e| NetInfoError::InvalidEntry("rx_multicast".to_string(), e))?;
-
-        let tx_bytes: i64 = tokens.next()
-            .ok_or_else(|| NetInfoError::EntryNotFound("tx_bytes".to_string()))?
-            .parse()
-            .map_err(|e| NetInfoError::InvalidEntry("tx_bytes".to_string(), e))?;
-        let tx_packets: i64 = tokens.next()
-            .ok_or_else(|| NetInfoError::EntryNotFound("tx_packets".to_string()))?
-            .parse()
-            .map_err(|e| NetInfoError::InvalidEntry("tx_packets".to_string(), e))?;
-        let tx_errs: i64 = tokens.next()
-            .ok_or_else(|| NetInfoError::EntryNotFound("tx_errs".to_string()))?
-            .parse()
-            .map_err(|e| NetInfoError::InvalidEntry("tx_errs".to_string(), e))?;
-        let tx_drop: i64 = tokens.next()
-            .ok_or_else(|| NetInfoError::EntryNotFound("tx_drop".to_string()))?
-            .parse()
-            .map_err(|e| NetInfoError::InvalidEntry("tx_drop".to_string(), e))?;
-        let tx_fifo: i64 = tokens.next()
-            .ok_or_else(|| NetInfoError::EntryNotFound("tx_fifo".to_string()))?
-            .parse()
-            .map_err(|e| NetInfoError::InvalidEntry("tx_fifo".to_string(), e))?;
-        let tx_colls: i64 = tokens.next()
-            .ok_or_else(|| NetInfoError::EntryNotFound("tx_colls".to_string()))?
-            .parse()
-            .map_err(|e| NetInfoError::InvalidEntry("tx_colls".to_string(), e))?;
-        let tx_carrier: i64 = tokens.next()
-            .ok_or_else(|| NetInfoError::EntryNotFound("tx_carrier".to_string()))?
-            .parse()
-            .map_err(|e| NetInfoError::InvalidEntry("tx_carrier".to_string(), e))?;
-        let tx_compressed: i64 = tokens.next()
-            .ok_or_else(|| NetInfoError::EntryNotFound("tx_compressed".to_string()))?
-            .parse()
-            .map_err(|e| NetInfoError::InvalidEntry("tx_compressed".to_string(), e))?;
 
         Ok(NetInfo { 
             rx: NetRxInfo {
-                bytes: rx_bytes, packets: rx_packets, 
-                errs: rx_errs, drop: rx_drop, fifo: rx_fifo, frame: rx_frame, 
-                compressed: rx_compressed, multicast: rx_multicast
+                bytes:      parse_token(&mut tokens, "rx_bytes")?, 
+                packets:    parse_token(&mut tokens, "rx_packets")?, 
+                errs:       parse_token(&mut tokens, "rx_errs")?, 
+                drop:       parse_token(&mut tokens, "rx_drop")?,
+                fifo:       parse_token(&mut tokens, "rx_fifo")?,
+                frame:      parse_token(&mut tokens, "rx_frame")?, 
+                compressed: parse_token(&mut tokens, "rx_compressed")?,
+                multicast:  parse_token(&mut tokens, "rx_multicast")?,
             },
             tx: NetTxInfo {
-                bytes: tx_bytes, packets: tx_packets,
-                errs: tx_errs, drop: tx_drop, fifo: tx_fifo, colls: tx_colls,
-                carrier: tx_carrier, compressed: tx_compressed,
+                bytes:      parse_token(&mut tokens, "tx_bytes")?,
+                packets:    parse_token(&mut tokens, "tx_packets")?,
+                errs:       parse_token(&mut tokens, "tx_errs")?,
+                drop:       parse_token(&mut tokens, "tx_drop")?,
+                fifo:       parse_token(&mut tokens, "tx_fifo")?,
+                colls:      parse_token(&mut tokens, "tx_colls")?,
+                carrier:    parse_token(&mut tokens, "tx_carrier")?,
+                compressed: parse_token(&mut tokens, "tx_compressed")?,
             },
         })
     }
@@ -202,9 +157,7 @@ pub fn get_net_info(dev_name: &str) -> Result<NetInfo, NetInfoError> {
     let dev_line = contents
         .lines()
         .find(|l| l.contains(dev_name))
-        .ok_or_else(
-            || NetInfoError::EntryNotFound(dev_name.to_string())
-        )?;
+        .ok_or(NetInfoError::EntryNotFound(dev_name.to_string()))?;
 
     dev_line.parse()
 }
