@@ -113,9 +113,7 @@ impl std::str::FromStr for CpuInfo {
         let mut tokens = s.split_ascii_whitespace();
         let cpu = tokens
             .next()
-            .ok_or_else(
-                || CpuInfoError::EntryNotFound("cpu".to_string())
-            )?;
+            .ok_or(CpuInfoError::EntryNotFound("cpu".to_string()))?;
         if cpu != "cpu" { 
             return Err(
                 CpuInfoError::EntryNotFound(String::from("cpu"))
@@ -143,9 +141,7 @@ fn parse_next_token(
 ) -> Result<i64, CpuInfoError> {
     let token = tokens
         .next()
-        .ok_or_else(
-            || CpuInfoError::EntryNotFound(name.to_string())
-        )?;
+        .ok_or(CpuInfoError::EntryNotFound(name.to_string()))?;
     parse_cpu_entry(name, token)
 }
 
@@ -169,9 +165,7 @@ pub fn get_cpu_info() -> Result<CpuInfo, CpuInfoError> {
     let cpu_line = contents
         .lines()
         .find(|l| l.contains("cpu"))
-        .ok_or_else(
-            || CpuInfoError::EntryNotFound("cpu line".to_string())
-        )?;
+        .ok_or(CpuInfoError::EntryNotFound("cpu line".to_string()))?;
 
     cpu_line.parse()
 }
