@@ -4,7 +4,7 @@ pub enum MemInfoError {
     EntryNotFound(String),
     InvalidEntry(String, std::num::ParseIntError),
 }
-
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct MemInfo {
     pub total:       u64,
@@ -15,6 +15,16 @@ pub struct MemInfo {
     pub swap_cached: u64,
     pub active:      u64, // since Linux 2.6.28
     pub inactive:    u64, // since Linux 2.6.28
+    pub active_anon:  u64,
+    pub inactive_anon: u64,
+    pub active_file: u64,
+    pub inactive_file: u64,
+    pub unevictable: u64,
+    pub mlocked: u64,
+    pub swap_total: u64,
+    pub swap_free: u64,
+    pub dirty: u64,
+    pub writeback: u64,
     // TODO more memory infomation in /proc/meminfo
 }
 
@@ -50,18 +60,26 @@ impl std::str::FromStr for MemInfo {
     type Err = MemInfoError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut lines = s.lines();
-        let total = parse_line(&mut lines, "MemTotal:")?;
-        let free = parse_line(&mut lines, "MemFree:")?;
-        let available = parse_line(&mut lines, "MemAvailable:")?;
-        let buffers = parse_line(&mut lines, "Buffers:")?;
-        let cached = parse_line(&mut lines, "Cached:")?;
-        let swap_cached = parse_line(&mut lines, "SwapCached:")?;
-        let active = parse_line(&mut lines, "Active:")?;
-        let inactive = parse_line(&mut lines, "Inactive:")?;
 
         Ok(MemInfo {
-            total, free, available, buffers, cached, swap_cached,
-            active, inactive,
+            total:         parse_line(&mut lines, "MemTotal:")?, 
+            free:          parse_line(&mut lines, "MemFree:")?, 
+            available:     parse_line(&mut lines, "MemAvailable:")?, 
+            buffers:       parse_line(&mut lines, "Buffers:")?, 
+            cached:        parse_line(&mut lines, "Cached:")?,
+            swap_cached:   parse_line(&mut lines, "SwapCached:")?,
+            active:        parse_line(&mut lines, "Active:")?,
+            inactive:      parse_line(&mut lines, "Inactive:")?,
+            active_anon:   parse_line(&mut lines, "Active(anon):")?, 
+            inactive_anon: parse_line(&mut lines, "Inactive(anon):")?, 
+            active_file:   parse_line(&mut lines, "Active(file):")?, 
+            inactive_file: parse_line(&mut lines, "Inactive(file):")?,
+            unevictable:   parse_line(&mut lines, "Unevictable:")?, 
+            mlocked:       parse_line(&mut lines, "Mlocked:")?, 
+            swap_total:    parse_line(&mut lines, "SwapTotal:")?, 
+            swap_free:     parse_line(&mut lines, "SwapFree:")?,
+            dirty:         parse_line(&mut lines, "Dirty:")?, 
+            writeback:     parse_line(&mut lines, "Writeback:")?,
         })
     }
 }
