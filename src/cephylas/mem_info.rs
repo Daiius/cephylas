@@ -59,36 +59,37 @@ impl std::fmt::Debug for MemInfoError {
 impl std::str::FromStr for MemInfo {
     type Err = MemInfoError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut lines = s.lines();
+        let lines: Vec<&str> = s.lines().collect();
 
         Ok(MemInfo {
-            total:         parse_line(&mut lines, "MemTotal:")?, 
-            free:          parse_line(&mut lines, "MemFree:")?, 
-            available:     parse_line(&mut lines, "MemAvailable:")?, 
-            buffers:       parse_line(&mut lines, "Buffers:")?, 
-            cached:        parse_line(&mut lines, "Cached:")?,
-            swap_cached:   parse_line(&mut lines, "SwapCached:")?,
-            active:        parse_line(&mut lines, "Active:")?,
-            inactive:      parse_line(&mut lines, "Inactive:")?,
-            active_anon:   parse_line(&mut lines, "Active(anon):")?, 
-            inactive_anon: parse_line(&mut lines, "Inactive(anon):")?, 
-            active_file:   parse_line(&mut lines, "Active(file):")?, 
-            inactive_file: parse_line(&mut lines, "Inactive(file):")?,
-            unevictable:   parse_line(&mut lines, "Unevictable:")?, 
-            mlocked:       parse_line(&mut lines, "Mlocked:")?, 
-            swap_total:    parse_line(&mut lines, "SwapTotal:")?, 
-            swap_free:     parse_line(&mut lines, "SwapFree:")?,
-            dirty:         parse_line(&mut lines, "Dirty:")?, 
-            writeback:     parse_line(&mut lines, "Writeback:")?,
+            total:         parse_line(&lines, "MemTotal:")?, 
+            free:          parse_line(&lines, "MemFree:")?, 
+            available:     parse_line(&lines, "MemAvailable:")?, 
+            buffers:       parse_line(&lines, "Buffers:")?, 
+            cached:        parse_line(&lines, "Cached:")?,
+            swap_cached:   parse_line(&lines, "SwapCached:")?,
+            active:        parse_line(&lines, "Active:")?,
+            inactive:      parse_line(&lines, "Inactive:")?,
+            active_anon:   parse_line(&lines, "Active(anon):")?, 
+            inactive_anon: parse_line(&lines, "Inactive(anon):")?, 
+            active_file:   parse_line(&lines, "Active(file):")?, 
+            inactive_file: parse_line(&lines, "Inactive(file):")?,
+            unevictable:   parse_line(&lines, "Unevictable:")?, 
+            mlocked:       parse_line(&lines, "Mlocked:")?, 
+            swap_total:    parse_line(&lines, "SwapTotal:")?, 
+            swap_free:     parse_line(&lines, "SwapFree:")?,
+            dirty:         parse_line(&lines, "Dirty:")?, 
+            writeback:     parse_line(&lines, "Writeback:")?,
         })
     }
 }
 
 fn parse_line(
-    lines: &mut std::str::Lines<'_>, 
+    lines: &Vec<&str>, 
     signature: &str
 ) -> Result<u64, MemInfoError> {
-    let line = lines.next()
+    let line = lines.iter()
+        .find(|l| l.starts_with(signature))
         .ok_or(MemInfoError::EntryNotFound(signature.to_string()))?;
     let mut tokens = line.split_ascii_whitespace();
 
@@ -102,7 +103,6 @@ fn parse_line(
         .ok_or(MemInfoError::EntryNotFound(signature.to_string()))?
         .parse()
         .map_err(|e| MemInfoError::InvalidEntry(signature.to_string(), e))
-
 }
 
 pub fn get_mem_info() -> Result<MemInfo, MemInfoError> {
