@@ -155,8 +155,8 @@ fn parse_next_token_optional(
         .transpose()
 }
 
-pub fn get_cpu_info() -> Result<CpuInfo, CpuInfoError> {
-    let mut file = std::fs::File::open("/proc/stat")
+pub fn get_cpu_info(host_proc: &str) -> Result<CpuInfo, CpuInfoError> {
+    let mut file = std::fs::File::open(host_proc.to_string() + "/stat")
         .map_err(CpuInfoError::IOError)?;
     let mut contents: String = String::new();
     std::io::Read::read_to_string(&mut file, &mut contents)

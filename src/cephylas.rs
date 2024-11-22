@@ -50,14 +50,18 @@ impl From<disk_info::DiskInfoError> for ApplicationError {
    }
 }
 
-pub fn get_info() -> Result<(), ApplicationError> {
-    let cpu_info_first = cpu_info::get_cpu_info()?;
-    let net_info_first = net_info::get_net_info("eth0")?;
-    let disk_info_first = disk_info::get_disk_info("sdb")?;
+pub fn get_info(
+    net_name: &str,
+    disk_name: &str,
+    host_proc: &str,
+) -> Result<(), ApplicationError> {
+    let cpu_info_first = cpu_info::get_cpu_info(host_proc)?;
+    let net_info_first = net_info::get_net_info(net_name, host_proc)?;
+    let disk_info_first = disk_info::get_disk_info(disk_name, host_proc)?;
     std::thread::sleep(std::time::Duration::from_secs(1));
-    let cpu_info_second = cpu_info::get_cpu_info()?;
-    let net_info_second = net_info::get_net_info("eth0")?;
-    let disk_info_second = disk_info::get_disk_info("sdb")?;
+    let cpu_info_second = cpu_info::get_cpu_info(host_proc)?;
+    let net_info_second = net_info::get_net_info(net_name, host_proc)?;
+    let disk_info_second = disk_info::get_disk_info(disk_name, host_proc)?;
 
     let diff_cpu = cpu_info_second - cpu_info_first;
     println!(
@@ -79,10 +83,9 @@ pub fn get_info() -> Result<(), ApplicationError> {
 
     let mem_info = mem_info::get_mem_info()?;
     println!(
-        "mem usage: total {} kB, free {} kB, available {} kB", 
-        mem_info.total, 
-        mem_info.free, 
-        mem_info.available
+        "mem usage: {}/{} kB, swap: {}/{} kB", 
+        mem_info.total - mem_info.free, mem_info.total, 
+        mem_info.swap_total - mem_info.swap_free, mem_info.swap_total
     );
 
     Ok(())
