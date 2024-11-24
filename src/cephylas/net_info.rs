@@ -23,7 +23,7 @@ pub struct NetRxInfo {
     pub multicast:  i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct NetTxInfo {
     pub bytes:      i64,
     pub packets:    i64,

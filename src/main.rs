@@ -24,6 +24,9 @@ fn run_threads(n: u8) {
 
 fn main() -> Result<(), cephylas::ApplicationError> {
     println!("Hello, world!");
+
+    let now = std::time::SystemTime::now();
+    println!("time: {:?}", now);
     //run_threads(4);
  
     let net_name = std::env::var("NET_NAME")
