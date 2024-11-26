@@ -5,6 +5,7 @@ mod mem_info;
 mod disk_info;
 mod watch;
 mod log;
+pub mod time;
 
 use json;
 
@@ -13,7 +14,7 @@ pub enum ApplicationError {
     NetInfoError(net_info::NetInfoError),
     MemInfoError(mem_info::MemInfoError),
     DiskInfoError(disk_info::DiskInfoError),
-    SyncError,
+    TimeError(time::TimeError),
 }
 impl std::fmt::Display for ApplicationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -26,8 +27,8 @@ impl std::fmt::Display for ApplicationError {
                 write!(f, "MemInfoError, {}", e),
             ApplicationError::DiskInfoError(e) =>
                 write!(f, "DiskInfoError, {}", e),
-            ApplicationError::SyncError =>
-                write!(f, "SyncTimeError"),
+            ApplicationError::TimeError(e) =>
+                write!(f, "TimeError, {}", e),
         }
     }
 }
@@ -55,6 +56,11 @@ impl From<disk_info::DiskInfoError> for ApplicationError {
    fn from(value: disk_info::DiskInfoError) -> Self {
        ApplicationError::DiskInfoError(value)
    }
+}
+impl From<time::TimeError> for ApplicationError {
+    fn from(value: time::TimeError) -> Self {
+        ApplicationError::TimeError(value)
+    }
 }
 
 pub struct ResourceInfo {

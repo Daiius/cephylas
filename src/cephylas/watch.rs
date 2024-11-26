@@ -1,5 +1,6 @@
 
 use super::log;
+use super::time;
 
 const INITIAL_WAIT_MILLIS: u128 = 1000;
 
@@ -139,19 +140,34 @@ fn get_last_timing(
         Some(line) => {
             let data = json::parse(line)
                 .map_err(WatchError::JsonError)?;
-            //let timing: std::time::SystemTime = data["time"]
-            //    .to_string()
-            //    .parse()?;
-            Ok(None)
+            let timing = time::parse_time(
+                &data["time"].to_string()
+            ).expect("failed to convert time string to system time");
+            Ok(Some(timing))
         },
         None => Ok(None),
     }
 }
 
+#[allow(unreachable_code)]
 pub fn start(
     durations: &DurationSettings
 ) -> Result<(), WatchError> {
     let mut timings = sync(durations)?;
+
+    loop {
+
+        log::log_daily();
+
+        let wait_millis = 
+            timings.daily
+            - std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap()
+                .as_millis();
+        std::thread::sleep(
+            std::time::Duration::from_millis(wait_millis as u64)
+        );
+    }
 
     Ok(())
 }

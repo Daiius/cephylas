@@ -1,5 +1,6 @@
 
 use json;
+use super::time;
 
 pub enum LogError {
     IOError(std::io::Error),
@@ -13,7 +14,9 @@ pub fn format_log(
     let mut errors = json::JsonValue::new_array();
     let json_error_message =
         "unexpected error at adding a string to json array";
-    data["time"] = format!("{:?}", info.timestamp).into();
+    data["time"] = time::format_time(&info.timestamp)
+        .expect("failed to convert SystemTime to String")
+        .into();
     match info.cpu_info {
         Ok(ref cpu) =>
             data["cpu"] = json_cpu(cpu),

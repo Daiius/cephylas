@@ -27,6 +27,16 @@ fn main() -> Result<(), cephylas::ApplicationError> {
 
     let now = std::time::SystemTime::now();
     println!("time: {:?}", now);
+
+    let formatted_time = 
+        cephylas::time::format_time(&now)?;
+    println!("formatted time: {}", formatted_time);
+    let conversion_back = 
+        cephylas::time::parse_time(&formatted_time)?;
+    let formatted_again = 
+        cephylas::time::format_time(&conversion_back)?;
+    println!("formatted again: {}", formatted_again);
+    
     //run_threads(4);
  
     let net_name = std::env::var("NET_NAME")
