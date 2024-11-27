@@ -28,3 +28,41 @@ sequenceDiagram
     app  ->> worker : stop
     deactivate worker
 ```
+
+## Log summarization
+```mermaid
+sequenceDiagram
+    participant app as cephylas<br/>application
+    participant daily
+    participant daily.1
+    participant weekly
+    participant weekly.1
+    participant monthly
+    participant monthly.1
+
+    app ->> daily : add log<br/>@daily unit time
+
+    opt every weekly unit time
+        daily ->> app: read latest<br/> ?? data length
+        app ->> weekly : summarize and add
+    end
+
+    opt every monthly unit time
+        weekly ->> app: read latest<br/> ?? data
+        app ->> monthly: summarize and add
+    end
+
+    opt every 00:00
+        daily -->> daily.1 : rename
+        app ->> daily.1 : delete old daily log
+    end
+
+    opt every Monday 00:00
+        weekly -->> weekly.1 : rename
+    end
+
+    opt every 1st
+        monthly -->> monthly.1 : rename
+    end
+```
+

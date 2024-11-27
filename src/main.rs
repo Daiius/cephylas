@@ -24,6 +24,19 @@ fn run_threads(n: u8) {
 
 fn main() -> Result<(), cephylas::ApplicationError> {
     println!("Hello, world!");
+
+    let now = std::time::SystemTime::now();
+    println!("time: {:?}", now);
+
+    let formatted_time = 
+        cephylas::time::format_time(&now)?;
+    println!("formatted time: {}", formatted_time);
+    let conversion_back = 
+        cephylas::time::parse_time(&formatted_time)?;
+    let formatted_again = 
+        cephylas::time::format_time(&conversion_back)?;
+    println!("formatted again: {}", formatted_again);
+    
     //run_threads(4);
  
     let net_name = std::env::var("NET_NAME")
@@ -36,20 +49,9 @@ fn main() -> Result<(), cephylas::ApplicationError> {
             println!("environment variable DISK_NAME not found.");
             "sdb".to_string()
         });
-    let host_proc = std::env::var("HOST_PROC")
-        .unwrap_or_else(|_| {
-            println!("environment variable HOST_PROC not found.");
-            "/proc".to_string()
-        });
 
-    loop {
-        print!("{}[2J", 27 as char);
-        cephylas::get_info(
-            &net_name,
-            &disk_name,
-            &host_proc,
-        )?;
-    }
+    cephylas::start_watch(&net_name, &disk_name)?;
+
 
     Ok(())
 }

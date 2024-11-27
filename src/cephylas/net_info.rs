@@ -23,7 +23,7 @@ pub struct NetRxInfo {
     pub multicast:  i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct NetTxInfo {
     pub bytes:      i64,
     pub packets:    i64,
@@ -149,9 +149,8 @@ impl std::str::FromStr for NetInfo {
 
 pub fn get_net_info(
     dev_name: &str,
-    host_proc: &str,
 ) -> Result<NetInfo, NetInfoError> {
-    let mut file = std::fs::File::open(host_proc.to_string() + "/net/dev")
+    let mut file = std::fs::File::open("/proc/net/dev")
         .map_err(NetInfoError::IOError)?;
     let mut contents = String::new();
     std::io::Read::read_to_string(&mut file, &mut contents)

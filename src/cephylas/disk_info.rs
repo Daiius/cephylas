@@ -158,9 +158,8 @@ fn parse_token(
 
 pub fn get_disk_info(
     disk_name: &str,
-    host_proc: &str,
 ) -> Result<DiskInfo, DiskInfoError> {
-    let mut file = std::fs::File::open(host_proc.to_string() + "/diskstats")
+    let mut file = std::fs::File::open("/proc/diskstats")
         .map_err(DiskInfoError::IOError)?;
     let mut contents = String::new();
     std::io::Read::read_to_string(&mut file, &mut contents)

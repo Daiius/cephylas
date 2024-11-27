@@ -2,3 +2,7 @@
 name = "cephylas"
 version = "0.1.0"
 edition = "2021"
+
+[dependencies]
+json = "0.12.4"
+libc = "0.2.164"
