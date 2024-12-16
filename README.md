@@ -8,6 +8,36 @@ Cephylas comes from "cephonodes hylas", a kind of moth with clear wings.
 ```mermaid
 sequenceDiagram
     actor user
+    participant cephylas
+    box cephylas/* 
+        participant watch
+        participant log
+        participant time
+
+    end
+    participant ./daily
+    participant ./weekly
+
+    user ->> cephylas : start with config
+    cephylas ->> watch : watch(config: &Config)
+    loop every daily unit time
+        watch ->> log : log_daily()
+        log ->> time : format_time(&time)<br/>using libc crate
+        time -->> log : (time string)
+        log ->> ./daily : json line log<br/>using json crate
+        opt every weekly unit time
+            watch ->> log : log_weekly()
+            log ->> ./daily : read data to summarize
+            ./daily -->> log : 
+            log ->> ./weekly : write summarized data
+        end
+    end
+```
+
+
+```mermaid
+sequenceDiagram
+    actor user
     participant app as cephylas<br/>application
     participant worker as cephylas<br/>worker
     participant os as Linux

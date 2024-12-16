@@ -120,13 +120,17 @@ pub fn get_info(
     }
 }
 
+pub use watch::DurationSettings;
+pub use log::OutputSettings;
+
 pub struct Settings {
     pub durations: watch::DurationSettings,
     pub targets: TargetSettings,
+    pub outputs: log::OutputSettings,
 }
 pub struct TargetSettings {
     pub disk_name: String,
-    pub net_dev_name: String,
+    pub net_name: String,
 }
 
 

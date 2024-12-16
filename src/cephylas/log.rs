@@ -6,6 +6,9 @@ pub enum LogError {
     IOError(std::io::Error),
     JsonError(json::JsonError),
 }
+pub struct OutputSettings {
+    pub device: dyn std::io::Write,
+}
 
 pub fn format_log(
     info: &super::ResourceInfo,
@@ -106,16 +109,20 @@ fn json_net(
 
 pub fn log_daily(
     path: &str,
-    info: &super::ResourceInfo
+    settings: &OutputSettings,
+    info: &super::ResourceInfo,
 ) -> Result<(), LogError> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true).create(true).append(true)
-        .open(path)
+    //let mut file = std::fs::OpenOptions::new()
+    //    .write(true).create(true).append(true)
+    //    .open(path)
+    //    .map_err(LogError::IOError)?;
+    //std::io::Write::write(
+    //    &mut file, 
+    //    format_log(&info).as_bytes()
+    //).map_err(LogError::IOError)?;
+
+    settings.device.write(format_log(&info).as_bytes())
         .map_err(LogError::IOError)?;
-    std::io::Write::write(
-        &mut file, 
-        format_log(&info).as_bytes()
-    ).map_err(LogError::IOError)?;
 
     Ok(())
 }
