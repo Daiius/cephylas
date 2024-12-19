@@ -121,8 +121,8 @@ pub fn log_daily(
     //    format_log(&info).as_bytes()
     //).map_err(LogError::IOError)?;
 
-    settings.device.write(format_log(&info).as_bytes())
-        .map_err(LogError::IOError)?;
+    //settings.device.write(format_log(&info).as_bytes())
+    //    .map_err(LogError::IOError)?;
 
     Ok(())
 }

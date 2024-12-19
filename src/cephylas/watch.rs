@@ -157,7 +157,7 @@ pub fn start(
 
     loop {
 
-        log::log_daily();
+        //log::log_daily();
 
         let wait_millis = 
             timings.daily
