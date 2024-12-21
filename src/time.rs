@@ -3,29 +3,22 @@ use libc;
 
 const TIME_FORMAT: &[u8] = b"%Y-%m-%d %H:%M:%S\0";
 
+#[derive(Debug)]
 pub enum TimeError {
     SystemTimeError(std::time::SystemTimeError),
     FormatError(std::ffi::FromBytesWithNulError),
     ConversionError,
     NullError(std::ffi::NulError),
 }
+impl std::error::Error for TimeError {}
 impl std::fmt::Display for TimeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TimeError::SystemTimeError(e) =>
-                write!(f, "SystemTimeError, {}", e),
-            TimeError::FormatError(e) =>
-                write!(f, "FormatError, {}", e),
-            TimeError::ConversionError =>
-                write!(f, "failed to convert native <-> rust string data"),
-            TimeError::NullError(e) =>
-                write!(f, "NullError, {}", e),
-        }
+        write!(f, "{:?}", self)
     }
 }
-impl std::fmt::Debug for TimeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self)
+impl From<std::time::SystemTimeError> for TimeError {
+    fn from(value: std::time::SystemTimeError) -> Self {
+        TimeError::SystemTimeError(value)
     }
 }
 
