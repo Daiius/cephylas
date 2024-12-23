@@ -89,37 +89,27 @@ fn reshape_json(
     let total = 
         json["cpu_stats"]["cpu_usage"]["total_usage"]
         .as_u64()
-        .expect("cannot get total usage as u64")
-        / 1_000_000; // ns -> ms
+        .map(|v| v / 1_000_000); // ns -> ms
     let system =
         json["cpu_stats"]["system_cpu_usage"]
         .as_u64()
-        .expect("cannot get kernelmode usage as u64")
-        / 1_000_000; // ns -> ms
+        .map(|v| v / 1_000_000); // ns -> ms
     let number_cpus =
         json["cpu_stats"]["online_cpus"]
-        .as_u32()
-        .expect("cannot get online cpus as u64");
+        .as_u32();
     let used_memory =
-        json["memory_stats"]["usage"]
-        .as_u64()
-        .expect("cannot get memory usage as u64")
-        -
-        json["memory_stats"]["stats"]["cache"]
-        .as_u64()
-        .expect("cannot get cached memory as u64");
+        json["memory_stats"]["usage"].as_u64()
+        .zip(json["memory_stats"]["stats"]["cache"].as_u64())
+        .map(|(a, b)| a - b);
     let available_memory =
         json["memory_stats"]["limit"]
-        .as_u64()
-        .expect("cannot get memory limit as u64");
+        .as_u64();
     let net_rx =
         json["networks"]["eth0"]["rx_bytes"]
-        .as_u64()
-        .expect("cannot get net eth0 rx_bytes as u64");
+        .as_u64();
     let net_tx =
         json["networks"]["eth0"]["tx_bytes"]
-        .as_u64()
-        .expect("cannot get net eth0 tx_bytes as u64");
+        .as_u64();
     let blkio_read =
         json["blkio_stats"]["io_service_bytes_recursive"]
         .members()
@@ -130,10 +120,11 @@ fn reshape_json(
         .members()
         .find(|ref m| m["op"] == "write")
         .and_then(|v| v.as_u64());
-
+    let time = json["read"].as_str();
 
 
     json::object!{
+        time: time, 
         cpu: { 
             total: total, 
             system: system, 
@@ -182,28 +173,46 @@ fn get_now_as_millis() -> Result<u128, std::time::SystemTimeError> {
     Ok(duration.as_millis())
 }
 
-fn calc_cpu_usage(
-    stats: &json::JsonValue,
-    prev_stats: &json::JsonValue,
-) -> Option<f32> {
-    let cpu_delta =
-               stats["cpu"]["total"].as_u64()? 
-        - prev_stats["cpu"]["total"].as_u64()?;
-    let system_cpu_delta = 
-               stats["cpu"]["system"].as_u64()?
-        - prev_stats["cpu"]["system"].as_u64()?;
-    let ncpu = stats["ncpu"].as_u64()?;
+//fn calc_cpu_usage(
+//    stats: &json::JsonValue,
+//    prev_stats: &json::JsonValue,
+//) -> Option<f32> {
+//    let cpu_delta =
+//               stats["cpu"]["total"].as_u64()? 
+//        - prev_stats["cpu"]["total"].as_u64()?;
+//    let system_cpu_delta = 
+//               stats["cpu"]["system"].as_u64()?
+//        - prev_stats["cpu"]["system"].as_u64()?;
+//    let ncpu = stats["ncpu"].as_u64()?;
+//
+//    Some(
+//        (cpu_delta as f32/ system_cpu_delta as f32) 
+//        * (ncpu as f32) 
+//        * 100.0_f32 
+//    )
+//}
 
-    Some(
-        (cpu_delta as f32/ system_cpu_delta as f32) 
-        * (ncpu as f32) 
-        * 100.0_f32 
-    )
+fn log_daily<T: AsRef<std::path::Path>, S: AsRef<str>>(
+    file_path: T,
+    content: S,
+) -> Result<(), error::Error> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .write(true)
+        .open(file_path)?;
+    std::io::Write::write_all(
+        &mut file, 
+        ("".to_string() + content.as_ref() + "\r\n").as_bytes()
+    )?;
+
+    Ok(())
 }
 
 #[allow(unreachable_code)]
 fn main() -> Result<(), error::Error> {
     let socket_path = "/var/run/docker.sock";
+    let daily_log_path = "./log_daily";
 
     let now_as_millis = get_now_as_millis()?;
     let tick = std::time::Duration::from_secs(10);
@@ -219,7 +228,8 @@ fn main() -> Result<(), error::Error> {
         );
 
         let stats = get_containers_stats(&socket_path)?;
-        println!("{}", stats);
+        println!("{}", &stats);
+        log_daily(daily_log_path, &stats.dump())?;
 
         timing += tick.as_millis();
     }
