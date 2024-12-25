@@ -99,8 +99,11 @@ fn reshape_json(
         .as_u32();
     let used_memory =
         json["memory_stats"]["usage"].as_u64()
-        .zip(json["memory_stats"]["stats"]["cache"].as_u64())
-        .map(|(a, b)| a - b);
+        .zip(
+            json["memory_stats"]["stats"]["cache"]
+                .as_u64()
+                .or(Some(0_u64)) // cache entry might not exist
+        ).map(|(a, b)| a - b);
     let available_memory =
         json["memory_stats"]["limit"]
         .as_u64();
@@ -114,12 +117,12 @@ fn reshape_json(
         json["blkio_stats"]["io_service_bytes_recursive"]
         .members()
         .find(|ref m| m["op"] == "read")
-        .and_then(|v| v.as_u64());
+        .and_then(|v| v["value"].as_u64());
     let blkio_write =
         json["blkio_stats"]["io_service_bytes_recursive"]
         .members()
         .find(|ref m| m["op"] == "write")
-        .and_then(|v| v.as_u64());
+        .and_then(|v| v["value"].as_u64());
     let time = json["read"].as_str();
 
 
@@ -212,7 +215,15 @@ fn log_daily<T: AsRef<std::path::Path>, S: AsRef<str>>(
 #[allow(unreachable_code)]
 fn main() -> Result<(), error::Error> {
     let socket_path = "/var/run/docker.sock";
-    let daily_log_path = "./log_daily";
+    let daily_log_path = "./log/log_daily";
+
+    // create log dir if not exists
+    if std::fs::exists("./log")? {
+        println!("./log directory exists.");
+    } else {
+        println!("creating ./log directory...");
+        std::fs::create_dir("./log")?;
+    }
 
     let now_as_millis = get_now_as_millis()?;
     let tick = std::time::Duration::from_secs(10);
