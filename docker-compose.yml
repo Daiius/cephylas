@@ -6,6 +6,8 @@ services:
     volumes:
       - ./log:/app/log:ro # place a sample log_daily file!
       - ./next:/app:cached
+    tmpfs:
+      - /app/.next
 
   webserver:
     image: nginx:latest

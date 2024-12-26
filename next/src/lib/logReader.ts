@@ -2,6 +2,8 @@
 import { readFile } from 'fs/promises';
 import { z } from 'zod';
 
+const LOG_PATH = "/app/log/log_daily";
+
 const logTimeSchema = z.preprocess(
   (arg) => {
     if (typeof arg === "string") {
@@ -23,17 +25,17 @@ const statsTimeSchema = z.preprocess(
 const statsSchema = z.object({
   time: statsTimeSchema,
   cpu: z.object({
-    total: z.number(),
-    system: z.number(),
-    ncpu: z.number(),
+    total: z.number().nullable(),
+    system: z.number().nullable(),
+    ncpu: z.number().nullable(),
   }),
   memory: z.object({
     used: z.number().nullable(),
-    available: z.number(),
+    available: z.number().nullable(),
   }),
   io: z.object({
-    read: z.number(),
-    write: z.number(),
+    read: z.number().nullable(),
+    write: z.number().nullable(),
   }),
   net: z.object({
     send: z.number().nullable(),
@@ -55,10 +57,10 @@ type ResourceUsage = {
   millis: number,
   time: Date,
   cpu: {
-    percentage: number,
-    delta: number,
-    systemDelta: number,
-    nCpu: number,
+    percentage: number|null,
+    delta: number|null,
+    systemDelta: number|null,
+    nCpu: number|null,
   },
   memory: {
     percentage: number|null,
@@ -95,40 +97,47 @@ const diffLog = (a: Log, b: Log): LogDiff => ({
   millis: b.time.getTime() - a.time.getTime(),
   stats: 
     Object.entries(b.stats)
-      .map(([key, bvalue]) => ({
-        [key as keyof (typeof a.stats)]: {
+      .map(([key, bvalue]) => {
+        const prev_stat = a.stats[key as keyof(typeof a.stats)];
+        if (prev_stat == null) return {};
+        return {
+          [key as keyof (typeof a.stats)]: {
           ...bvalue,
           cpu: {
             ...bvalue.cpu,
             total: 
-              bvalue.cpu.total 
-              - a.stats[key as keyof (typeof a.stats)].cpu.total,
+              bvalue.cpu.total == null || prev_stat.cpu.total == null 
+                ? null 
+                : bvalue.cpu.total - prev_stat.cpu.total,
             system:
-              bvalue.cpu.system
-              - a.stats[key as keyof (typeof a.stats)].cpu.system,
+              bvalue.cpu.system == null || prev_stat.cpu.system == null
+                ? null
+                : bvalue.cpu.system - prev_stat.cpu.system,
           },
           io: {
             read:
-              bvalue.io.read
-              - a.stats[key as keyof(typeof a.stats)].io.read,
+              bvalue.io.read == null || prev_stat.io.read == null
+                ? null
+                : bvalue.io.read - prev_stat.io.read,
             write:
-              bvalue.io.write
-              - a.stats[key as keyof(typeof a.stats)].io.write,
+              bvalue.io.write == null || prev_stat.io.write == null
+                ? null
+                : bvalue.io.write - prev_stat.io.write,
           },
           net: {
             send:
               nullableSub(
                 bvalue.net.send,
-                a.stats[key as keyof(typeof a.stats)].net.send
+                prev_stat.net.send
               ),
             recv:
               nullableSub(
                 bvalue.net.recv,
-                a.stats[key as keyof(typeof a.stats)].net.recv
+                prev_stat.net.recv
               ),
           }
-        }
-      }))
+        }};
+      })
       .reduce((acc, curr) => ({ ...acc, ...curr }), {}),
 });
 
@@ -145,20 +154,23 @@ const logDiffsToUsages = (
   const usages: Record<string, ResourceUsage[]> = {};
   for (const containerName of containerNames) {
     usages[containerName] = diffs.map(d => {
-      const stat = d.stats[containerName]; 
+      const stat = d.stats[containerName];
+      if (stat == null) return undefined;
       const usage: ResourceUsage = {
         time: d.time,
         millis: d.millis,
         cpu: {
-          percentage: 
-            stat.cpu.total / stat.cpu.system * stat.cpu.ncpu * 100.0,
+          percentage:
+            stat.cpu.total == null || stat.cpu.system == null || stat.cpu.ncpu == null
+              ? null 
+              : stat.cpu.total / stat.cpu.system * stat.cpu.ncpu * 100.0,
           delta: stat.cpu.total,
           systemDelta: stat.cpu.system,
           nCpu: stat.cpu.ncpu,
         },
         memory: {
           percentage:
-            stat.memory.used == null
+            stat.memory.used == null || stat.memory.available == null
               ? null
               : stat.memory.used / stat.memory.available * 100.0,
           availableBytes: stat.memory.available,
@@ -184,13 +196,20 @@ const logDiffsToUsages = (
         },
         io: {
           readBytes: stat.io.read,
-          readBytesPerSecs: stat.io.read / (d.millis / 1_000),
+          readBytesPerSecs: 
+            stat.io.read == null
+              ? null
+              : stat.io.read / (d.millis / 1_000),
           writtenBytes: stat.io.write,
-          writtenBytesPerSecs: stat.io.write / (d.millis / 1_000),
+          writtenBytesPerSecs: 
+            stat.io.write == null
+              ? null
+              : stat.io.write / (d.millis / 1_000),
         }
       };
       return usage;
-    });
+    })
+    .filter(u => u != null) as ResourceUsage[];
   }
   return usages;
 }
@@ -198,22 +217,44 @@ const logDiffsToUsages = (
 export const readLogs = async (): Promise<
   Record<string, ResourceUsage[]>
 > => {
-  const rawData = await readFile(
-    "/app/log/log_daily",
-    { encoding: 'utf-8', flag: 'r'}
-  );
-  const logs: Log[] = rawData
-    .split("\n")
-    .map(l => l.trim())
-    .filter(l => l)
-    .map(l => logLineSchema.parse(JSON.parse(l)))
+  var rawData: string = "";
+  try {
+    rawData = await readFile(
+      LOG_PATH,
+      { encoding: 'utf-8', flag: 'r'}
+    );
+  } catch (err) {
+    console.log("failed to load log file.", err);
+  }
 
-  const diffs = logs
-    .slice(1)
-    .map((value, index) => diffLog(logs[index], value));
+  var logs: Log[] = [];
+  try {
+    logs = rawData
+      .split("\n")
+      .map(l => l.trim())
+      .filter(l => l)
+      .slice(-6 * 60 * 24) // 最新の24時間分（暫定10秒1データ）
+      .map(l => logLineSchema.parse(JSON.parse(l)))
+  } catch (err) {
+    console.log("failed to parse log file.", err);
+  }
 
-  const usages = logDiffsToUsages(diffs);
-  //console.log(usages);
+  var diffs: LogDiff[] = [];
+  try {
+    diffs = logs
+      .slice(1)
+      .map((value, index) => diffLog(logs[index], value));
+  } catch (err) {
+    console.log("failed to calc diff of log lines.", err);
+  }
+
+  var usages: Record<string, ResourceUsage[]> = {};
+  try {
+    usages = logDiffsToUsages(diffs);
+  } catch (err) {
+    console.log("failed to calc resource usages.", err);
+  }
 
   return usages;
 };
+

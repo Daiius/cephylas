@@ -11,6 +11,8 @@ const nextConfig: NextConfig = {
     ...config,
     watchOptions: { poll: 1000, },
   }),
+  output: 'standalone',
+  expireTime: 10,
 };
 
 export default nextConfig;

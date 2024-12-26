@@ -1,4 +1,5 @@
 
+export const revalidate = 10;
 
 
 import Chart from '@/components/Chart';
