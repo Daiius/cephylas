@@ -1,4 +1,5 @@
 
+import { readFile } from 'fs/promises';
 import { createReadStream } from 'fs';
 import { createInterface } from 'readline';
 import { z } from 'zod';
@@ -221,38 +222,58 @@ const logDiffsToUsages = (
 export const readLogs = async (): Promise<
   Record<string, ResourceUsage[]>
 > => {
+
   var logs: Log[] = [];
   try {
+
+    const nlines = 
+      (await readFile(LOG_PATH, { encoding: 'utf-8', flag: 'r' }))
+      .split('\n')
+      .length;
+    const nlinesToSkip = Math.max(nlines - 6 * 60 * 24, 0);
+    
+    console.time("ストリーム読み込み+JSONパース");
     const stream = createReadStream(LOG_PATH, { encoding: 'utf-8'});
     const reader = createInterface({ input: stream });
 
+    var iline = 0;
     for await (const line of reader) {
+      iline++;
       if (!line.trim()) continue;
+      if (iline < nlinesToSkip) continue;
       const parsedLine = //logLineSchema.parse(
         JSON.parse(line.trim());
       //);
       logs.push(parsedLine);
       // 暫定1日分(10秒ごと1行)を保持
-      if (logs.length > 6 * 60 * 24) logs.shift();
+      //if (logs.length > 6 * 60 * 24) logs.shift();
     }
   } catch (err) {
     console.log("failed to parse log file.", err);
+  } finally {
+    console.timeEnd("ストリーム読み込み+JSONパース");
   }
 
   var diffs: LogDiff[] = [];
   try {
+    console.time("差分計算");
     diffs = logs
       .slice(1)
       .map((value, index) => diffLog(logs[index], value));
   } catch (err) {
     console.log("failed to calc diff of log lines.", err);
+  } finally {
+    console.timeEnd("差分計算");
   }
 
   var usages: Record<string, ResourceUsage[]> = {};
   try {
+    console.time("使用率計算");
     usages = logDiffsToUsages(diffs);
   } catch (err) {
     console.log("failed to calc resource usages.", err);
+  } finally {
+    console.timeEnd("使用率計算");
   }
 
   return usages;
