@@ -1,5 +1,6 @@
 
-import { readFile } from 'fs/promises';
+import { createReadStream } from 'fs';
+import { createInterface } from 'readline';
 import { z } from 'zod';
 
 const LOG_PATH = "/app/log/log_daily";
@@ -93,8 +94,11 @@ const nullableSub = (
 );
 
 const diffLog = (a: Log, b: Log): LogDiff => ({
-  time: b.time,
-  millis: b.time.getTime() - a.time.getTime(),
+  time: 
+    new Date(b.time as unknown as string),
+  millis: 
+    new Date(b.time as unknown as string).getTime() 
+    - new Date(a.time as unknown as string).getTime(),
   stats: 
     Object.entries(b.stats)
       .map(([key, bvalue]) => {
@@ -217,24 +221,20 @@ const logDiffsToUsages = (
 export const readLogs = async (): Promise<
   Record<string, ResourceUsage[]>
 > => {
-  var rawData: string = "";
-  try {
-    rawData = await readFile(
-      LOG_PATH,
-      { encoding: 'utf-8', flag: 'r'}
-    );
-  } catch (err) {
-    console.log("failed to load log file.", err);
-  }
-
   var logs: Log[] = [];
   try {
-    logs = rawData
-      .split("\n")
-      .map(l => l.trim())
-      .filter(l => l)
-      .slice(-6 * 60 * 24) // 最新の24時間分（暫定10秒1データ）
-      .map(l => logLineSchema.parse(JSON.parse(l)))
+    const stream = createReadStream(LOG_PATH, { encoding: 'utf-8'});
+    const reader = createInterface({ input: stream });
+
+    for await (const line of reader) {
+      if (!line.trim()) continue;
+      const parsedLine = //logLineSchema.parse(
+        JSON.parse(line.trim());
+      //);
+      logs.push(parsedLine);
+      // 暫定1日分(10秒ごと1行)を保持
+      if (logs.length > 6 * 60 * 24) logs.shift();
+    }
   } catch (err) {
     console.log("failed to parse log file.", err);
   }
