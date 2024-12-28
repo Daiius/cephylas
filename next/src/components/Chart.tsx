@@ -12,12 +12,14 @@ import 'chartjs-adapter-luxon';
 const Chart: React.FC<
   React.ComponentProps<'canvas'>
   & { 
+    chartId: string,
     datasets: any,
     title?: string,
     xlabel?: string,
     ylabel?: string,
   }
 > = ({
+  chartId,
   datasets,
   title,
   xlabel,
@@ -35,7 +37,7 @@ const Chart: React.FC<
   React.useEffect(() => {
     if (mounted) {
       refCanvas.current =
-        document.getElementById('chartjs-canvas') as HTMLCanvasElement;
+        document.getElementById(chartId ?? 'chartjs-canvas') as HTMLCanvasElement;
       if (refCanvas.current == null) {
         throw new Error('Chart.js container is null.');
       }
@@ -79,7 +81,7 @@ const Chart: React.FC<
 
   return (
     <canvas 
-      id='chartjs-canvas'
+      id={chartId ?? 'chartjs-canvas'}
       className={clsx(className)}
       {...props}
     >
