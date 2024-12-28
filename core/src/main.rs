@@ -243,6 +243,7 @@ fn calc_usage(
                 percentage: cpu_percentage,
                 total: cpu_delta,
                 system: system_cpu_delta,
+                ncpu: ncpu,
             },
             memory: {
                 percentage: memory_percentage,
@@ -250,8 +251,8 @@ fn calc_usage(
                 available: stats["memory"]["available"].as_u64(),
             },
             io: {
-                readkBs: io_read_kb_per_s,
-                writekBs: io_write_kb_per_s,
+                readkBps: io_read_kb_per_s,
+                writekBps: io_write_kb_per_s,
                 readkB: stats["io"]["read"].as_u64().map(|x| x / 1000),
                 writekB: stats["io"]["write"].as_u64().map(|x| x / 1000),
             },
