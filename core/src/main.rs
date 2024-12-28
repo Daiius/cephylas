@@ -176,24 +176,78 @@ fn get_now_as_millis() -> Result<u128, std::time::SystemTimeError> {
     Ok(duration.as_millis())
 }
 
-//fn calc_cpu_usage(
-//    stats: &json::JsonValue,
-//    prev_stats: &json::JsonValue,
-//) -> Option<f32> {
-//    let cpu_delta =
-//               stats["cpu"]["total"].as_u64()? 
-//        - prev_stats["cpu"]["total"].as_u64()?;
-//    let system_cpu_delta = 
-//               stats["cpu"]["system"].as_u64()?
-//        - prev_stats["cpu"]["system"].as_u64()?;
-//    let ncpu = stats["ncpu"].as_u64()?;
-//
-//    Some(
-//        (cpu_delta as f32/ system_cpu_delta as f32) 
-//        * (ncpu as f32) 
-//        * 100.0_f32 
-//    )
-//}
+fn calc_usage(
+    millis: &u64,
+    stats: &json::JsonValue,
+    prev_stats: &json::JsonValue,
+) -> Result<json::JsonValue, error::Error> {
+    // CPU calculations
+    let cpu_delta =
+       stats["cpu"]["total"].as_u64() 
+       .zip(prev_stats["cpu"]["total"].as_u64())
+       .map(|(a, b)| a - b);
+    let system_cpu_delta = 
+       stats["cpu"]["system"].as_u64()
+       .zip(prev_stats["cpu"]["system"].as_u64())
+       .map(|(a, b)| a - b);
+    let ncpu = stats["ncpu"].as_u64();
+    let cpu_percentage =
+        cpu_delta.zip(system_cpu_delta).zip(ncpu)
+        .map(|((a, b), c)| (a as f32) / (b as f32) * (c as f32) * 100_f32);
+
+    // Memory calculations
+    let memory_percentage =
+        stats["memory"]["used"].as_u64()
+        .zip(stats["memory"]["available"].as_u64())
+        .map(|(a,b)| (a as f32) / (b as f32) * 100_f32);
+
+    // IO calculations
+    let io_read_kb_per_s =
+        stats["io"]["read"].as_u64()
+        .zip(prev_stats["io"]["read"].as_u64())
+        .map(|(a,b)| (a - b) / 1000 / (millis / 1000));
+    let io_write_kb_per_s =
+        stats["io"]["write"].as_u64()
+        .zip(prev_stats["io"]["write"].as_u64())
+        .map(|(a,b)| (a - b) / 1000 / (millis / 1000));
+
+    // Net calculations
+    let net_send_kb_per_s =
+        stats["net"]["send"].as_u64()
+        .zip(prev_stats["net"]["send"].as_u64())
+        .map(|(a,b)| (a - b) / millis);
+    let net_recv_kb_per_s =
+        stats["net"]["recv"].as_u64()
+        .zip(prev_stats["net"]["recv"].as_u64())
+        .map(|(a,b)| (a - b) / millis);
+
+    Ok(
+        json::object!{
+            cpu: {
+                percentage: cpu_percentage,
+                total: cpu_delta,
+                system: system_cpu_delta,
+            },
+            memory: {
+                percentage: memory_percentage,
+                used: stats["memory"]["used"].as_u64(),
+                available: stats["memory"]["available"].as_u64(),
+            },
+            io: {
+                readkBs: io_read_kb_per_s,
+                writekBs: io_write_kb_per_s,
+                readkB: stats["io"]["read"].as_u64().map(|x| x / 1000),
+                writekB: stats["io"]["write"].as_u64().map(|x| x / 1000),
+            },
+            net: {
+                sendkBps: net_send_kb_per_s,
+                recvkBps: net_recv_kb_per_s,
+                sendkB: stats["net"]["send"].as_u64().map(|x| x / 1000),
+                recvkB: stats["net"]["recv"].as_u64().map(|x| x / 1000),
+            },
+        }
+    )
+}
 
 fn log_daily<T: AsRef<std::path::Path>, S: AsRef<str>>(
     file_path: T,
@@ -231,6 +285,7 @@ fn main() -> Result<(), error::Error> {
           tick.as_millis() * 2 
         - now_as_millis % tick.as_millis()
     );
+    let mut prev_stats = json::object!{};
     loop {
         // TODO possibly overflow and panic.
         let millis_to_wait = (timing - get_now_as_millis()?) as u64;
@@ -239,10 +294,13 @@ fn main() -> Result<(), error::Error> {
         );
 
         let stats = get_containers_stats(&socket_path)?;
-        println!("{}", &stats);
-        log_daily(daily_log_path, &stats.dump())?;
+        if let Ok(usage) = calc_usage(&millis_to_wait, &stats, &prev_stats) {
+            println!("{}", &usage);
+            log_daily(daily_log_path, &usage.dump())?;
+        }
 
         timing += tick.as_millis();
+        prev_stats = stats;
     }
 
     Ok(())
