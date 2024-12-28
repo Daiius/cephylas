@@ -1,7 +1,6 @@
 use json;
 
 mod error;
-mod time;
 
 const DOCKER_API_CONTAINERS: &str = "/containers/json";
 const DOCKER_API_STATS: &str = "/containers/{}/stats?stream=false&one-shot=true";
@@ -103,7 +102,7 @@ fn reshape_json(
             json["memory_stats"]["stats"]["cache"]
                 .as_u64()
                 .or(Some(0_u64)) // cache entry might not exist
-        ).map(|(a, b)| a - b);
+        ).map(|(a, b)| a.saturating_sub(b));
     let available_memory =
         json["memory_stats"]["limit"]
         .as_u64();
@@ -153,10 +152,7 @@ fn get_containers_stats<T: AsRef<std::path::Path>>(
 ) -> Result<json::JsonValue, error::Error> {
     let container_names = get_container_names(&socket_path)?;
 
-    let mut log_json = json::JsonValue::new_object();
-    log_json["time"] = 
-        time::format_time(&std::time::SystemTime::now())?
-        .into();
+    let mut log_json_tmp = json::JsonValue::new_object();
     for container_name in container_names {
         // in one-shot mode, pre-stats are not available.
         // we have to take diff by ourselves
@@ -164,8 +160,15 @@ fn get_containers_stats<T: AsRef<std::path::Path>>(
             &socket_path, &container_name
         )?;
 
-        log_json["stats"][&container_name] = stats_json;
+        log_json_tmp[&container_name] = stats_json;
     }
+    let log_json = json::object!{
+        time: log_json_tmp.entries()
+            .take(1)
+            .map(|(_, v)| v["time"].as_str())
+            .next(),
+        stats: log_json_tmp,
+    };
 
     Ok(log_json)
 }
@@ -181,48 +184,61 @@ fn calc_usage(
     stats: &json::JsonValue,
     prev_stats: &json::JsonValue,
 ) -> Result<json::JsonValue, error::Error> {
-    // CPU calculations
-    let cpu_delta =
-       stats["cpu"]["total"].as_u64() 
-       .zip(prev_stats["cpu"]["total"].as_u64())
-       .map(|(a, b)| a - b);
-    let system_cpu_delta = 
-       stats["cpu"]["system"].as_u64()
-       .zip(prev_stats["cpu"]["system"].as_u64())
-       .map(|(a, b)| a - b);
-    let ncpu = stats["ncpu"].as_u64();
-    let cpu_percentage =
-        cpu_delta.zip(system_cpu_delta).zip(ncpu)
-        .map(|((a, b), c)| (a as f32) / (b as f32) * (c as f32) * 100_f32);
+    let container_names = stats["stats"].entries()
+        .map(|(key, _)| key);
 
-    // Memory calculations
-    let memory_percentage =
-        stats["memory"]["used"].as_u64()
-        .zip(stats["memory"]["available"].as_u64())
-        .map(|(a,b)| (a as f32) / (b as f32) * 100_f32);
+    let mut usages = json::JsonValue::new_object();
+    usages["time"] = stats["time"].as_str().unwrap_or("null").into();
+    usages["millis"] = (*millis).into();
+    for container_name in container_names {
+        let stats = &stats["stats"][container_name];
+        //println!("calc stats: {}", stats);
+        let prev_stats = &prev_stats["stats"][container_name];
+        //println!("calc prev_stats: {}", prev_stats);
 
-    // IO calculations
-    let io_read_kb_per_s =
-        stats["io"]["read"].as_u64()
-        .zip(prev_stats["io"]["read"].as_u64())
-        .map(|(a,b)| (a - b) / 1000 / (millis / 1000));
-    let io_write_kb_per_s =
-        stats["io"]["write"].as_u64()
-        .zip(prev_stats["io"]["write"].as_u64())
-        .map(|(a,b)| (a - b) / 1000 / (millis / 1000));
+        // CPU calculations
+        let cpu_delta =
+           stats["cpu"]["total"].as_u64() 
+           .zip(prev_stats["cpu"]["total"].as_u64())
+           .map(|(a, b)| a.saturating_sub(b));
+        let system_cpu_delta = 
+           stats["cpu"]["system"].as_u64()
+           .zip(prev_stats["cpu"]["system"].as_u64())
+           .map(|(a, b)| a.saturating_sub(b));
+        let ncpu = 
+            stats["cpu"]["ncpu"].as_u64();
+        let cpu_percentage =
+            cpu_delta.zip(system_cpu_delta).zip(ncpu)
+            .map(|((a, b), c)| (a as f32) / (b as f32) * (c as f32) * 100_f32);
+        //println!("cpu_percentage: {:?}", cpu_percentage);
 
-    // Net calculations
-    let net_send_kb_per_s =
-        stats["net"]["send"].as_u64()
-        .zip(prev_stats["net"]["send"].as_u64())
-        .map(|(a,b)| (a - b) / millis);
-    let net_recv_kb_per_s =
-        stats["net"]["recv"].as_u64()
-        .zip(prev_stats["net"]["recv"].as_u64())
-        .map(|(a,b)| (a - b) / millis);
+        // Memory calculations
+        let memory_percentage =
+            stats["memory"]["used"].as_u64()
+            .zip(stats["memory"]["available"].as_u64())
+            .map(|(a,b)| (a as f32) / (b as f32) * 100_f32);
 
-    Ok(
-        json::object!{
+        // IO calculations
+        let io_read_kb_per_s =
+            stats["io"]["read"].as_u64()
+            .zip(prev_stats["io"]["read"].as_u64())
+            .map(|(a,b)| a.saturating_sub(b) / 1000 / (millis / 1000));
+        let io_write_kb_per_s =
+            stats["io"]["write"].as_u64()
+            .zip(prev_stats["io"]["write"].as_u64())
+            .map(|(a,b)| a.saturating_sub(b) / 1000 / (millis / 1000));
+
+        // Net calculations
+        let net_send_kb_per_s =
+            stats["net"]["send"].as_u64()
+            .zip(prev_stats["net"]["send"].as_u64())
+            .map(|(a,b)| a.saturating_sub(b) / millis);
+        let net_recv_kb_per_s =
+            stats["net"]["recv"].as_u64()
+            .zip(prev_stats["net"]["recv"].as_u64())
+            .map(|(a,b)| a.saturating_sub(b) / millis);
+
+        usages["stats"][container_name] = json::object!{
             cpu: {
                 percentage: cpu_percentage,
                 total: cpu_delta,
@@ -245,8 +261,10 @@ fn calc_usage(
                 sendkB: stats["net"]["send"].as_u64().map(|x| x / 1000),
                 recvkB: stats["net"]["recv"].as_u64().map(|x| x / 1000),
             },
-        }
-    )
+        };
+    }
+
+    Ok(usages)
 }
 
 fn log_daily<T: AsRef<std::path::Path>, S: AsRef<str>>(
@@ -282,21 +300,38 @@ fn main() -> Result<(), error::Error> {
     let now_as_millis = get_now_as_millis()?;
     let tick = std::time::Duration::from_secs(10);
     let mut timing = now_as_millis + (
-          tick.as_millis() * 2 
+          tick.as_millis() //* 2  // NOTE if tick is short, maybe more wait needed.
         - now_as_millis % tick.as_millis()
     );
     let mut prev_stats = json::object!{};
     loop {
-        // TODO possibly overflow and panic.
-        let millis_to_wait = (timing - get_now_as_millis()?) as u64;
+        let millis_to_wait = timing.saturating_sub(get_now_as_millis()?) as u64;
+
         std::thread::sleep(
             std::time::Duration::from_millis(millis_to_wait)
         );
 
         let stats = get_containers_stats(&socket_path)?;
-        if let Ok(usage) = calc_usage(&millis_to_wait, &stats, &prev_stats) {
-            println!("{}", &usage);
-            log_daily(daily_log_path, &usage.dump())?;
+        //println!("stats: {}", stats.dump());
+        //println!("prev_stats: {}", prev_stats.dump());
+
+
+        let first_stat = stats["stats"].entries()
+            .take(1).map(|(_, v)| v).next();
+        let first_prev_stat = prev_stats["stats"].entries()
+            .take(1).map(|(_, v)| v).next();
+            
+        let log_condition = first_stat
+            .zip(first_prev_stat)
+            .map(|(a, b)| !a["cpu"].is_null() && !b["cpu"].is_null() )
+            .unwrap_or(false);
+
+        if log_condition {
+            let usage_result = calc_usage(&millis_to_wait, &stats, &prev_stats);
+            if let Ok(usage) = usage_result {
+                println!("{}", &usage);
+                log_daily(daily_log_path, &usage.dump())?;
+            }
         }
 
         timing += tick.as_millis();

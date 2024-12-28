@@ -1,11 +1,10 @@
 
-use super::time;
 
 #[derive(Debug)]
 pub enum Error {
     IOError(std::io::Error),
     JsonError(json::JsonError),
-    TimeError(time::TimeError),
+    TimeError(std::time::SystemTimeError),
     OtherError(String),
 }
 
@@ -28,11 +27,6 @@ impl From<json::JsonError> for Error {
 }
 impl From<std::time::SystemTimeError> for Error {
     fn from(value: std::time::SystemTimeError) -> Self {
-        Error::TimeError(time::TimeError::SystemTimeError(value))
-    }
-}
-impl From<time::TimeError> for Error {
-    fn from(value: time::TimeError) -> Self {
         Error::TimeError(value)
     }
 }
