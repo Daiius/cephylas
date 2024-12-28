@@ -64,7 +64,7 @@ export const readLogs = async (): Promise<
       const trimmedLine = line.trim();
       if (!trimmedLine) continue;
       const parsedLog: Log = LogSchema.parse(JSON.parse(trimmedLine));
-      const container_names = Object.keys(parsedLog.stats);
+      const container_names = Object.keys(parsedLog.stats).sort();
       for (const container_name of container_names) {
         if (logs[container_name] == null) {
           logs[container_name] = [];
