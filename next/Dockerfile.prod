@@ -1,0 +1,45 @@
+# 参考: https://zenn.dev/kazumax4395/articles/427cc791f6145b
+
+# Build layer
+# devDependenciesも含めてinstallし、
+# .next/ 内にNext.js関連の仕組みが動作するのに必要なファイルを出力
+FROM node:20-slim AS build
+
+WORKDIR /app
+
+RUN npm install -g pnpm
+COPY package.json pnpm-lock.yaml ./
+
+RUN pnpm install --frozen-lockfile
+
+COPY . .
+
+RUN pnpm next build
+
+# Package install layer
+# dependencies をインストール、動作に必要なライブラリだけを取得する
+FROM node:20-slim AS node_modules
+WORKDIR /app
+RUN npm install -g pnpm
+COPY package.json pnpm-lock.yaml ./
+
+RUN pnpm install --frozen-lockfile --prod
+
+# Deploy layer
+#
+# イメージサイズやセキュリティの視点からおすすめのイメージとのこと
+FROM gcr.io/distroless/nodejs20-debian12
+#FROM gcr.io/distroless/nodejs20:debug
+
+WORKDIR /app
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+
+COPY package.json next.config.ts ./
+COPY --from=build /app/.next/standalone ./
+COPY --from=build /app/public ./public
+COPY --from=build /app/.next/static ./.next/static
+#COPY --from=node_modules /app/node_modules ./node_modules
+
+CMD ["server.js"]
+

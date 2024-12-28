@@ -1,0 +1,24 @@
+services:
+  cephylas-nextjs:
+    build: 
+      dockerfile: ./next/Dockerfile
+    container_name: cephylas-nextjs-dev
+    volumes:
+      - ./log:/app/log:ro # place a sample log_daily file!
+      - ./next:/app:cached
+    tmpfs:
+      - /app/.next
+
+  webserver:
+    image: nginx:latest
+    container_name: cephylas-webserver
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - 80:80
+    
+
+networks:
+  default:
+    name: cephylas-network
+
