@@ -3,9 +3,7 @@ export const revalidate = 10;
 
 
 import Chart from '@/components/Chart';
-import {  } from 'chart.js/auto'
 import { readLogs } from '@/lib/logReader';
-
 
 export default async function Home() {
 
