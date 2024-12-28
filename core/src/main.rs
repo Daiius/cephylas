@@ -327,7 +327,10 @@ fn main() -> Result<(), error::Error> {
             .unwrap_or(false);
 
         if log_condition {
-            let usage_result = calc_usage(&millis_to_wait, &stats, &prev_stats);
+            let usage_result = calc_usage(
+                &(tick.as_millis() as u64), 
+                &stats, &prev_stats
+            );
             if let Ok(usage) = usage_result {
                 println!("{}", &usage);
                 log_daily(daily_log_path, &usage.dump())?;
