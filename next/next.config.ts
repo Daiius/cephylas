@@ -6,13 +6,14 @@ const nextConfig: NextConfig = {
     basePath: "/cephylas",
   },
   // for docker container dev environment
-  watchOptions: { pollIntervalMs: 1000, },
-  webpack: (config) => ({
-    ...config,
-    watchOptions: { poll: 1000, },
-  }),
+  //watchOptions: { pollIntervalMs: 1000, },
+  //webpack: (config) => ({
+  //  ...config,
+  //  watchOptions: { poll: 1000, },
+  //}),
   output: 'standalone',
-  expireTime: 10,
+  //expireTime: 10,
+  serverExternalPackages: ['@/lib/logReader'],
 };
 
 export default nextConfig;
