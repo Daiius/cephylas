@@ -6,11 +6,11 @@ const DOCKER_API_CONTAINERS: &str = "/containers/json";
 const DOCKER_API_STATS: &str = "/containers/{}/stats?stream=false&one-shot=true";
 
 fn call_docker_api<
-    T: AsRef<std::path::Path>,
-    U: AsRef<str>,
+    P: AsRef<std::path::Path>,
+    S: AsRef<str>,
 >(
-    socket_path: T,
-    url: U,
+    socket_path: P,
+    url: S,
 ) -> Result<String, std::io::Error> {
     let mut stream = 
         std::os::unix::net::UnixStream::connect(socket_path)?;
