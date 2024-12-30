@@ -1,5 +1,5 @@
 
-//import { readFile } from 'fs/promises';
+import { stat, open, readFile } from 'fs/promises';
 import { createReadStream } from 'fs';
 import { createInterface } from 'readline';
 import { z } from 'zod';
@@ -58,30 +58,69 @@ export const readLogs = async (): Promise<
     const stream = createReadStream(LOG_PATH, { encoding: 'utf-8'});
     const reader = createInterface({ input: stream });
 
-    var iline = 0;
+    //for (const line of (await readFile(LOG_PATH, { flag: 'r' })).toString('utf-8').split('\n')) {
+
     for await (const line of reader) {
-      iline++;
+    //for (const line of await readLastLines(LOG_PATH, 8000, 131072)) {
       const trimmedLine = line.trim();
       if (!trimmedLine) continue;
-      const parsedLog: Log = LogSchema.parse(JSON.parse(trimmedLine));
-      const container_names = Object.keys(parsedLog.stats).sort();
-      for (const container_name of container_names) {
-        if (logs[container_name] == null) {
-          logs[container_name] = [];
+      const parsedLog: Log = //LogSchema.parse(
+        JSON.parse(trimmedLine)
+      //)
+      ;
+      const containerNames = Object.keys(parsedLog.stats);
+      for (const containerName of containerNames) {
+        if (logs[containerName] == null) {
+          logs[containerName] = [];
         }
-        const parsedStat: Stat = parsedLog.stats[container_name];
-        logs[container_name]?.push({
+        const parsedStat: Stat = parsedLog.stats[containerName];
+        logs[containerName]?.push({
           time: parsedLog.time,
           ...parsedStat
         });
       }
     }
+
   } catch (err) {
     console.log("failed to parse log file.", err);
   } finally {
     console.timeEnd("ストリーム読み込み+JSONパース");
+   
   }
 
   return logs;
 };
+
+const readLastLines = async (
+  filePath: string,
+  lineCount: number,
+  chunkSize = 1024
+) => {
+  const stats = await stat(filePath);
+  const fileSize = stats.size;
+  let position = fileSize;
+  let buffer = Buffer.alloc(0);
+
+  const fileHandle = await open(filePath, 'r');
+
+  try {
+    while (
+      buffer.toString('utf-8').split('\n').length <= lineCount 
+      && position > 0
+    ) {
+      const readSize = Math.min(chunkSize, position);
+      const chunk = Buffer.alloc(readSize);
+      position -= readSize;
+
+      await fileHandle.read(chunk, 0, readSize, position);
+      buffer = Buffer.concat([chunk, buffer]);
+
+    }
+  } finally {
+    await fileHandle.close();
+  }
+
+  const lines = buffer.toString('utf-8').split('\n');
+  return lines.slice(-lineCount);
+}
 
