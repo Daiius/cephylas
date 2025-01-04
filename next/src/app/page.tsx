@@ -20,18 +20,24 @@ export default async function Home() {
     'rgb(153, 102, 255)', // purple
     'rgb(201, 203, 207)' // grey
   ];
+
+  console.time("データ成型");
+
   const backgroundColors = borderColors
     .map(bc => bc.replace('rgb(', 'rgba(').replace(')', ',0.5)'));
   
   const datasetsCpu = Object.entries(logs)
+    .sort(([labelA, _vA], [labelB, _vB]) => labelA.localeCompare(labelB))
     .map(([label, data]) => ({
       label, data, parsing: { xAxisKey: 'time', yAxisKey: 'cpu.percentage', },
     }));
   const datasetsMemory = Object.entries(logs)
+    .sort(([labelA, _vA], [labelB, _vB]) => labelA.localeCompare(labelB))
     .map(([label, data]) => ({
       label, data, parsing: { xAxisKey: 'time', yAxisKey: 'memory.percentage', },
     }));
   const datasetsDisk = Object.entries(logs)
+    .sort(([labelA, _vA], [labelB, _vB]) => labelA.localeCompare(labelB))
     .flatMap(([label, data], ilabel) => ["read", "write"].map(type => ({
       label: `${label} ${type}`, data, parsing: { xAxisKey: 'time', yAxisKey: `io.${type}kBps` },
       borderColor: borderColors[ilabel & borderColors.length],
@@ -39,6 +45,7 @@ export default async function Home() {
       borderDash: type === "read" ? [5,5] : [1,0],
     })));
   const datasetsNet = Object.entries(logs)
+    .sort(([labelA, _vA], [labelB, _vB]) => labelA.localeCompare(labelB))
     .flatMap(([label, data], ilabel) => ["send", "recv"].map(type => ({
       label: `${label} ${type}`, data, parsing: { xAxisKey: 'time', yAxisKey: `net.${type}kBps` },
       borderColor: borderColors[ilabel % borderColors.length],
@@ -46,6 +53,7 @@ export default async function Home() {
       borderDash: type === "send" ? [5,5] : [1,0],
     })));
 
+  console.timeEnd("データ成型");
 
   return (
     <div>
