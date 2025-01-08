@@ -47,7 +47,7 @@ const Chart: React.FC<
         refCanvas.current,
         {
           type: 'line',
-          data: { datasets },
+          data: { datasets: datasets == null ? {} : datasets },
           options: {
             animation: false,
             plugins: {

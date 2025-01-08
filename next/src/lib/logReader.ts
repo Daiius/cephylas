@@ -1,5 +1,4 @@
 
-import { stat, open, readFile } from 'fs/promises';
 import { createReadStream } from 'fs';
 import { createInterface } from 'readline';
 import { z } from 'zod';
@@ -50,7 +49,7 @@ type Stat = z.infer<typeof StatsSchema>;
 
 
 export const readLogs = async (): Promise<
-  Record<string, Stat[]>
+  Record<string, (Stat & { time: Date })[]>
 > => {
   var logs: Record<string, (Stat & { time: Date })[]> = {};
   try {
@@ -64,9 +63,9 @@ export const readLogs = async (): Promise<
     //for (const line of await readLastLines(LOG_PATH, 8000, 131072)) {
       const trimmedLine = line.trim();
       if (!trimmedLine) continue;
-      const parsedLog: Log = //LogSchema.parse(
+      const parsedLog: Log = LogSchema.parse(
         JSON.parse(trimmedLine)
-      //)
+      )
       ;
       const containerNames = Object.keys(parsedLog.stats);
       for (const containerName of containerNames) {
@@ -90,37 +89,4 @@ export const readLogs = async (): Promise<
 
   return logs;
 };
-
-const readLastLines = async (
-  filePath: string,
-  lineCount: number,
-  chunkSize = 1024
-) => {
-  const stats = await stat(filePath);
-  const fileSize = stats.size;
-  let position = fileSize;
-  let buffer = Buffer.alloc(0);
-
-  const fileHandle = await open(filePath, 'r');
-
-  try {
-    while (
-      buffer.toString('utf-8').split('\n').length <= lineCount 
-      && position > 0
-    ) {
-      const readSize = Math.min(chunkSize, position);
-      const chunk = Buffer.alloc(readSize);
-      position -= readSize;
-
-      await fileHandle.read(chunk, 0, readSize, position);
-      buffer = Buffer.concat([chunk, buffer]);
-
-    }
-  } finally {
-    await fileHandle.close();
-  }
-
-  const lines = buffer.toString('utf-8').split('\n');
-  return lines.slice(-lineCount);
-}
 
