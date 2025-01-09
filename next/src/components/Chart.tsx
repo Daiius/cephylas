@@ -20,6 +20,7 @@ import {
   LinearScale,
   Legend,
   Colors,
+  Tooltip,
 } from 'chart.js';
 ChartJs.register(
   LineController,
@@ -29,6 +30,7 @@ ChartJs.register(
   LinearScale,
   Legend,
   Colors,
+  Tooltip,
 );
 import 'chartjs-adapter-luxon';
 
