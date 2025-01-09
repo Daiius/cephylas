@@ -51,13 +51,13 @@ type Stat = z.infer<typeof StatsSchema>;
 export const readLogs = async (
   ndata: number = 8640
 ): Promise<Record<string, (Stat & { time: Date })[]>> => {
-  console.time("ログ行数チェック");
-  const nlinesInLog = await checkNumberOfLines(LOG_PATH);
-  console.timeEnd("ログ行数チェック");
-  const nlinesToSkip = Math.min(0, nlinesInLog - ndata);
-
   var logs: Record<string, (Stat & { time: Date })[]> = {};
   try {
+    console.time("ログ行数チェック");
+    const nlinesInLog = await checkNumberOfLines(LOG_PATH);
+    console.timeEnd("ログ行数チェック");
+    const nlinesToSkip = Math.min(0, nlinesInLog - ndata);
+
     console.time("ストリーム読み込み+JSONパース");
     const stream = createReadStream(LOG_PATH, { encoding: 'utf-8'});
     const reader = createInterface({ input: stream });
