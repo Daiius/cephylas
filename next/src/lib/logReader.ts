@@ -48,19 +48,23 @@ type Log = z.infer<typeof LogSchema>;
 type Stat = z.infer<typeof StatsSchema>;
 
 
-export const readLogs = async (): Promise<
-  Record<string, (Stat & { time: Date })[]>
-> => {
+export const readLogs = async (
+  ndata: number = 8640
+): Promise<Record<string, (Stat & { time: Date })[]>> => {
+  console.time("ログ行数チェック");
+  const nlinesInLog = await checkNumberOfLines(LOG_PATH);
+  console.timeEnd("ログ行数チェック");
+  const nlinesToSkip = Math.min(0, nlinesInLog - ndata);
+
   var logs: Record<string, (Stat & { time: Date })[]> = {};
   try {
     console.time("ストリーム読み込み+JSONパース");
     const stream = createReadStream(LOG_PATH, { encoding: 'utf-8'});
     const reader = createInterface({ input: stream });
 
-    //for (const line of (await readFile(LOG_PATH, { flag: 'r' })).toString('utf-8').split('\n')) {
-
+    var iline = 0;
     for await (const line of reader) {
-    //for (const line of await readLastLines(LOG_PATH, 8000, 131072)) {
+      if (iline++ < nlinesToSkip) continue;
       const trimmedLine = line.trim();
       if (!trimmedLine) continue;
       const parsedLog: Log = LogSchema.parse(
@@ -88,5 +92,19 @@ export const readLogs = async (): Promise<
   }
 
   return logs;
+};
+
+/**
+ * streamを用いて1行ずつファイルを読みだしながら
+ * 全部で何行あるかカウントします
+ */
+const checkNumberOfLines = async (path: string): Promise<number> => {
+    const stream = createReadStream(path, { encoding: 'utf-8'});
+    const reader = createInterface({ input: stream });
+    let nlines = 0;
+    for await (const _line of reader) {
+      ++nlines;
+    }
+    return nlines;
 };
 
