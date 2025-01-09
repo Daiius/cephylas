@@ -110,30 +110,16 @@ export default async function Home() {
 
   console.time("データ成型");
 
-  const datasetsCpuRaw = prepareDatasets(
+  const datasetsCpu = prepareDatasets(
     logs, d => ({ x: d.time, y: d.cpu.percentage })
   );
-  console.log("downsampled data length: ", datasetsCpuRaw[0].data.length);
-  
-  const datasetsCpu = JSON.stringify(
-    datasetsCpuRaw,
-    (_, value) => typeof value === "number" ? Number(value.toFixed(2)) : value);
-  console.log("datasetsCpu string length: ", datasetsCpu.length);
 
+  const datasetsMemory = prepareDatasets(
+    logs, d => ({ x: d.time, y: d.memory.percentage })
+  );
+  const datasetsDisk = prepareDatasetsIOandNet(logs, 'io');
 
-  const datasetsMemory = JSON.stringify(
-    prepareDatasets(logs, d => ({ x: d.time, y: d.memory.percentage })),
-    (_, value) => typeof value === "number" ? Number(value.toFixed(2)) : value,
-  );
-  const datasetsDisk = JSON.stringify(
-    prepareDatasetsIOandNet(logs, 'io'),
-    (_, value) => typeof value === "number" ? Number(value.toFixed(2)) : value,
-  );
-
-  const datasetsNet = JSON.stringify(
-    prepareDatasetsIOandNet(logs, 'net'),
-    (_, value) => typeof value === "number" ? Number(value.toFixed(2)) : value,
-  );
+  const datasetsNet = prepareDatasetsIOandNet(logs, 'net');
 
   console.timeEnd("データ成型");
 
@@ -141,19 +127,19 @@ export default async function Home() {
     <div>
       <Chart 
         chartId='chartjs-cpu-usage'
-        datasets={JSON.parse(datasetsCpu)} title='CPU usage (%)' 
+        datasets={datasetsCpu} title='CPU usage (%)' 
       />
       <Chart 
         chartId='chartjs-memory-usage'
-        datasets={JSON.parse(datasetsMemory)} title='Memory usage (%)'
+        datasets={datasetsMemory} title='Memory usage (%)'
       />
       <Chart
         chartId='chartjs-disk-usage'
-        datasets={JSON.parse(datasetsDisk)} title='Disk usage (kB/s)'
+        datasets={datasetsDisk} title='Disk usage (kB/s)'
       />
       <Chart
         chartId='chartjs-net-usage'
-        datasets={JSON.parse(datasetsNet)} title='Net usage (kB/s)'
+        datasets={datasetsNet} title='Net usage (kB/s)'
       />
     </div>
   );
