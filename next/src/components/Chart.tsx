@@ -3,9 +3,33 @@
 import React from 'react';
 import clsx from 'clsx';
 
+// Chart.js v4 あたりから
+// 必要なモジュールのみをimport出来る様に変更された
+// 多少はメモリ消費が減る...???
+// 全部importする場合には以下でOK
+// import { Chart as ChartJs } from 'chart.js/auto';
+// 正直、ちゃんと動いてるか見た目を確認しながら
+// 追加していかないといけないので微妙
+// TODO 効果の検証...
 import {
   Chart as ChartJs,
-} from 'chart.js/auto';
+  LineController,
+  LineElement,
+  PointElement,
+  TimeScale,
+  LinearScale,
+  Legend,
+  Colors,
+} from 'chart.js';
+ChartJs.register(
+  LineController,
+  LineElement,
+  PointElement,
+  TimeScale,
+  LinearScale,
+  Legend,
+  Colors,
+);
 import 'chartjs-adapter-luxon';
 
 
@@ -90,6 +114,6 @@ const Chart: React.FC<
 };
 
 export default Chart;
-export type { ChartData } from 'chart.js/auto';
+//export type { ChartData } from 'chart.js/auto';
 
 
