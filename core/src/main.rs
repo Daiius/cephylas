@@ -285,6 +285,32 @@ fn log_daily<T: AsRef<std::path::Path>, S: AsRef<str>>(
     Ok(())
 }
 
+fn custom_dump(json: &json::JsonValue) -> String {
+    match json {
+        json::JsonValue::Object(o) => {
+            let entries: Vec<String> = o.iter()
+                .map(|(k,v)| format!("\"{}\":{}", k, custom_dump(v)))
+                .collect();
+            format!("{{{}}}", entries.join(","))
+        },
+        json::JsonValue::Array(a) => {
+            let elements: Vec<String> = a.iter()
+                .map(custom_dump)
+                .collect();
+            format!("[{}]", elements.join(","))
+        }
+        json::JsonValue::Number(n) => {
+            let (_, _, exponent) = n.as_parts();
+            if exponent != 0 {
+                format!("{:.2}", json.as_f64().unwrap())
+            } else {
+                n.to_string()
+            }
+        }
+        _ => json.dump(),
+    }
+}
+
 #[allow(unreachable_code)]
 fn main() -> Result<(), error::Error> {
     let socket_path = "/var/run/docker.sock";
@@ -333,8 +359,9 @@ fn main() -> Result<(), error::Error> {
                 &stats, &prev_stats
             );
             if let Ok(usage) = usage_result {
-                println!("{}", &usage);
-                log_daily(daily_log_path, &usage.dump())?;
+                let log_content = custom_dump(&usage);
+                println!("{}", log_content);
+                log_daily(daily_log_path, log_content)?;
             }
         }
 
