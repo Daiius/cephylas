@@ -7,31 +7,31 @@ import clsx from 'clsx';
 // 必要なモジュールのみをimport出来る様に変更された
 // 多少はメモリ消費が減る...???
 // 全部importする場合には以下でOK
-// import { Chart as ChartJs } from 'chart.js/auto';
+import { Chart as ChartJs } from 'chart.js/auto';
 // 正直、ちゃんと動いてるか見た目を確認しながら
 // 追加していかないといけないので微妙
 // TODO 効果の検証...
-import {
-  Chart as ChartJs,
-  LineController,
-  LineElement,
-  PointElement,
-  TimeScale,
-  LinearScale,
-  Legend,
-  Colors,
-  Tooltip,
-} from 'chart.js';
-ChartJs.register(
-  LineController,
-  LineElement,
-  PointElement,
-  TimeScale,
-  LinearScale,
-  Legend,
-  Colors,
-  Tooltip,
-);
+//import {
+//  Chart as ChartJs,
+//  LineController,
+//  LineElement,
+//  PointElement,
+//  TimeScale,
+//  LinearScale,
+//  Legend,
+//  Colors,
+//  Tooltip,
+//} from 'chart.js';
+//ChartJs.register(
+//  LineController,
+//  LineElement,
+//  PointElement,
+//  TimeScale,
+//  LinearScale,
+//  Legend,
+//  Colors,
+//  Tooltip,
+//);
 import 'chartjs-adapter-luxon';
 
 
