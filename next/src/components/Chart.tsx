@@ -76,6 +76,8 @@ const Chart: React.FC<
           data: { datasets: datasets == null ? {} : datasets },
           options: {
             animation: false,
+            //aspectRatio: 1,
+            maintainAspectRatio: false,
             plugins: {
               title: {
                 display: true,
@@ -106,12 +108,16 @@ const Chart: React.FC<
   }, [mounted, datasets]);
 
   return (
-    <canvas 
-      id={chartId ?? 'chartjs-canvas'}
-      className={clsx(className)}
-      {...props}
-    >
-    </canvas>
+    <div className='w-full h-[80vh]'>
+      <canvas 
+        id={chartId ?? 'chartjs-canvas'}
+        className={clsx(
+          className,
+        )}
+        {...props}
+      >
+      </canvas>
+    </div>
   )
 };
 
