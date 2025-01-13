@@ -68,7 +68,16 @@ export const readLogs = async (
       const trimmedLine = line.trim();
       if (!trimmedLine) continue;
       const parsedLog: Log = LogSchema.parse(
-        JSON.parse(trimmedLine)
+        JSON.parse(
+          trimmedLine, 
+          //(key, value) => {
+          //  if (key === 'time') {
+          //    return new Date(value);
+          //  } else {
+          //    return value;
+          //  }
+          //}
+        )
       )
       ;
       const containerNames = Object.keys(parsedLog.stats);
