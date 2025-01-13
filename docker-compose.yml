@@ -6,6 +6,10 @@ services:
     volumes:
       - ./log:/app/log:ro # place a sample log_daily file!
       - ./core-node:/app:cached
+    develop:
+      watch:
+        - action: rebuild
+          path: .
 
   cephylas-nextjs:
     build: 
