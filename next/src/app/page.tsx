@@ -1,6 +1,3 @@
-
-
-//export const revalidate = 10;
 export const dynamic = 'force-dynamic';
 
 import Chart from '@/components/Chart';
@@ -12,6 +9,8 @@ import {
   prepareDatasetsIOandNet,
 } from '@/lib/datasets';
 
+import { trpc } from '@/trpc';
+
 export default async function Home() {
 
   const logs = await readLogs();
@@ -20,7 +19,7 @@ export default async function Home() {
     return (<div>データ集計中...</div>);
   }
 
-  console.time("データ成型");
+  console.time('データ成型');
 
   const datasetsCpu = prepareDatasets(
     logs, d => ({ x: d.time, y: d.cpu.percentage })
@@ -31,7 +30,11 @@ export default async function Home() {
   const datasetsDisk = prepareDatasetsIOandNet(logs, 'io');
   const datasetsNet = prepareDatasetsIOandNet(logs, 'net');
 
-  console.timeEnd("データ成型");
+  console.timeEnd('データ成型');
+
+  console.time('trpc call');
+  await trpc.stats.query();
+  console.timeEnd('trpc call');
 
   return (
     <>

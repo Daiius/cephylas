@@ -1,4 +1,12 @@
 services:
+  cephylas-node:
+    build:
+      dockerfile: ./core-node/Dockerfile
+    container_name: cephylas-node
+    volumes:
+      - ./log:/app/log:ro # place a sample log_daily file!
+      - ./core-node:/app:cached
+
   cephylas-nextjs:
     build: 
       dockerfile: ./next/Dockerfile
