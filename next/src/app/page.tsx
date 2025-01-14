@@ -14,11 +14,15 @@ import {
 
 export default async function Home() {
 
-  const logs = await readLogs();
-
-  if (Object.values(logs).length === 0) {
+  const response = await fetch('http://cephylas:7878');
+  if (!response.ok) {
     return (<div>データ集計中...</div>);
   }
+  const logs = JSON.parse(
+    await response.text(),
+    (key, value) => key === 'time' ? new Date(value) : value,
+  );
+
 
   console.time("データ成型");
 
@@ -32,6 +36,7 @@ export default async function Home() {
   const datasetsNet = prepareDatasetsIOandNet(logs, 'net');
 
   console.timeEnd("データ成型");
+
 
   return (
     <>

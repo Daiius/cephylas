@@ -22,7 +22,7 @@ fn handle_connection(
 }
 
 pub fn start_server() -> Result<(), error::Error> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:7878")?;
+    let listener = std::net::TcpListener::bind("0.0.0.0:7878")?;
 
     for stream in listener.incoming() {
         let stream = stream?;

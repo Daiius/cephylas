@@ -1,13 +1,6 @@
-FROM rust:latest AS builder
+FROM rust:latest
 
 WORKDIR /app
-COPY . .
-RUN cargo build --release 
 
-FROM gcr.io/distroless/cc:latest
-#FROM gcr.io/distroless/cc:debug
-#FROM debian:bookworm-slim
-WORKDIR /app
-COPY --from=builder /app/target/release/cephylas ./
-CMD ["/app/cephylas"]
+CMD ["cargo", "run"]
 
