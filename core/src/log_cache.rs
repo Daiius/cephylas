@@ -7,7 +7,9 @@ pub struct LogCache {
 
 impl LogCache {
     pub fn new() -> Self {
-        LogCache { container: vec![], }
+        let mut v: Vec<json::JsonValue> = Vec::new();
+        v.reserve(MAX_LOG_LENGTH);
+        LogCache { container: v, }
     }
     pub fn add_and_rotate(self: &mut Self, d: json::JsonValue) {
         if self.container.len() >= MAX_LOG_LENGTH {
