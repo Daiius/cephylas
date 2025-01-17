@@ -14,6 +14,7 @@ import {
 
 export default async function Home() {
 
+  console.time("データ取得");
   const response = await fetch('http://cephylas:7878');
   if (!response.ok) {
     return (<div>データ集計中...</div>);
@@ -22,6 +23,7 @@ export default async function Home() {
     await response.text(),
     (key, value) => key === 'time' ? new Date(value) : value,
   );
+  console.timeEnd("データ取得");
 
 
   console.time("データ成型");

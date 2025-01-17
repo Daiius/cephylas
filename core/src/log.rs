@@ -1,10 +1,12 @@
 use json;
 use super::error;
+use super::log_cache;
 
 const DAILY_LOG_PATH: &str = "./log/log_daily";
 
 const DOCKER_API_CONTAINERS: &str = "/containers/json";
 const DOCKER_API_STATS: &str = "/containers/{}/stats?stream=false&one-shot=true";
+
 
 fn call_docker_api<
     P: AsRef<std::path::Path>,
@@ -312,7 +314,14 @@ pub fn custom_dump(json: &json::JsonValue) -> String {
     }
 }
 
-pub fn log_json() -> Result<(), error::Error> {
+pub fn log_json(
+    log_cache: 
+        &std::sync::Arc<
+            std::sync::RwLock<
+                log_cache::LogCache
+            >
+        >
+) -> Result<(), error::Error> {
     let socket_path = "/var/run/docker.sock";
 
     // create log dir if not exists
@@ -365,6 +374,9 @@ pub fn log_json() -> Result<(), error::Error> {
                 let log_content = custom_dump(&usage);
                 println!("{}", log_content);
                 log_daily(DAILY_LOG_PATH, log_content)?;
+                let mut lock = log_cache.write()
+                    .expect("failed to get write lock for log_cache");
+                lock.add_and_rotate(usage);
             }
         }
 
@@ -373,18 +385,50 @@ pub fn log_json() -> Result<(), error::Error> {
     }
 }
 
-pub fn read_log() 
--> Result<json::JsonValue, error::Error> {
+pub fn read_log(
+    log_cache:
+        &std::sync::Arc<
+            std::sync::RwLock<
+                log_cache::LogCache
+            >
+        >
+) -> Result<(), error::Error> {
 
-    let mut json = json::object!{};
+    let nlines = check_nlines()?;
+    let nlines_to_skip = nlines.saturating_sub(log_cache::MAX_LOG_LENGTH as u64);
+
     let file = std::fs::OpenOptions::new()
         .read(true)
         .open(DAILY_LOG_PATH)?;
     let reader = std::io::BufReader::new(file);
+    let mut iline = 0;
     for line in std::io::BufRead::lines(reader) {
+        iline += 1;
+        if iline < nlines_to_skip { continue; }
+
         let line = line?;
-        let log_line_json = json::parse(&line)?;
-        let container_names = log_line_json["stats"]
+        let log_line = json::parse(&line)?;
+
+        let mut lock = log_cache.write()
+            .expect("cannot lock log_cache"); 
+        lock.add_and_rotate(log_line);
+    }
+
+    Ok(())
+}
+
+pub fn reshape_log_cache(
+    log_cache:
+        &std::sync::Arc<
+            std::sync::RwLock<
+                log_cache::LogCache
+            >
+        >
+) -> Result<json::JsonValue, error::Error> {
+    let mut json = json::object!{};
+    let lock = log_cache.read().expect("failed to read lock log_cache");
+    for log_line in lock.data() {
+        let container_names = log_line["stats"]
             .entries()
             .map(|(k, _v)| k);
         for container_name in container_names {
@@ -392,16 +436,27 @@ pub fn read_log()
                 json[container_name] = json::array!{};
             }
             let mut stat_json = json::object!{
-                time: log_line_json["time"].as_str(),
+                time: log_line["time"].as_str(),
             };
-            log_line_json["stats"][container_name].entries()
+            log_line["stats"][container_name].entries()
                 .for_each(|(k, v)| stat_json.insert(
                     k, json::parse(&custom_dump(v)).expect("")
                 ).expect(""));
             json[container_name].push(stat_json)?;
         }
     }
-    
+
     Ok(json)
 }
 
+fn check_nlines() -> Result<u64, error::Error> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(DAILY_LOG_PATH)?;
+    let reader = std::io::BufReader::new(file);
+    let mut nlines: u64 = 0;
+    for _ in std::io::BufRead::lines(reader) {
+        nlines += 1;
+    }
+    Ok(nlines)
+}
