@@ -433,14 +433,19 @@ pub fn reshape_log_cache(
             .map(|(k, _v)| k);
         for container_name in container_names {
             if json[container_name].is_null() {
-                json[container_name] = json::array!{};
+                // 初期長さをセット
+                json[container_name] = 
+                    json::Array::with_capacity(log_cache::MAX_LOG_LENGTH)
+                    .into();
             }
             let mut stat_json = json::object!{
                 time: log_line["time"].as_str(),
             };
+            // 値の移動やコピーで対応
+            // これまで一度dumpしてparseしていたが無駄だと思うので...
             log_line["stats"][container_name].entries()
                 .for_each(|(k, v)| stat_json.insert(
-                    k, json::parse(&custom_dump(v)).expect("")
+                    k, v.clone()
                 ).expect(""));
             json[container_name].push(stat_json)?;
         }
