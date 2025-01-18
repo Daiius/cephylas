@@ -7,6 +7,181 @@ const DAILY_LOG_PATH: &str = "./log/log_daily";
 const DOCKER_API_CONTAINERS: &str = "/containers/json";
 const DOCKER_API_STATS: &str = "/containers/{}/stats?stream=false&one-shot=true";
 
+//
+// resource usage data structures
+//
+#[derive(Debug)]
+pub struct CpuStats {
+    total: Option<u64>,
+    system: Option<u64>,
+    ncpu: Option<u8>, // more than 256 cores??
+}
+#[derive(Debug)]
+pub struct MemoryStats {
+    used: Option<u64>,
+    available: Option<u64>,
+}
+#[derive(Debug)]
+pub struct IoStats {
+    read: Option<u64>,
+    write: Option<u64>,
+}
+#[derive(Debug)]
+pub struct NetStats {
+    send: Option<u64>,
+    recv: Option<u64>,
+}
+#[derive(Debug)]
+pub struct Stats {
+    time: Option<String>,
+    cpu: CpuStats,
+    memory: MemoryStats,
+    io: IoStats,
+    net: NetStats,
+}
+impl Default for Stats {
+    fn default() -> Self {
+        Stats {
+            time: None,
+            cpu: CpuStats { total: None, system: None, ncpu: None, },
+            memory: MemoryStats { used: None, available: None, },
+            io: IoStats { read: None, write: None },
+            net: NetStats { recv: None, send: None },
+        }
+    }
+}
+
+pub struct CpuUsage {
+    percentage: Option<f32>,
+    total: Option<u64>,
+    system: Option<u64>,
+    ncpu: Option<u8>,
+}
+fn option_to_string<T>(value: Option<T>) -> String 
+where
+    T: ToString + std::fmt::Display
+{
+    match value {
+        Some(n) => {
+            format!("{:.2}", n)
+        },
+        None => "null".to_string(),
+    }
+}
+impl std::fmt::Display for CpuUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{\"percentage\":{0},\"total\":{1},\"system\":{2},\"ncpu\":{3}}}",
+            option_to_string(self.percentage),
+            option_to_string(self.total),
+            option_to_string(self.system),
+            option_to_string(self.ncpu),
+        )
+    }
+}
+pub struct MemoryUsage {
+    percentage: Option<f32>,
+    used: Option<u64>,
+    available: Option<u64>,
+}
+impl std::fmt::Display for MemoryUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{\"percentage\":{0},\"used\":{1},\"available\":{2}}}",
+            option_to_string(self.percentage),
+            option_to_string(self.used),
+            option_to_string(self.available),
+        )
+    }
+}
+#[allow(non_snake_case)]
+pub struct IoUsage {
+    readkB: Option<u64>,
+    writekB: Option<u64>,
+    readkBps: Option<u32>,
+    writekBps: Option<u32>,
+}
+impl std::fmt::Display for IoUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{\"readkB\":{0},\"writekB\":{1},\"readkBps\":{2},\"writekBps\":{3}}}",
+            option_to_string(self.readkB),
+            option_to_string(self.writekB),
+            option_to_string(self.readkBps),
+            option_to_string(self.writekBps),
+        )
+    }
+}
+#[allow(non_snake_case)]
+pub struct NetUsage {
+    recvkB: Option<u64>,
+    sendkB: Option<u64>,
+    recvkBps: Option<u32>,
+    sendkBps: Option<u32>,
+}
+impl std::fmt::Display for NetUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{\"recvkB\":{0},\"sendkB\":{1},\"recvkBps\":{2},\"sendkBps\":{3}}}",
+            option_to_string(self.recvkB),
+            option_to_string(self.sendkB),
+            option_to_string(self.recvkBps),
+            option_to_string(self.sendkBps),
+        )
+    }
+}
+#[allow(non_snake_case)]
+pub struct Usage {
+    cpu: CpuUsage,
+    memory: MemoryUsage,
+    io: IoUsage,
+    net: NetUsage,
+}
+impl std::fmt::Display for Usage {
+    fn fmt(
+        &self, 
+        f: &mut std::fmt::Formatter<'_>
+    ) -> std::fmt::Result {
+        write!(
+            f,
+            "{{\"cpu\":{cpu},\"memory\":{memory},\"io\":{io},\"net\":{net}}}",
+            cpu = self.cpu,
+            memory = self.memory,
+            io = self.io,
+            net = self.net,
+        )
+    }
+}
+#[allow(non_snake_case)]
+pub struct Usages {
+    time: String,
+    millis: u16,
+    usages: std::collections::HashMap<String, Usage>,
+}
+impl std::fmt::Display for Usages {
+    fn fmt(
+        &self, 
+        f: &mut std::fmt::Formatter<'_>
+    ) -> std::fmt::Result {
+        let containers_part = self.usages
+            .iter()
+            .map(|(k, v)| format!("\"{k}\":{v}", k = k, v = v))
+            .collect::<Vec<String>>()
+            .join(",")
+            ;
+            
+        write!(
+            f,
+            "{{\"time\":\"{time}\",\"millis\":{millis},{containers_part}}}",
+            time = self.time, 
+            millis = self.millis,
+        )
+    }
+}
 
 fn call_docker_api<
     P: AsRef<std::path::Path>,
@@ -71,7 +246,7 @@ fn get_container_stats<
 >(
     socket_path: T,
     container_name: U,
-) -> Result<json::JsonValue, error::Error> {
+) -> Result<Stats, error::Error> {
     let response = call_docker_api(
         socket_path, 
         DOCKER_API_STATS.replace("{}", container_name.as_ref()),
@@ -87,7 +262,7 @@ fn get_container_stats<
 
 fn reshape_json(
     json: &json::JsonValue,
-) -> json::JsonValue {
+) -> Stats {
     let total = 
         json["cpu_stats"]["cpu_usage"]["total_usage"]
         .as_u64()
@@ -98,7 +273,8 @@ fn reshape_json(
         .map(|v| v / 1_000_000); // ns -> ms
     let number_cpus =
         json["cpu_stats"]["online_cpus"]
-        .as_u32();
+        .as_u16()
+        .map(|n| n as u8);
     let used_memory =
         json["memory_stats"]["usage"].as_u64()
         .zip(
@@ -127,23 +303,21 @@ fn reshape_json(
         .and_then(|v| v["value"].as_u64());
     let time = json["read"].as_str();
 
-
-    json::object!{
-        time: time, 
-        cpu: { 
-            total: total, 
-            system: system, 
+    Stats {
+        time: time.map(|s| s.to_string()), 
+        cpu: CpuStats { 
+            total, system, 
             ncpu: number_cpus
         },
-        memory: {
+        memory: MemoryStats {
             used: used_memory, 
             available: available_memory
         },
-        io: {
+        io: IoStats {
             read: blkio_read,
             write: blkio_write, 
         },
-        net: {
+        net: NetStats {
             send: net_tx,
             recv: net_rx,
         }
@@ -152,28 +326,25 @@ fn reshape_json(
 
 fn get_containers_stats<T: AsRef<std::path::Path>>(
     socket_path: T,
-) -> Result<json::JsonValue, error::Error> {
+) -> Result<
+    std::collections::HashMap<String, Stats>, 
+    error::Error
+> {
     let container_names = get_container_names(&socket_path)?;
 
-    let mut log_json_tmp = json::JsonValue::new_object();
+    let mut stats_map: std::collections::HashMap<String, Stats>
+         = std::collections::HashMap::new();
     for container_name in container_names {
         // in one-shot mode, pre-stats are not available.
         // we have to take diff by ourselves
-        let stats_json = get_container_stats(
+        let stats = get_container_stats(
             &socket_path, &container_name
         )?;
 
-        log_json_tmp[&container_name] = stats_json;
+        stats_map.insert(container_name, stats);
     }
-    let log_json = json::object!{
-        time: log_json_tmp.entries()
-            .take(1)
-            .map(|(_, v)| v["time"].as_str())
-            .next(),
-        stats: log_json_tmp,
-    };
 
-    Ok(log_json)
+    Ok(stats_map)
 }
 
 fn get_now_as_millis() -> Result<u128, std::time::SystemTimeError> {
@@ -182,90 +353,96 @@ fn get_now_as_millis() -> Result<u128, std::time::SystemTimeError> {
     Ok(duration.as_millis())
 }
 
-fn calc_usage(
-    millis: &u64,
-    stats: &json::JsonValue,
-    prev_stats: &json::JsonValue,
-) -> Result<json::JsonValue, error::Error> {
-    let container_names = stats["stats"].entries()
-        .map(|(key, _)| key);
+fn calc_usages(
+    millis: &u16,
+    stats: &std::collections::HashMap<String, Stats>,
+    prev_stats: &std::collections::HashMap<String, Stats>,
+) -> Result<Usages, error::Error> {
 
-    let mut usages = json::JsonValue::new_object();
-    usages["time"] = stats["time"].as_str().unwrap_or("null").into();
-    usages["millis"] = (*millis).into();
+    let container_names = stats.keys();
+
+    let time = stats.values().next()
+        .and_then(|s| s.time.clone())
+        .expect("time entry should exist");
+    let millis = millis.clone();
+    let mut usages = Usages {
+        time, millis, 
+        usages: std::collections::HashMap::new(),
+    };
     for container_name in container_names {
-        let stats = &stats["stats"][container_name];
+        let stats = &stats[container_name];
         //println!("calc stats: {}", stats);
-        let prev_stats = &prev_stats["stats"][container_name];
+        let prev_stats = &prev_stats[container_name];
         //println!("calc prev_stats: {}", prev_stats);
 
         // CPU calculations
-        let cpu_delta =
-           stats["cpu"]["total"].as_u64() 
-           .zip(prev_stats["cpu"]["total"].as_u64())
+        let cpu_delta = stats.cpu.total 
+           .zip(prev_stats.cpu.total)
            .map(|(a, b)| a.saturating_sub(b));
-        let system_cpu_delta = 
-           stats["cpu"]["system"].as_u64()
-           .zip(prev_stats["cpu"]["system"].as_u64())
+        let system_cpu_delta = stats.cpu.system
+           .zip(prev_stats.cpu.system)
            .map(|(a, b)| a.saturating_sub(b));
-        let ncpu = 
-            stats["cpu"]["ncpu"].as_u64();
-        let cpu_percentage =
-            cpu_delta.zip(system_cpu_delta).zip(ncpu)
-            .map(|((a, b), c)| (a as f32) / (b as f32) * (c as f32) * 100_f32);
+        let cpu_percentage = cpu_delta
+            .zip(system_cpu_delta)
+            .zip(stats.cpu.ncpu)
+            .map(|((a, b), c)| 
+                 (a as f32) / (b as f32) * (c as f32) * 100_f32
+            );
         //println!("cpu_percentage: {:?}", cpu_percentage);
 
         // Memory calculations
-        let memory_percentage =
-            stats["memory"]["used"].as_u64()
-            .zip(stats["memory"]["available"].as_u64())
+        let memory_percentage = stats.memory.used
+            .zip(stats.memory.available)
             .map(|(a,b)| (a as f32) / (b as f32) * 100_f32);
 
         // IO calculations
-        let io_read_kb_per_s =
-            stats["io"]["read"].as_u64()
-            .zip(prev_stats["io"]["read"].as_u64())
-            .map(|(a,b)| a.saturating_sub(b) / 1000 / (millis / 1000));
-        let io_write_kb_per_s =
-            stats["io"]["write"].as_u64()
-            .zip(prev_stats["io"]["write"].as_u64())
-            .map(|(a,b)| a.saturating_sub(b) / 1000 / (millis / 1000));
+        let io_read_kb_per_s = stats.io.read
+            .zip(prev_stats.io.read)
+            .map(|(a,b)| a.saturating_sub(b) 
+                 / 1000 / (millis as u64 / 1000)
+            );
+        let io_write_kb_per_s = stats.io.write
+            .zip(prev_stats.io.write)
+            .map(|(a,b)| a.saturating_sub(b) 
+                 / 1000 / (millis as u64 / 1000)
+            );
 
         // Net calculations
-        let net_send_kb_per_s =
-            stats["net"]["send"].as_u64()
-            .zip(prev_stats["net"]["send"].as_u64())
-            .map(|(a,b)| a.saturating_sub(b) / millis);
-        let net_recv_kb_per_s =
-            stats["net"]["recv"].as_u64()
-            .zip(prev_stats["net"]["recv"].as_u64())
-            .map(|(a,b)| a.saturating_sub(b) / millis);
+        let net_send_kb_per_s = stats.net.send
+            .zip(prev_stats.net.send)
+            .map(|(a,b)| a.saturating_sub(b) / millis as u64);
+        let net_recv_kb_per_s = stats.net.recv
+            .zip(prev_stats.net.recv)
+            .map(|(a,b)| a.saturating_sub(b) / millis as u64);
 
-        usages["stats"][container_name] = json::object!{
-            cpu: {
-                percentage: cpu_percentage,
-                total: cpu_delta,
-                system: system_cpu_delta,
-                ncpu: ncpu,
-            },
-            memory: {
-                percentage: memory_percentage,
-                used: stats["memory"]["used"].as_u64(),
-                available: stats["memory"]["available"].as_u64(),
-            },
-            io: {
-                readkBps: io_read_kb_per_s,
-                writekBps: io_write_kb_per_s,
-                readkB: stats["io"]["read"].as_u64().map(|x| x / 1000),
-                writekB: stats["io"]["write"].as_u64().map(|x| x / 1000),
-            },
-            net: {
-                sendkBps: net_send_kb_per_s,
-                recvkBps: net_recv_kb_per_s,
-                sendkB: stats["net"]["send"].as_u64().map(|x| x / 1000),
-                recvkB: stats["net"]["recv"].as_u64().map(|x| x / 1000),
-            },
-        };
+        usages.usages.insert(
+            container_name.to_string(),
+            Usage {
+                cpu: CpuUsage {
+                    percentage: cpu_percentage,
+                    total: cpu_delta,
+                    system: system_cpu_delta,
+                    ncpu: stats.cpu.ncpu,
+                },
+                memory: MemoryUsage {
+                    percentage: memory_percentage,
+                    used: stats.memory.used,
+                    available: stats.memory.available,
+                },
+                io: IoUsage {
+                    readkBps: io_read_kb_per_s.map(|n| n as u32),
+                    writekBps: io_write_kb_per_s.map(|n| n as u32),
+                    readkB: stats.io.read.map(|x| x / 1000),
+                    writekB: stats.io.write.map(|x| x / 1000),
+                },
+                net: NetUsage {
+                    sendkBps: net_send_kb_per_s.map(|n| n as u32),
+                    recvkBps: net_recv_kb_per_s.map(|n| n as u32),
+                    sendkB: stats.net.send.map(|x| x / 1000),
+                    recvkB: stats.net.recv.map(|x| x / 1000),
+                },
+            }
+        );
     }
 
     Ok(usages)
@@ -339,7 +516,8 @@ pub fn log_json(
         - now_as_millis % tick.as_millis()
     );
 
-    let mut prev_stats = json::object!{};
+    let mut prev_stats: std::collections::HashMap<String, Stats>
+        = std::collections::HashMap::new();
     loop {
         let millis_to_wait = timing.saturating_sub(get_now_as_millis()?) as u64;
         println!("waiting {} millis...", millis_to_wait);
@@ -353,27 +531,26 @@ pub fn log_json(
         //println!("prev_stats: {}", prev_stats.dump());
 
 
-        let first_stat = stats["stats"].entries()
-            .take(1).map(|(_, v)| v).next();
-        let first_prev_stat = prev_stats["stats"].entries()
-            .take(1).map(|(_, v)| v).next();
+        let first_stat = stats.values().next();
+        let first_prev_stat = prev_stats.values().next();
             
         let log_condition = first_stat
             .zip(first_prev_stat)
-            .map(|(a, b)| !a["cpu"].is_null() && !b["cpu"].is_null() )
+            .map(|(a, b)| !a.cpu.total.is_none() 
+                 && !b.cpu.total.is_none()
+            )
             .unwrap_or(false);
 
         println!("log condition: {}", log_condition);
 
         if log_condition {
-            let usage_result = calc_usage(
-                &(tick.as_millis() as u64), 
+            let usage_result = calc_usages(
+                &(tick.as_millis() as u16), 
                 &stats, &prev_stats
             );
             if let Ok(usage) = usage_result {
-                let log_content = custom_dump(&usage);
-                println!("{}", log_content);
-                log_daily(DAILY_LOG_PATH, log_content)?;
+                println!("{}", usage);
+                log_daily(DAILY_LOG_PATH, usage.to_string())?;
                 let mut lock = log_cache.write()
                     .expect("failed to get write lock for log_cache");
                 lock.add_and_rotate(usage);
@@ -383,6 +560,50 @@ pub fn log_json(
         timing += tick.as_millis();
         prev_stats = stats;
     }
+}
+
+fn json_to_usage(
+    json: &json::JsonValue
+) -> Result<Usages, error::Error> {
+
+
+    Ok(Usages {
+        time:
+            json["time"].as_str()
+                .ok_or("time entry not found".to_string())?
+                .to_string(),
+        millis:
+            json["millis"].as_u16()
+                .ok_or("millis entry not found")?,
+        usages:
+            json["stats"].entries()
+                .map(|(k, v)| (k.to_string(), Usage {
+                    cpu: CpuUsage {
+                        percentage: v["cpu"]["percentage"].as_f32(),
+                        total: v["cpu"]["total"].as_u64(),
+                        system: v["cpu"]["system"].as_u64(),
+                        ncpu: v["cpu"]["ncpu"].as_u8(),
+                    },
+                    memory: MemoryUsage {
+                        percentage: v["memory"]["percentage"].as_f32(),
+                        used: v["memory"]["used"].as_u64(),
+                        available: v["memory"]["available"].as_u64(),
+                    },
+                    io: IoUsage {
+                        readkB: v["io"]["readkB"].as_u64(),
+                        writekB: v["io"]["sendkB"].as_u64(),
+                        readkBps: v["io"]["readkBps"].as_u32(),
+                        writekBps: v["io"]["sendkBps"].as_u32(),
+                    },
+                    net: NetUsage {
+                        recvkB: v["net"]["recvkB"].as_u64(),
+                        sendkB: v["net"]["sendkB"].as_u64(),
+                        recvkBps: v["net"]["recvkBps"].as_u32(),
+                        sendkBps: v["net"]["sendkBps"].as_u32(),
+                    }
+                }))
+                .collect(),
+    })
 }
 
 pub fn read_log(
@@ -407,11 +628,23 @@ pub fn read_log(
         if iline < nlines_to_skip { continue; }
 
         let line = line?;
-        let log_line = json::parse(&line)?;
-
-        let mut lock = log_cache.write()
-            .expect("cannot lock log_cache"); 
-        lock.add_and_rotate(log_line);
+        match json::parse(&line) {
+            Ok(json) => {
+                match json_to_usage(&json) {
+                    Ok(usages) => {
+                        let mut lock = log_cache.write()
+                            .expect("cannot lock log_cache"); 
+                        lock.add_and_rotate(usages);
+                    },
+                    Err(e) => {
+                        eprintln!("error in log: {}", e);
+                    },
+                }
+            },
+            Err(e) => {
+                eprintln!("error in log json format: {}", e);
+            },
+        }
     }
 
     Ok(())
@@ -427,10 +660,8 @@ pub fn reshape_log_cache(
 ) -> Result<json::JsonValue, error::Error> {
     let mut json = json::object!{};
     let lock = log_cache.read().expect("failed to read lock log_cache");
-    for log_line in lock.data() {
-        let container_names = log_line["stats"]
-            .entries()
-            .map(|(k, _v)| k);
+    for usages in lock.data() {
+        let container_names = usages.usages.keys();
         for container_name in container_names {
             if json[container_name].is_null() {
                 // 初期長さをセット
@@ -438,15 +669,34 @@ pub fn reshape_log_cache(
                     json::Array::with_capacity(log_cache::MAX_LOG_LENGTH)
                     .into();
             }
-            let mut stat_json = json::object!{
-                time: log_line["time"].as_str(),
+            let u = &usages.usages[container_name];
+            let stat_json = json::object!{
+                time: usages.time.clone(),
+                cpu: {
+                    percentage: u.cpu.percentage,
+                    total: u.cpu.total,
+                    system: u.cpu.system,
+                    ncpu: u.cpu.ncpu,
+                },
+                memory: {
+                    percentage: u.memory.percentage,
+                    used: u.memory.used,
+                    available: u.memory.available,
+                },
+                io: {
+                    readkB: u.io.readkB,
+                    sendkB: u.io.writekB,
+                    readkBps: u.io.readkBps,
+                    sendkBps: u.io.writekBps,
+                },
+                net: {
+                    recvkB: u.net.recvkB,
+                    sendkB: u.net.sendkB,
+                    recvkBps: u.net.recvkBps,
+                    sendkBps: u.net.sendkBps,
+                }
             };
-            // 値の移動やコピーで対応
-            // これまで一度dumpしてparseしていたが無駄だと思うので...
-            log_line["stats"][container_name].entries()
-                .for_each(|(k, v)| stat_json.insert(
-                    k, v.clone()
-                ).expect(""));
+
             json[container_name].push(stat_json)?;
         }
     }
