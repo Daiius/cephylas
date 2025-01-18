@@ -1,4 +1,12 @@
 services:
+  cephylas:
+    build:
+      dockerfile: ./core/Dockerfile
+    container_name: cephylas
+    volumes:
+      - ./log:/app/log
+      - ./core:/app
+
   cephylas-nextjs:
     build: 
       dockerfile: ./next/Dockerfile
