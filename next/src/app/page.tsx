@@ -6,36 +6,46 @@ export const dynamic = 'force-dynamic';
 import Chart from '@/components/Chart';
 import Header from '@/components/Header';
 
-import { readLogs } from '@/lib/logReader';
-import {
-  prepareDatasets,
-  prepareDatasetsIOandNet,
-} from '@/lib/datasets';
 
 export default async function Home() {
 
   console.time("データ取得");
-  const response = await fetch('http://cephylas:7878');
-  if (!response.ok) {
-    return (<div>データ集計中...</div>);
+  const containersResponse = 
+    await fetch('http://cephylas:7878/containers');
+  if (!containersResponse.ok) {
+    return (<div>コンテナ名取得中...</div>);
   }
-  const logs = JSON.parse(
-    await response.text(),
-    (key, value) => key === 'time' ? new Date(value) : value,
-  );
+  const containerNames = await containersResponse.json();
   console.timeEnd("データ取得");
 
 
   console.time("データ成型");
 
-  const datasetsCpu = prepareDatasets(
-    logs, d => ({ x: d.time, y: d.cpu.percentage })
-  );
-  const datasetsMemory = prepareDatasets(
-    logs, d => ({ x: d.time, y: d.memory.percentage })
-  );
-  const datasetsDisk = prepareDatasetsIOandNet(logs, 'io');
-  const datasetsNet = prepareDatasetsIOandNet(logs, 'net');
+  const datasetsCpu: { 
+    label: string;
+    data: any[];
+  }[] = [];
+  for (const containerName of containerNames) {
+    const cpuResponse = 
+      await fetch(`http://cephylas:7878/containers/${containerName}/cpu`);
+    if (!cpuResponse.ok) return (<div>CPU使用率取得中...</div>);
+    const rawData = await cpuResponse.json();
+    console.log("rawData: ", rawData);
+    datasetsCpu.push({
+      label: containerName,
+      data: rawData.map((d: any) => ({ x: new Date(d.time), y: d.percentage }))
+    });
+  }
+  console.log('%o', datasetsCpu);
+  
+  //const datasetsCpu = prepareDatasets(
+  //  logs, d => ({ x: d.time, y: d.cpu.percentage })
+  //);
+  //const datasetsMemory = prepareDatasets(
+  //  logs, d => ({ x: d.time, y: d.memory.percentage })
+  //);
+  //const datasetsDisk = prepareDatasetsIOandNet(logs, 'io');
+  //const datasetsNet = prepareDatasetsIOandNet(logs, 'net');
 
   console.timeEnd("データ成型");
 
@@ -49,6 +59,7 @@ export default async function Home() {
           datasets={datasetsCpu} 
           title='CPU usage (%)' 
         />
+        {/*
         <Chart 
           chartId='chartjs-memory-usage'
           datasets={datasetsMemory} 
@@ -64,6 +75,7 @@ export default async function Home() {
           datasets={datasetsNet} 
           title='Net usage (kB/s)'
         />
+        */}
       </div>
     </>
   );

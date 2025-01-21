@@ -122,7 +122,7 @@ fn route_usage(
         // (404が後で返されるはず)
         if let Some(data) = data {
             let response = format!(
-                "HTTP/1.1 200 OK\r\n\r\n [{}]",
+                "HTTP/1.1 200 OK\r\n\r\n {}",
                 data
             );
             stream.write(response.as_bytes())?;
