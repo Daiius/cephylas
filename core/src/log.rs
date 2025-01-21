@@ -1,3 +1,6 @@
+
+use std::collections::HashMap;
+
 use json;
 use super::error;
 use super::log_cache;
@@ -57,7 +60,7 @@ pub struct CpuUsage {
     system: Option<u64>,
     ncpu: Option<u8>,
 }
-fn option_to_string<T>(value: Option<T>) -> String 
+pub fn option_to_string<T>(value: Option<T>) -> String 
 where
     T: ToString + std::fmt::Display
 {
@@ -80,6 +83,11 @@ impl std::fmt::Display for CpuUsage {
         )
     }
 }
+impl Default for CpuUsage {
+    fn default() -> Self {
+        CpuUsage { percentage: None, total: None, system: None, ncpu: None }
+    }
+}
 pub struct MemoryUsage {
     percentage: Option<f32>,
     used: Option<u64>,
@@ -94,6 +102,11 @@ impl std::fmt::Display for MemoryUsage {
             option_to_string(self.used),
             option_to_string(self.available),
         )
+    }
+}
+impl Default for MemoryUsage {
+    fn default() -> Self {
+        MemoryUsage { percentage: None, used: None, available: None }
     }
 }
 #[allow(non_snake_case)]
@@ -115,6 +128,11 @@ impl std::fmt::Display for IoUsage {
         )
     }
 }
+impl Default for IoUsage {
+    fn default() -> Self {
+        IoUsage { readkB: None, writekB: None, readkBps: None, writekBps: None }
+    }
+}
 #[allow(non_snake_case)]
 pub struct NetUsage {
     recvkB: Option<u64>,
@@ -134,7 +152,11 @@ impl std::fmt::Display for NetUsage {
         )
     }
 }
-#[allow(non_snake_case)]
+impl Default for NetUsage {
+    fn default() -> Self {
+        NetUsage { recvkB: None, sendkB: None, recvkBps: None, sendkBps: None }
+    }
+}
 pub struct Usage {
     cpu: CpuUsage,
     memory: MemoryUsage,
@@ -160,7 +182,7 @@ impl std::fmt::Display for Usage {
 pub struct Usages {
     time: String,
     millis: u16,
-    usages: std::collections::HashMap<String, Usage>,
+    usages: HashMap<String, Usage>,
 }
 impl std::fmt::Display for Usages {
     fn fmt(
@@ -327,13 +349,13 @@ fn reshape_json(
 fn get_containers_stats<T: AsRef<std::path::Path>>(
     socket_path: T,
 ) -> Result<
-    std::collections::HashMap<String, Stats>, 
+    HashMap<String, Stats>, 
     error::Error
 > {
     let container_names = get_container_names(&socket_path)?;
 
-    let mut stats_map: std::collections::HashMap<String, Stats>
-         = std::collections::HashMap::new();
+    let mut stats_map: HashMap<String, Stats>
+         = HashMap::new();
     for container_name in container_names {
         // in one-shot mode, pre-stats are not available.
         // we have to take diff by ourselves
@@ -355,8 +377,8 @@ fn get_now_as_millis() -> Result<u128, std::time::SystemTimeError> {
 
 fn calc_usages(
     millis: &u16,
-    stats: &std::collections::HashMap<String, Stats>,
-    prev_stats: &std::collections::HashMap<String, Stats>,
+    stats: &HashMap<String, Stats>,
+    prev_stats: &HashMap<String, Stats>,
 ) -> Result<Usages, error::Error> {
 
     let container_names = stats.keys();
@@ -367,7 +389,7 @@ fn calc_usages(
     let millis = millis.clone();
     let mut usages = Usages {
         time, millis, 
-        usages: std::collections::HashMap::new(),
+        usages: HashMap::new(),
     };
     for container_name in container_names {
         let stats = &stats[container_name];
@@ -491,13 +513,52 @@ pub fn custom_dump(json: &json::JsonValue) -> String {
     }
 }
 
+fn insert_usages_to_cache(
+    container_name: &String,
+    usages: &Usages,
+    log_cache: &mut log_cache::UsageCache,
+) {
+    log_cache.cpu.insert(
+        container_name.clone(),
+        log_cache::TimedCpuUsage {
+            time: usages.time.clone(),
+            percentage:
+                usages.usages[container_name].cpu.percentage,
+        }
+    );
+    log_cache.memory.insert(
+        container_name.clone(),
+        log_cache::TimedMemoryUsage {
+            time: usages.time.clone(),
+            percentage:
+                usages.usages[container_name].memory.percentage
+        }
+    );
+    log_cache.io.insert(
+        container_name.clone(),
+        log_cache::TimedIoUsage {
+            time: usages.time.clone(),
+            readkBps:
+                usages.usages[container_name].io.readkBps,
+            writekBps:
+                usages.usages[container_name].io.writekBps,
+        }
+    );
+    log_cache.net.insert(
+        container_name.clone(),
+        log_cache::TimedNetUsage {
+            time: usages.time.clone(),
+            recvkBps:
+                usages.usages[container_name].net.recvkBps,
+            sendkBps: 
+                usages.usages[container_name].net.sendkBps,
+        }
+    );
+
+}
+
 pub fn log_json(
-    log_cache: 
-        &std::sync::Arc<
-            std::sync::RwLock<
-                log_cache::LogCache
-            >
-        >
+    log_cache: &log_cache::SharedUsageCache
 ) -> Result<(), error::Error> {
     let socket_path = "/var/run/docker.sock";
 
@@ -516,8 +577,8 @@ pub fn log_json(
         - now_as_millis % tick.as_millis()
     );
 
-    let mut prev_stats: std::collections::HashMap<String, Stats>
-        = std::collections::HashMap::new();
+    let mut prev_stats: HashMap<String, Stats>
+        = HashMap::new();
     loop {
         let millis_to_wait = timing.saturating_sub(get_now_as_millis()?) as u64;
         println!("waiting {} millis...", millis_to_wait);
@@ -553,7 +614,18 @@ pub fn log_json(
                 log_daily(DAILY_LOG_PATH, usage.to_string())?;
                 let mut lock = log_cache.write()
                     .expect("failed to get write lock for log_cache");
-                lock.add_and_rotate(usage);
+
+                let container_names = 
+                    usage.usages.keys().cloned()
+                    .collect::<Vec<String>>();
+                for container_name in container_names {
+                    // usage中のデータをキャッシュへ移動
+                    insert_usages_to_cache(
+                        &container_name, 
+                        &usage, 
+                        &mut (*lock),
+                    );
+                }
             }
         }
 
@@ -607,12 +679,7 @@ fn json_to_usage(
 }
 
 pub fn read_log(
-    log_cache:
-        &std::sync::Arc<
-            std::sync::RwLock<
-                log_cache::LogCache
-            >
-        >
+    log_cache: &log_cache::SharedUsageCache
 ) -> Result<(), error::Error> {
 
     let nlines = check_nlines()?;
@@ -634,7 +701,16 @@ pub fn read_log(
                     Ok(usages) => {
                         let mut lock = log_cache.write()
                             .expect("cannot lock log_cache"); 
-                        lock.add_and_rotate(usages);
+                        let container_names = 
+                            usages.usages.keys().cloned().collect::<Vec<String>>();
+                        for container_name in container_names {
+                            // コンテナ名がキャッシュ中に無ければ追加
+                            insert_usages_to_cache(
+                                &container_name, 
+                                &usages, 
+                                &mut (*lock)
+                            );
+                        }
                     },
                     Err(e) => {
                         eprintln!("error in log: {}", e);
@@ -650,59 +726,6 @@ pub fn read_log(
     Ok(())
 }
 
-pub fn reshape_log_cache(
-    log_cache:
-        &std::sync::Arc<
-            std::sync::RwLock<
-                log_cache::LogCache
-            >
-        >
-) -> Result<json::JsonValue, error::Error> {
-    let mut json = json::object!{};
-    let lock = log_cache.read().expect("failed to read lock log_cache");
-    for usages in lock.data() {
-        let container_names = usages.usages.keys();
-        for container_name in container_names {
-            if json[container_name].is_null() {
-                // 初期長さをセット
-                json[container_name] = 
-                    json::Array::with_capacity(log_cache::MAX_LOG_LENGTH)
-                    .into();
-            }
-            let u = &usages.usages[container_name];
-            let stat_json = json::object!{
-                time: usages.time.clone(),
-                cpu: {
-                    percentage: u.cpu.percentage,
-                    total: u.cpu.total,
-                    system: u.cpu.system,
-                    ncpu: u.cpu.ncpu,
-                },
-                memory: {
-                    percentage: u.memory.percentage,
-                    used: u.memory.used,
-                    available: u.memory.available,
-                },
-                io: {
-                    readkB: u.io.readkB,
-                    sendkB: u.io.writekB,
-                    readkBps: u.io.readkBps,
-                    sendkBps: u.io.writekBps,
-                },
-                net: {
-                    recvkB: u.net.recvkB,
-                    sendkB: u.net.sendkB,
-                    recvkBps: u.net.recvkBps,
-                    sendkBps: u.net.sendkBps,
-                }
-            };
-
-            json[container_name].push(stat_json)?;
-        }
-    }
-
-    Ok(json)
-}
 
 fn check_nlines() -> Result<u64, error::Error> {
     let file = std::fs::OpenOptions::new()
