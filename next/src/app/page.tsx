@@ -16,27 +16,38 @@ export default async function Home() {
     return (<div>コンテナ名取得中...</div>);
   }
   const containerNames = await containersResponse.json();
-  console.timeEnd("データ取得");
-
-
-  console.time("データ成型");
 
   const datasetsCpu: { 
     label: string;
     data: any[];
   }[] = [];
   for (const containerName of containerNames) {
-    const cpuResponse = 
+    const response = 
       await fetch(`http://cephylas:7878/containers/${containerName}/cpu`);
-    if (!cpuResponse.ok) return (<div>CPU使用率取得中...</div>);
-    const rawData = await cpuResponse.json();
-    console.log("rawData: ", rawData);
+    if (!response.ok) return (<div>CPU使用率取得中...</div>);
+    const rawData = await response.json();
+    //console.log("rawData: ", rawData);
     datasetsCpu.push({
       label: containerName,
       data: rawData.map((d: any) => ({ x: new Date(d.time), y: d.percentage }))
     });
   }
-  console.log('%o', datasetsCpu);
+  const datasetsMemory: { 
+    label: string;
+    data: any[];
+  }[] = [];
+  for (const containerName of containerNames) {
+    const response = 
+      await fetch(`http://cephylas:7878/containers/${containerName}/memory`);
+    if (!response.ok) return (<div>Memory使用率取得中...</div>);
+    const rawData = await response.json();
+    //console.log("rawData: ", rawData);
+    datasetsMemory.push({
+      label: containerName,
+      data: rawData.map((d: any) => ({ x: new Date(d.time), y: d.percentage }))
+    });
+  }
+  //console.log('%o', datasetsCpu);
   
   //const datasetsCpu = prepareDatasets(
   //  logs, d => ({ x: d.time, y: d.cpu.percentage })
@@ -46,9 +57,7 @@ export default async function Home() {
   //);
   //const datasetsDisk = prepareDatasetsIOandNet(logs, 'io');
   //const datasetsNet = prepareDatasetsIOandNet(logs, 'net');
-
-  console.timeEnd("データ成型");
-
+  console.timeEnd("データ取得");
 
   return (
     <>
@@ -59,12 +68,12 @@ export default async function Home() {
           datasets={datasetsCpu} 
           title='CPU usage (%)' 
         />
-        {/*
         <Chart 
           chartId='chartjs-memory-usage'
           datasets={datasetsMemory} 
           title='Memory usage (%)'
         />
+        {/*
         <Chart
           chartId='chartjs-disk-usage'
           datasets={datasetsDisk} 
