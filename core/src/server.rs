@@ -89,6 +89,47 @@ fn route_containers(
     Ok(true)
 }
 
+/// かなり微妙な実装
+/// ログは1日でローテーションされるので
+/// 日時まで変換する
+/// 一日の始まりから何秒経ったか変換する
+fn limited_convert_time_string_to_f32(
+    time_str: &str
+) -> Result<f32, error::Error> {
+    // ISO time string は YYYY/MM/ddTHH:mm:ss.nnnnn という形式
+    if let [_year_month_date, time] = 
+        time_str.split('T').collect::<Vec<&str>>()[..]
+    {
+        // 今はyear, month, dateは無視...
+        if let [hours, minutes, seconds] = 
+            time.split(':').collect::<Vec<&str>>()[..] 
+        {
+            //println!("h,m,s = {},{},{}", hours, minutes, seconds);
+            let seconds = str::parse::<f32>(&seconds.replace("Z",""))
+                .map_err(|e| e.to_string())?;
+            let minutes = str::parse::<f32>(minutes)
+                .map_err(|e| e.to_string())?;
+            let hours = str::parse::<f32>(hours)
+                .map_err(|e| e.to_string())?;
+            
+            return Ok(
+                ((hours * 60.0) + minutes) * 60.0 + seconds
+            )
+        }
+    }
+    Err(error::Error::OtherError("invalid time format".to_string()))
+}
+
+pub fn data_to_json<T: ToString>(data: Vec<&T>) -> String {
+    format!(
+        "[{}]",
+        data.iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<String>>()
+            .join(",")
+    )
+}
+
 fn route_usage(
     url: &str,
     stream: &mut std::net::TcpStream,
@@ -98,21 +139,38 @@ fn route_usage(
         .filter(|s| !s.is_empty())
         .collect();
     if let ["containers", container_name, resource] = &parts[..] {
+        let downsample_option = log_cache::DownsampleOption::default();
         let lock = log_cache.read().map_err(|e| e.to_string())?;
 
         let data = match *resource {
             "cpu" => lock.cpu
-                .get(container_name)
-                .map(|v| v.to_json()),
+                .downsample(
+                    container_name,
+                    &downsample_option,
+                    |c| (
+                        limited_convert_time_string_to_f32(&c.time)
+                            .unwrap(), 
+                        c.percentage.unwrap_or_default()
+                    ),
+                )
+                .map(|v| data_to_json(v)),
             "memory" => lock.memory
-                .get(container_name)
-                .map(|v| v.to_json()),
-            "io" => lock.io
-                .get(container_name)
-                .map(|v| v.to_json()),
-            "net" => lock.net
-                .get(container_name)
-                .map(|v| v.to_json()),
+                .downsample(
+                    container_name,
+                    &downsample_option,
+                    |m| (
+                        limited_convert_time_string_to_f32(&m.time)
+                            .unwrap(),
+                        m.percentage.unwrap_or_default(),
+                    ),
+                )
+                .map(|v| data_to_json(v)),
+            //"io" => lock.io
+            //    .get(container_name)
+            //    .map(|v| v.to_json()),
+            //"net" => lock.net
+            //    .get(container_name)
+            //    .map(|v| v.to_json()),
             _ => None,
         };
 
@@ -145,7 +203,7 @@ fn handle_connection(
     stream.read(&mut buffer)?;
 
     let request_data = String::from_utf8_lossy(&buffer[..]);
-    println!("Request: {}", request_data);
+    //println!("Request: {}", request_data);
 
     let request = Request::try_from(request_data.as_ref())?;
     if request.method != "GET" {
