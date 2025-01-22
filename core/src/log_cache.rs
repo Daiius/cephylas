@@ -29,15 +29,25 @@ impl<T> LogVec<T>
     //pub fn data(self: &Self) -> &VecDeque<T> { 
     //    &self.v
     //}
-    pub fn to_json(self: &Self) -> String {
-        format!(
-            "[{}]",
-            self.v.iter()
-                .map(|d| d.to_string())
-                .collect::<Vec<String>>()
-                .join(",")
-        )
+}
+
+pub struct DownsampleOption {
+    pub nsample: usize,
+}
+impl Default for DownsampleOption {
+    fn default() -> Self {
+        DownsampleOption { nsample: 512 }
     }
+}
+
+fn calculate_triangle_area(
+    p0: &(f32, f32),
+    p1: &(f32, f32),
+    p2: &(f32, f32),
+) -> f32 {
+    (
+        (p2.0 - p0.0) * (p1.1 - p0.1) - (p1.0 - p0.0) * (p2.1 - p0.1)
+    ).abs() * 0.5
 }
 
 pub struct UsageCacheMap<T> {
@@ -61,8 +71,12 @@ impl<T> UsageCacheMap<T>
                 LogVec::<T>::new()
             ).push(usage);
     }
+    /// 記録されたコンテナ名をソートしてから返します
     pub fn container_names(&self) -> Vec<&String> {
-        self.map.keys().collect::<Vec<&String>>()
+        let mut keys = self.map.keys().collect::<Vec<&String>>();
+        keys.sort();
+
+        keys
     }
     pub fn get(
         &self,
@@ -70,6 +84,64 @@ impl<T> UsageCacheMap<T>
     ) -> Option<&LogVec<T>> {
         self.map.get(container_name)
     }
+    pub fn downsample<F: Fn(&T) -> (f32, f32)>(
+        &self,
+        container_name: &str,
+        downsample_option: &DownsampleOption,
+        fxy: F,
+    ) -> Option<Vec<&T>> {
+        let log_vec = self.map.get(container_name)?;
+        let data = &log_vec.v;
+        let n = data.len();
+        let nsample = downsample_option.nsample;
+        if nsample >= n || nsample < 3 {
+            return Some(log_vec.v.iter().collect());
+        }
+        let mut samples: Vec<&T> = Vec::with_capacity(nsample);
+        let bucket_size = (n - 2) as f32 / (nsample - 2) as f32;
+        samples.push(&data[0]);
+
+        // 本来LTTBアルゴリズムでは次のバケットの平均点を用いるが
+        // 間違って今のバケットの平均値を使っても一応動く
+        // (Largest Triangle in Three Bukets じゃなくて
+        //  Single Buckets になる?
+        // )
+        let mut last_point_index = 0;
+        for i in 0..(nsample - 2) {
+            let mut max_area = -1.0;
+            let mut max_area_point = None;
+
+            let istart = ((i as  f32 * bucket_size).floor() as usize).max(1);
+            let iend = ((i as f32 + 1.0) * bucket_size).floor() as usize;
+            let (average_x, average_y) = 
+                data.iter().skip(istart).take(iend - istart)
+                .map(|d| fxy(d))
+                .reduce(|acc, curr| (acc.0 + curr.0, acc.1 + curr.1))
+                .map(|s| (s.0 / (iend - istart) as f32, s.1 / (iend - istart) as f32))
+                .unwrap();
+            for j in istart..iend {
+                let area = calculate_triangle_area(
+                    &fxy(&data[last_point_index]),
+                    &fxy(&data[j]),
+                    &(average_x, average_y),
+                );
+                if area > max_area {
+                    max_area = area;
+                    max_area_point = Some(&data[j]);
+                }
+            }
+            if let Some(point) = max_area_point {
+                samples.push(point);
+            }
+
+            last_point_index = iend;
+        }
+        // 最後の点を追加
+        samples.push(&data[n - 1]);
+
+        Some(samples)
+    }
+    
 }
 
 pub struct TimedCpuUsage {
