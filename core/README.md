@@ -1,10 +1,56 @@
-# Cephylas Telemetrer
+# Cephylas Docker Container Telemetrer
 Simple server load logging system for Linux systems,
 written in Rust.
 
 Cephylas comes from "cephonodes hylas", a kind of moth with clear wings.
 
 ## Memo
+```mermaid
+classDiagram
+    class Usages {
+        time: String
+        stats: Vec(HashMap(String,Usage))
+    }
+    class Usage {
+        cpu: CpuUsage
+        memory: MemoryUsage
+        io: IoUsage
+        net: NetUsage
+    }
+
+    class LogCache
+    note for LogCache "HashMap(String,Usages)"
+
+    class LogCacheUsage {
+        cpu: Vec(CpuUsage)
+        memory: Vec(MemoryUsage)
+        io: Vec(IoUsage)
+        net: Vec(NetUsage)
+    }
+```
+```mermaid
+sequenceDiagram
+    participant docker as (Docker socket)
+    participant stream as TcpStream
+    participant buffer as buffer<br/>String
+    participant container_names as container names<br/>String
+    participant struct as Usages<br/>struct
+    participant map as HashMap&lt;ContainerName,UsageData&gt;
+    participant log as (log file)
+    participant cache as LogCache<br/>a
+    
+    note over docker,cache : log cache initialization
+
+    note over docker,cache : log record in every ticks
+
+    docker -->> stream : /containers<br/>/stats
+    stream -->> buffer : stream.read(&mut buffer)
+    buffer -->> map : container_name
+    buffer -->> map : UsageData
+
+
+```
+
 ```mermaid
 sequenceDiagram
     actor user
@@ -59,7 +105,7 @@ sequenceDiagram
     deactivate worker
 ```
 
-## Log summarization
+## Log summarization plan
 ```mermaid
 sequenceDiagram
     participant app as cephylas<br/>application
