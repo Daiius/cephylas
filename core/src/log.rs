@@ -53,7 +53,7 @@ impl Default for Stats {
         }
     }
 }
-
+#[derive(Debug)]
 pub struct CpuUsage {
     percentage: Option<f32>,
     total: Option<u64>,
@@ -88,6 +88,7 @@ impl Default for CpuUsage {
         CpuUsage { percentage: None, total: None, system: None, ncpu: None }
     }
 }
+#[derive(Debug)]
 pub struct MemoryUsage {
     percentage: Option<f32>,
     used: Option<u64>,
@@ -110,6 +111,7 @@ impl Default for MemoryUsage {
     }
 }
 #[allow(non_snake_case)]
+#[derive(Debug)]
 pub struct IoUsage {
     readkB: Option<u64>,
     writekB: Option<u64>,
@@ -134,6 +136,7 @@ impl Default for IoUsage {
     }
 }
 #[allow(non_snake_case)]
+#[derive(Debug)]
 pub struct NetUsage {
     recvkB: Option<u64>,
     sendkB: Option<u64>,
@@ -157,6 +160,7 @@ impl Default for NetUsage {
         NetUsage { recvkB: None, sendkB: None, recvkBps: None, sendkBps: None }
     }
 }
+#[derive(Debug)]
 pub struct Usage {
     cpu: CpuUsage,
     memory: MemoryUsage,
@@ -179,6 +183,7 @@ impl std::fmt::Display for Usage {
     }
 }
 #[allow(non_snake_case)]
+#[derive(Debug)]
 pub struct Usages {
     time: String,
     millis: u16,
@@ -198,7 +203,7 @@ impl std::fmt::Display for Usages {
             
         write!(
             f,
-            "{{\"time\":\"{time}\",\"millis\":{millis},{containers_part}}}",
+            "{{\"time\":\"{time}\",\"millis\":{millis},\"stats\":{{{containers_part}}}}}",
             time = self.time, 
             millis = self.millis,
         )
@@ -610,7 +615,7 @@ pub fn log_json(
                 &stats, &prev_stats
             );
             if let Ok(usage) = usage_result {
-                println!("{}", usage);
+                //println!("{}", usage);
                 log_daily(DAILY_LOG_PATH, usage.to_string())?;
                 let mut lock = log_cache.write()
                     .expect("failed to get write lock for log_cache");
@@ -637,7 +642,6 @@ pub fn log_json(
 fn json_to_usage(
     json: &json::JsonValue
 ) -> Result<Usages, error::Error> {
-
 
     Ok(Usages {
         time:
@@ -683,13 +687,18 @@ pub fn read_log(
 ) -> Result<(), error::Error> {
 
     let nlines = check_nlines()?;
+    //println!("nlines: {}", nlines);
     let nlines_to_skip = nlines.saturating_sub(log_cache::MAX_LOG_LENGTH as u64);
+    //println!("nlines to skip: {}", nlines_to_skip);
 
     let file = std::fs::OpenOptions::new()
         .read(true)
+        .create(false)
+        .write(false)
         .open(DAILY_LOG_PATH)?;
     let reader = std::io::BufReader::new(file);
     let mut iline = 0;
+    let mut iline_success = 0;
     for line in std::io::BufRead::lines(reader) {
         iline += 1;
         if iline < nlines_to_skip { continue; }
@@ -699,18 +708,20 @@ pub fn read_log(
             Ok(json) => {
                 match json_to_usage(&json) {
                     Ok(usages) => {
+                        //println!("{:?}", usages);
                         let mut lock = log_cache.write()
                             .expect("cannot lock log_cache"); 
                         let container_names = 
-                            usages.usages.keys().cloned().collect::<Vec<String>>();
+                            usages.usages.keys().cloned()
+                            .collect::<Vec<String>>();
                         for container_name in container_names {
-                            // コンテナ名がキャッシュ中に無ければ追加
                             insert_usages_to_cache(
                                 &container_name, 
                                 &usages, 
                                 &mut (*lock)
                             );
                         }
+                        iline_success += 1;
                     },
                     Err(e) => {
                         eprintln!("error in log: {}", e);
@@ -722,6 +733,12 @@ pub fn read_log(
             },
         }
     }
+
+    println!(
+        "{}/{} lines are successfully processed.", 
+        iline_success, 
+        nlines - nlines_to_skip
+    );
 
     Ok(())
 }

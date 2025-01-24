@@ -4,6 +4,11 @@ use std::io::{ Read, Write };
 use super::error;
 use super::log_cache;
 
+
+/// HTTPリクエストを一時的に記録する構造体
+/// 一時的で良いので参照を使う
+/// (大本はbuffer)
+#[allow(dead_code)] // http_versionは読み取るが使用しない
 struct Request<'a> {
     method: &'a str,
     uri: &'a str,
@@ -31,6 +36,12 @@ impl<'a> TryFrom<&'a str> for Request<'a> {
     }
 }
 
+/// GET以外のリクエストが来た際には一律で405を返します
+///
+/// 一般的なルータは
+/// Fn(url: &str, stream: &mut TcpStream, log_cache: &SharedUsageCache)
+///   -> Result<bool, error::Error>
+/// 型としていますが、エラーを返すだけなので簡略化します
 fn handle_method_not_allowed(
     stream: &mut std::net::TcpStream,
 ) -> Result<(), error::Error> {
@@ -39,6 +50,13 @@ fn handle_method_not_allowed(
     stream.flush()?;
     Ok(())
 }
+
+/// ルータ内でエラーが発生などした場合には500を返します
+/// 
+/// 一般的なルータは
+/// Fn(url: &str, stream: &mut TcpStream, log_cache: &SharedUsageCache)
+///   -> Result<bool, error::Error>
+/// 型としていますが、エラーを返すだけなので簡略化します
 fn handle_generic_error(
     stream: &mut std::net::TcpStream,
     e: &error::Error,
@@ -52,6 +70,12 @@ fn handle_generic_error(
     Ok(())
 }
 
+/// どのルートにもマッチしなかった場合には404を返します
+///
+/// 一般的なルータは
+/// Fn(url: &str, stream: &mut TcpStream, log_cache: &SharedUsageCache)
+///   -> Result<bool, error::Error>
+/// 型としていますが、エラーを返すだけなので簡略化します
 fn route_not_found(
     _url: &str,
     stream: &mut std::net::TcpStream,
@@ -64,6 +88,15 @@ fn route_not_found(
     Ok(true)
 }
 
+/// リソース使用状況を記録しているコンテナの名前を
+/// アルファベット順に返します
+///
+/// ルータは以下の型に統一して配列に格納し、
+/// ループを回して順番にマッチするか否か確認しています
+/// Fn(url: &str, stream: &mut TcpStream, log_cache: &SharedUsageCache)
+///   -> Result<bool, error::Error>
+/// 型としており、bool型はマッチしたか否かを返します
+/// 処理に失敗すればError型を返します
 fn route_containers(
     url: &str,
     stream: &mut std::net::TcpStream,
@@ -89,10 +122,9 @@ fn route_containers(
     Ok(true)
 }
 
-/// かなり微妙な実装
-/// ログは1日でローテーションされるので
-/// 日時まで変換する
-/// 一日の始まりから何秒経ったか変換する
+/// 注意: かなり微妙な実装です
+/// ログは1日でローテーションされるので(運用の仕方次第......)
+/// 時刻のみ解釈して一日の始まりから何秒経ったかに変換します
 fn limited_convert_time_string_to_f32(
     time_str: &str
 ) -> Result<f32, error::Error> {
@@ -120,6 +152,7 @@ fn limited_convert_time_string_to_f32(
     Err(error::Error::OtherError("invalid time format".to_string()))
 }
 
+/// Vec<&T> 型の使用率データをjson文字列に変換します
 pub fn data_to_json<T: ToString>(data: Vec<&T>) -> String {
     format!(
         "[{}]",
@@ -130,6 +163,14 @@ pub fn data_to_json<T: ToString>(data: Vec<&T>) -> String {
     )
 }
 
+/// CPU/メモリ使用状況を返すルートです
+///
+/// ルータは以下の型に統一して配列に格納し、
+/// ループを回して順番にマッチするか否か確認しています
+/// Fn(url: &str, stream: &mut TcpStream, log_cache: &SharedUsageCache)
+///   -> Result<bool, error::Error>
+/// 型としており、bool型はマッチしたか否かを返します
+/// 処理に失敗すればError型を返します
 fn route_usage(
     url: &str,
     stream: &mut std::net::TcpStream,
@@ -165,6 +206,8 @@ fn route_usage(
                     ),
                 )
                 .map(|v| data_to_json(v)),
+            // io, net には send, recv / read, write もあるので
+            // 別のルートで定義した方が楽そう?
             //"io" => lock.io
             //    .get(container_name)
             //    .map(|v| v.to_json()),
@@ -203,7 +246,7 @@ fn handle_connection(
     stream.read(&mut buffer)?;
 
     let request_data = String::from_utf8_lossy(&buffer[..]);
-    //println!("Request: {}", request_data);
+    println!("Request: {}", request_data);
 
     let request = Request::try_from(request_data.as_ref())?;
     if request.method != "GET" {
