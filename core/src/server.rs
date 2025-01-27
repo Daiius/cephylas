@@ -246,7 +246,7 @@ fn handle_connection(
     stream.read(&mut buffer)?;
 
     let request_data = String::from_utf8_lossy(&buffer[..]);
-    println!("Request: {}", request_data);
+    //println!("Request: {}", request_data);
 
     let request = Request::try_from(request_data.as_ref())?;
     if request.method != "GET" {
