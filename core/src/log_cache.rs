@@ -118,18 +118,27 @@ impl<T> UsageCacheMap<T>
                 .max(1);
             let iend = 
                 ((i as f32 + 1.0) * bucket_size).floor() as usize;
+            let istart_next =
+                ((i as f32 + 1.0) * bucket_size).floor() as usize;
+            let iend_next =
+                (((i as f32 + 2.0) * bucket_size).floor() as usize)
+                .min(n - 1);
             let (average_x, average_y) = 
-                data.iter().skip(istart).take(iend - istart)
+                data.iter()
+                .skip(istart_next)
+                .take(iend_next - istart_next)
                 .map(|d| fxy(d))
                 .reduce(|acc, curr| (acc.0 + curr.0, acc.1 + curr.1))
-                .map(|s| (s.0 / (iend - istart) as f32, s.1 / (iend - istart) as f32))
-                .unwrap_or((0.0,0.0));
+                .map(|s| (
+                    s.0 / (iend - istart) as f32, 
+                    s.1 / (iend - istart) as f32
+                ))
+                .unwrap_or(fxy(&data[0]));
             for j in istart..iend {
                 let area = calculate_triangle_area(
                     &fxy(last_point.unwrap_or(&data[0])),
                     &fxy(&data[j]),
                     &(average_x, average_y),
-                    //&fxy(&data[iend]), // これもちょっとした簡易化
                 );
                 if area > max_area {
                     max_area = area;
