@@ -1,4 +1,7 @@
 services:
+  cephylas:
+    env_file:
+      - .env.production
   cephylas-nextjs:
     image: daiius/private-registry:cephylas-nextjs
     container_name: cephylas-nextjs
