@@ -10,9 +10,9 @@ export const metadata: Metadata = {
   title: "Cephylas Next.js",
   description: "Cephylas docker container log viewer",
   icons: {
-    icon: '/cephylas/cephonodes-hylas.svg',
-    shortcut: '/cephylas/cephonodes-hylas.svg',
-    apple: '/cephylas/cephonodes-hylas.svg',
+    icon: '/cephonodes-hylas.svg',
+    shortcut: '/cephonodes-hylas.svg',
+    apple: '/cephonodes-hylas.svg',
   }
 };
 

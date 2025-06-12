@@ -14,6 +14,7 @@ const fetchWithZod = async <T>(
   try {
     const response = await fetch(url);
     if (!response.ok) {
+      console.error(response.statusText);
       return { 
         ok: false, 
         error: new Error(`fetch failed with ${response.status}`),
@@ -23,6 +24,7 @@ const fetchWithZod = async <T>(
     const data = schema.parse(json);
     return { ok: true, data };
   } catch (err) {
+    console.error(err);
     return {
       ok: false,
       error:
