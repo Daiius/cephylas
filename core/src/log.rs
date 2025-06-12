@@ -367,6 +367,10 @@ fn get_containers_stats<T: AsRef<std::path::Path>>(
         let stats = get_container_stats(
             &socket_path, &container_name
         )?;
+        if stats.time == Some("0001-01-01T00:00:00Z".to_string()) {
+            // it's terrible, docker api sometimes returns unix epoc ZERO.
+            break;
+        }
 
         stats_map.insert(container_name, stats);
     }
@@ -708,6 +712,10 @@ pub fn read_log(
             Ok(json) => {
                 match json_to_usage(&json) {
                     Ok(usages) => {
+                        if usages.time == "0001-01-01T00:00:00Z".to_string() {
+                            // it's terrible. docker api sometimes returns unix epoc ZERO.
+                            break;
+                        }
                         //println!("{:?}", usages);
                         let mut lock = log_cache.write()
                             .expect("cannot lock log_cache"); 
