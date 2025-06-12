@@ -11,6 +11,8 @@ services:
     build: 
       dockerfile: ./next/Dockerfile
     container_name: cephylas-nextjs-dev
+    env_file:
+      - .env.development
     volumes:
       - ./log:/app/log:ro # place a sample log_daily file!
       - ./next:/app:cached
