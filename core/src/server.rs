@@ -111,15 +111,19 @@ fn route_containers(
 ) -> Result<StatusCode, error::Error> {
     let lock = log_cache.read().map_err(|e| e.to_string())?;
     let container_names = lock.cpu.container_names();
+    let data = container_names
+        .iter()
+        .map(|s| format!("\"{}\"", s))
+        .collect::<Vec<String>>()
+        .join(",");
+    let body = format!("[{}]", data);
+    let body_bytes = body.as_bytes();
     let response = format!(
-        "HTTP/1.1 200 OK\r\n\r\n [{}]",
-        container_names
-            .iter()
-            .map(|s| format!("\"{}\"", s))
-            .collect::<Vec<String>>()
-            .join(",")
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body_bytes.len(),
     );
     stream.write(response.as_bytes())?;
+    stream.write(body_bytes)?;
     stream.flush()?;
 
     Ok(StatusCode::Ok)
@@ -210,11 +214,13 @@ fn route_cpu_or_memory_usage(
     };
 
     if let Some(data) = data {
+        let body_bytes = data.as_bytes();
         let response = format!(
-            "HTTP/1.1 200 OK\r\n\r\n {}",
-            data
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body_bytes.len(),
         );
         stream.write(response.as_bytes())?;
+        stream.write(body_bytes)?;
         stream.flush()?;
         return Ok(StatusCode::Ok);
     }
@@ -258,11 +264,13 @@ fn route_io_usage(
     };
 
     if let Some(data) = data {
+        let body_bytes = data.as_bytes();
         let response = format!(
-            "HTTP/1.1 200 OK\r\n\r\n {}",
-            data
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body_bytes.len()
         );
         stream.write(response.as_bytes())?;
+        stream.write(body_bytes)?;
         stream.flush()?;
         return Ok(StatusCode::Ok);
     }
@@ -306,11 +314,13 @@ fn route_net_usage(
     };
 
     if let Some(data) = data {
+        let body_bytes = data.as_bytes();
         let response = format!(
-            "HTTP/1.1 200 OK\r\n\r\n {}",
-            data
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body_bytes.len(),
         );
         stream.write(response.as_bytes())?;
+        stream.write(body_bytes)?;
         stream.flush()?;
 
         return Ok(StatusCode::Ok);
