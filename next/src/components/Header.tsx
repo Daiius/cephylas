@@ -23,7 +23,7 @@ const Header: React.FC<
       href='/about'
     >
       <img 
-        src='/cephylas/cephonodes-hylas.svg' 
+        src='/cephonodes-hylas.svg' 
         width={36} 
         height={36}
         alt='cephylas icon'

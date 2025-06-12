@@ -15,7 +15,7 @@ export default async function About() {
           'animate-appear',
           'w-1/2 mb-2 sm:mb-0 sm:mr-2',
         )}
-        src='/cephylas/cephonodes-hylas.svg'
+        src='/cephonodes-hylas.svg'
         alt='cephylas icon'
       />
       <div className='flex flex-col items-center'>
