@@ -1,6 +1,11 @@
 import clsx from 'clsx';
-import z from 'zod';
 import Chart from '@/components/Chart';
+
+import { 
+  fetchContainers,
+  fetchNetStatus,
+  NetUsageDatasets,
+} from '@/lib/fetchers';
 
 // could not find exported one,
 // so i copied it from Chart.js source code.
@@ -16,27 +21,6 @@ const borderColors = [
 const backgroundColors = borderColors
   .map(bc => bc.replace('rgb(', 'rgba(').replace(')', ',0.5)'));
 
-const NetUsageDataSchema = z.array(
-  z.object({
-    time: z.string().nullish(),
-    recvkBps: z.number().nullish(),
-    sendkBps: z.number().nullish(),
-  })
-);
-const NetRecvDatasetSchema = NetUsageDataSchema.transform((data) => 
-  data.map(d => ({ x: d.time, y: d.recvkBps }))
-);
-const NetSendDatasetSchema = NetUsageDataSchema.transform((data) =>
- data.map(d => ({ x: d.time, y: d.sendkBps }))
-);
-
-type NetUsageDatasets = {
-  label: string;
-  data: z.infer<typeof NetRecvDatasetSchema>;
-  backgroundColor: string;
-  borderColor: string;
-  borderDash: [number, number];
-}[];
 
 export const NetChart: React.FC<
   Omit<
@@ -47,24 +31,20 @@ export const NetChart: React.FC<
   className,
   ...props
 }) => {
-  const containersResponse = 
-    await fetch('http://cephylas:7878/containers');
+  const containersResponse = await fetchContainers();
   if (!containersResponse.ok) {
     return (<div>コンテナ名取得中...</div>);
   }
-  const containerNames = await containersResponse.json();
+  const containerNames = containersResponse.data;
 
   const netUsageDatasets: NetUsageDatasets = [];
   let icolor = 0;
   for (const containerName of containerNames) {
-    const responseRecv = 
-      await fetch(`http://cephylas:7878/containers/${containerName}/net/recv`);
+    const responseRecv = await fetchNetStatus(containerName, 'recv');
     if (!responseRecv.ok) return (<div>CPU使用率取得中...</div>);
-    const rawDataRecv = await responseRecv.json();
-    const validatedJsonRecv = NetRecvDatasetSchema.parse(rawDataRecv);
     netUsageDatasets.push({
       label: containerName + " recv",
-      data: validatedJsonRecv,
+      data: responseRecv.data,
       backgroundColor: 
         backgroundColors[icolor % backgroundColors.length],
       borderColor:
@@ -72,14 +52,11 @@ export const NetChart: React.FC<
       borderDash: [1,0],
     });
 
-    const responseSend = 
-      await fetch(`http://cephylas:7878/containers/${containerName}/net/send`);
+    const responseSend = await fetchNetStatus(containerName, 'send');
     if (!responseSend.ok) return (<div>CPU使用率取得中...</div>);
-    const rawDataSend = await responseSend.json();
-    const validatedJsonSend = NetSendDatasetSchema.parse(rawDataSend);
     netUsageDatasets.push({
       label: containerName + " send",
-      data: validatedJsonSend,
+      data: responseSend.data,
       backgroundColor: 
         backgroundColors[icolor % backgroundColors.length],
       borderColor:

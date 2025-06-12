@@ -1,6 +1,11 @@
 import clsx from 'clsx';
-import z from 'zod';
 import Chart from '@/components/Chart';
+
+import {
+  fetchContainers,
+  fetchIoStatus,
+  IoUsageDatasets,
+} from '@/lib/fetchers';
 
 // could not find exported one,
 // so i copied it from Chart.js source code.
@@ -16,28 +21,6 @@ const borderColors = [
 const backgroundColors = borderColors
   .map(bc => bc.replace('rgb(', 'rgba(').replace(')', ',0.5)'));
 
-const IoUsageDataSchema = z.array(
-  z.object({
-    time: z.string().optional(),
-    readkBps: z.number().nullish(),
-    writekBps: z.number().nullish(),
-  })
-);
-const IoReadDatasetSchema = IoUsageDataSchema.transform((data) => 
-  data.map(d => ({ x: d.time, y: d.readkBps }))
-);
-const IoWriteDatasetSchema = IoUsageDataSchema.transform((data) =>
- data.map(d => ({ x: d.time, y: d.writekBps }))
-);
-
-type IoUsageDatasets = {
-  label: string;
-  data: z.infer<typeof IoReadDatasetSchema>;
-  backgroundColor: string;
-  borderColor: string;
-  borderDash: [number, number];
-}[];
-
 export const IoChart: React.FC<
   Omit<
     React.ComponentProps<typeof Chart>,
@@ -47,24 +30,20 @@ export const IoChart: React.FC<
   className,
   ...props
 }) => {
-  const containersResponse = 
-    await fetch('http://cephylas:7878/containers');
+  const containersResponse = await fetchContainers();
   if (!containersResponse.ok) {
     return (<div>コンテナ名取得中...</div>);
   }
-  const containerNames = await containersResponse.json();
+  const containerNames = containersResponse.data;
 
   const ioUsageDatasets: IoUsageDatasets = [];
   let icolor = 0;
   for (const containerName of containerNames) {
-    const responseRead = 
-      await fetch(`http://cephylas:7878/containers/${containerName}/io/read`);
+    const responseRead = await fetchIoStatus(containerName, 'read');
     if (!responseRead.ok) return (<div>CPU使用率取得中...</div>);
-    const rawDataRead = await responseRead.json();
-    const validatedJsonRead = IoReadDatasetSchema.parse(rawDataRead);
     ioUsageDatasets.push({
       label: containerName + " read",
-      data: validatedJsonRead,
+      data: responseRead.data,
       backgroundColor: 
         backgroundColors[icolor % backgroundColors.length],
       borderColor:
@@ -72,14 +51,11 @@ export const IoChart: React.FC<
       borderDash: [1,0],
     });
 
-    const responseWrite = 
-      await fetch(`http://cephylas:7878/containers/${containerName}/io/write`);
+    const responseWrite = await fetchIoStatus(containerName, 'write');
     if (!responseWrite.ok) return (<div>CPU使用率取得中...</div>);
-    const rawDataWrite = await responseWrite.json();
-    const validatedJsonWrite = IoWriteDatasetSchema.parse(rawDataWrite);
     ioUsageDatasets.push({
       label: containerName + " write",
-      data: validatedJsonWrite,
+      data: responseWrite.data,
       backgroundColor: 
         backgroundColors[icolor % backgroundColors.length],
       borderColor:

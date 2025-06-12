@@ -1,21 +1,12 @@
 import clsx from 'clsx';
-import z from 'zod';
 import Chart from '@/components/Chart';
 
-const MemoryUsageDataSchema = z.array(
-  z.object({
-    time: z.string().optional(), 
-    percentage: z.number().optional().nullish(),
-  })
-);
-const MemoryUsageDatasetSchema = MemoryUsageDataSchema.transform((data) => 
-  data.map(d => ({ x: d.time, y: d.percentage }))
-);
+import {
+  fetchContainers,
+  fetchMemoryStatus,
+  MemoryUsageDatasets,
+} from '@/lib/fetchers';
 
-type CpuUsageDatasets = {
-  label: string;
-  data: z.infer<typeof MemoryUsageDatasetSchema>;
-}[];
 
 export const CpuChart: React.FC<
   Omit<
@@ -26,23 +17,19 @@ export const CpuChart: React.FC<
   className,
   ...props
 }) => {
-  const containersResponse = 
-    await fetch('http://cephylas:7878/containers');
+  const containersResponse = await fetchContainers();
   if (!containersResponse.ok) {
     return (<div>コンテナ名取得中...</div>);
   }
-  const containerNames = await containersResponse.json();
+  const containerNames = containersResponse.data;
 
-  const memoryUsageDatasets: CpuUsageDatasets = [];
+  const memoryUsageDatasets: MemoryUsageDatasets = [];
   for (const containerName of containerNames) {
-    const response = 
-      await fetch(`http://cephylas:7878/containers/${containerName}/memory`);
+    const response = await fetchMemoryStatus(containerName);
     if (!response.ok) return (<div>CPU使用率取得中...</div>);
-    const rawData = await response.json();
-    const validatedJson = MemoryUsageDatasetSchema.parse(rawData);
     memoryUsageDatasets.push({
       label: containerName,
-      data: validatedJson,
+      data: response.data,
     });
   }
 
