@@ -5,7 +5,7 @@ import Chart from '@/components/Chart';
 const CpuUsageDataSchema = z.array(
   z.object({
     time: z.string().optional(), 
-    percentage: z.number().optional()
+    percentage: z.number().optional().nullish(),
   })
 );
 const CpuUsageDatasetSchema = CpuUsageDataSchema.transform((data) => 
