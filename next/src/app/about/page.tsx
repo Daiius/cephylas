@@ -1,5 +1,4 @@
 
-import React from 'react';
 import clsx from 'clsx';
 
 export default async function About() {

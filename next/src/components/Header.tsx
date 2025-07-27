@@ -1,13 +1,11 @@
-import React from 'react';
-import clsx from 'clsx';
+import { clsx }  from 'clsx';
 
 import Link from 'next/link';
 
-const Header: React.FC<
-  React.ComponentProps<'div'>
-> = ({
+export const Header = ({
   className,
-  ...props
+}: {
+  className?: string;
 }) => (
   <div 
     className={clsx(
@@ -16,7 +14,6 @@ const Header: React.FC<
       'flex flex-row items-center justify-center',
       className,
     )}
-    {...props}
   >
     
     <Link
@@ -31,6 +28,4 @@ const Header: React.FC<
     </Link>
   </div>
 );
-
-export default Header;
 

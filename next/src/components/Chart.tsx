@@ -1,7 +1,11 @@
 'use client'
 
-import React from 'react';
-import clsx from 'clsx';
+import { clsx } from 'clsx'
+import {
+  useEffect,
+  useRef,
+  useState,
+} from 'react'
 
 // Chart.js v4 あたりから
 // 必要なモジュールのみをimport出来る様に変更された
@@ -10,33 +14,25 @@ import clsx from 'clsx';
 import { Chart as ChartJs } from 'chart.js/auto';
 import 'chartjs-adapter-luxon';
 
+export type ChartProps = { 
+  chartId: string,
+  datasets: any,
+  title?: string,
+  className?: string,
+}
 
-const Chart: React.FC<
-  React.ComponentProps<'canvas'>
-  & { 
-    chartId: string,
-    datasets: any,
-    title?: string,
-    xlabel?: string,
-    ylabel?: string,
-  }
-> = ({
+export const Chart = ({
   chartId,
   datasets,
   title,
-  xlabel,
-  ylabel,
   className,
-  ...props
-}) => {
+}: ChartProps) => {
 
-  const [mounted, setMounted] = React.useState<boolean>(false);
-  const refCanvas = 
-    React.useRef<HTMLCanvasElement|null>(null);
-  const refChart = 
-    React.useRef<ChartJs|null>(null);
+  const [mounted, setMounted] = useState<boolean>(false);
+  const refCanvas = useRef<HTMLCanvasElement|null>(null);
+  const refChart = useRef<ChartJs|null>(null);
 
-  React.useEffect(() => {
+  useEffect(() => {
     if (mounted) {
       refCanvas.current =
         document.getElementById(chartId ?? 'chartjs-canvas') as HTMLCanvasElement;
@@ -90,12 +86,9 @@ const Chart: React.FC<
         className={clsx(
           className,
         )}
-        {...props}
       >
       </canvas>
     </div>
   )
 };
-
-export default Chart;
 
