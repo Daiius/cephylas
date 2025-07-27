@@ -1,5 +1,5 @@
-import clsx from 'clsx';
-import Chart from '@/components/Chart';
+import { clsx } from 'clsx';
+import { Chart } from '@/components/Chart';
 
 import { 
   fetchContainers,
@@ -22,14 +22,10 @@ const backgroundColors = borderColors
   .map(bc => bc.replace('rgb(', 'rgba(').replace(')', ',0.5)'));
 
 
-export const NetChart: React.FC<
-  Omit<
-    React.ComponentProps<typeof Chart>,
-    "chartId" | "datasets" | "title"
-  >
-> = async ({
+export const NetChart = async ({
   className,
-  ...props
+}: {
+  className?: string,
 }) => {
   const containersResponse = await fetchContainers();
   if (!containersResponse.ok) {
@@ -70,13 +66,10 @@ export const NetChart: React.FC<
   return (
     <Chart 
       className={clsx(className)}
-      {...props}
       chartId='chartjs-net-usage'
       datasets={netUsageDatasets} 
       title='Net speeds (kBps)' 
     />
   );
 };
-
-export default NetChart;
 

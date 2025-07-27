@@ -1,5 +1,5 @@
-import clsx from 'clsx';
-import Chart from '@/components/Chart';
+import { clsx } from 'clsx';
+import { Chart } from '@/components/Chart';
 
 import {
   fetchContainers,
@@ -21,14 +21,10 @@ const borderColors = [
 const backgroundColors = borderColors
   .map(bc => bc.replace('rgb(', 'rgba(').replace(')', ',0.5)'));
 
-export const IoChart: React.FC<
-  Omit<
-    React.ComponentProps<typeof Chart>,
-    "chartId" | "datasets" | "title"
-  >
-> = async ({
+export const IoChart = async ({
   className,
-  ...props
+}: {
+  className?: string,
 }) => {
   const containersResponse = await fetchContainers();
   if (!containersResponse.ok) {
@@ -69,13 +65,10 @@ export const IoChart: React.FC<
   return (
     <Chart 
       className={clsx(className)}
-      {...props}
       chartId='chartjs-io-usage'
       datasets={ioUsageDatasets} 
       title='IO speeds (kBps)' 
     />
   );
 };
-
-export default IoChart;
 

@@ -1,5 +1,5 @@
 import clsx from 'clsx';
-import Chart from '@/components/Chart';
+import { Chart } from '@/components/Chart';
 
 import {
   fetchContainers,
@@ -8,14 +8,10 @@ import {
 } from '@/lib/fetchers';
 
 
-export const CpuChart: React.FC<
-  Omit<
-    React.ComponentProps<typeof Chart>,
-    "chartId" | "datasets" | "title"
-  >
-> = async ({
+export const MemoryChart = async ({
   className,
-  ...props
+}: {
+  className?: string,
 }) => {
   const containersResponse = await fetchContainers();
   if (!containersResponse.ok) {
@@ -36,13 +32,10 @@ export const CpuChart: React.FC<
   return (
     <Chart 
       className={clsx(className)}
-      {...props}
       chartId='chartjs-memory-usage'
       datasets={memoryUsageDatasets} 
       title='Memory usage (%)' 
     />
   );
 };
-
-export default CpuChart;
 

@@ -1,5 +1,5 @@
 import clsx from 'clsx';
-import Chart from '@/components/Chart';
+import { Chart } from '@/components/Chart';
 
 import {
   fetchContainers,
@@ -8,16 +8,13 @@ import {
 } from '@/lib/fetchers';
 
 
+export type CpuChartProps = {
+  className?: string;
+}
 
-export const CpuChart: React.FC<
-  Omit<
-    React.ComponentProps<typeof Chart>,
-    "chartId" | "datasets" | "title"
-  >
-> = async ({
+export const CpuChart = async ({
   className,
-  ...props
-}) => {
+}: CpuChartProps) => {
   const containersResponse = await fetchContainers();
   if (!containersResponse.ok) { return (<div>コンテナ名取得中...</div>); }
   const containerNames = containersResponse.data;
@@ -35,13 +32,10 @@ export const CpuChart: React.FC<
   return (
     <Chart 
       className={clsx(className)}
-      {...props}
       chartId='chartjs-cpu-usage'
       datasets={cpuUsageDatasets} 
       title='CPU usage (%)' 
     />
   );
 };
-
-export default CpuChart;
 
