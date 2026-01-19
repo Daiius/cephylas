@@ -566,8 +566,8 @@ fn insert_usages_to_cache(
 
 }
 
-pub fn log_json(
-    log_cache: &log_cache::SharedUsageCache
+pub async fn log_json(
+    log_cache: log_cache::SharedUsageCache
 ) -> Result<(), error::Error> {
     let socket_path = "/var/run/docker.sock";
 
@@ -579,34 +579,27 @@ pub fn log_json(
         std::fs::create_dir("./log")?;
     }
 
-    let now_as_millis = get_now_as_millis()?;
     let tick = std::time::Duration::from_secs(10);
-    let mut timing = now_as_millis + (
-          tick.as_millis() //* 2  // NOTE if tick is short, maybe more wait needed.
-        - now_as_millis % tick.as_millis()
-    );
+    let mut interval = tokio::time::interval(tick);
 
     let mut prev_stats: HashMap<String, Stats>
         = HashMap::new();
     loop {
-        let millis_to_wait = timing.saturating_sub(get_now_as_millis()?) as u64;
-        println!("waiting {} millis...", millis_to_wait);
+        interval.tick().await;
+        println!("logging tick...");
 
-        std::thread::sleep(
-            std::time::Duration::from_millis(millis_to_wait)
-        );
-
-        let stats = get_containers_stats(&socket_path)?;
-        //println!("stats: {}", stats.dump());
-        //println!("prev_stats: {}", prev_stats.dump());
-
+        // Docker API calls are blocking, so run them in a blocking task
+        let socket_path_owned = socket_path.to_string();
+        let stats = tokio::task::spawn_blocking(move || {
+            get_containers_stats(&socket_path_owned)
+        }).await.map_err(|e| error::Error::OtherError(e.to_string()))??;
 
         let first_stat = stats.values().next();
         let first_prev_stat = prev_stats.values().next();
-            
+
         let log_condition = first_stat
             .zip(first_prev_stat)
-            .map(|(a, b)| !a.cpu.total.is_none() 
+            .map(|(a, b)| !a.cpu.total.is_none()
                  && !b.cpu.total.is_none()
             )
             .unwrap_or(false);
@@ -615,30 +608,28 @@ pub fn log_json(
 
         if log_condition {
             let usage_result = calc_usages(
-                &(tick.as_millis() as u16), 
+                &(tick.as_millis() as u16),
                 &stats, &prev_stats
             );
             if let Ok(usage) = usage_result {
-                //println!("{}", usage);
                 log_daily(DAILY_LOG_PATH, usage.to_string())?;
                 let mut lock = log_cache.write()
                     .expect("failed to get write lock for log_cache");
 
-                let container_names = 
+                let container_names =
                     usage.usages.keys().cloned()
                     .collect::<Vec<String>>();
                 for container_name in container_names {
                     // usage中のデータをキャッシュへ移動
                     insert_usages_to_cache(
-                        &container_name, 
-                        &usage, 
+                        &container_name,
+                        &usage,
                         &mut (*lock),
                     );
                 }
             }
         }
 
-        timing += tick.as_millis();
         prev_stats = stats;
     }
 }
