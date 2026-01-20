@@ -1,0 +1,14 @@
+{
+  "name": "cephylas-benchmark",
+  "version": "1.0.0",
+  "description": "k6 benchmark for cephylas HTTP server implementations",
+  "scripts": {
+    "build": "esbuild src/load-test.ts --bundle --platform=node --target=es2020 --external:k6 --external:k6/* --outfile=dist/load-test.js",
+    "test": "pnpm run build && k6 run dist/load-test.js"
+  },
+  "devDependencies": {
+    "@types/k6": "^0.52.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.4.0"
+  }
+}
