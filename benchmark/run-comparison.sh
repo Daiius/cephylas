@@ -2,10 +2,16 @@
 
 set -e
 
-WORKTREES=("main" "feat-tiny-http-migration" "feat-axum-migration" "feat-hyper-http-migration")
+if [ $# -eq 0 ]; then
+  echo "Usage: $0 <worktree1> [worktree2] ..."
+  echo "Example: $0 main feat-axum-migration feat-hyper-migration"
+  exit 1
+fi
+
+WORKTREES=("$@")
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULTS_DIR="$SCRIPT_DIR/results"
-BASE_DIR="/Users/daiji/sources/cephylas"
+BASE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 mkdir -p "$RESULTS_DIR"
 
