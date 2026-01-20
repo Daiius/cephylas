@@ -24,9 +24,8 @@ async fn main() -> Result<(), error::Error> {
         log::log_loop(logger_cache).await
     });
 
-    tokio::select! {
-        r = server_task => eprintln!("Server ended: {:?}", r),
-        r = logger_task => eprintln!("Logger ended: {:?}", r),
-    }
+    let (server_result, logger_result) = tokio::join!(server_task, logger_task);
+    eprintln!("Server ended: {:?}", server_result);
+    eprintln!("Logger ended: {:?}", logger_result);
     Ok(())
 }
