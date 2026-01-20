@@ -1,0 +1,8 @@
+services:
+  cephylas:
+    build:
+      context: ./core
+      dockerfile: Dockerfile.prod
+    # Override volume mounts - only mount log directory, not source code
+    volumes: !override
+      - ./log:/app/log

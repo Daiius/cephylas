@@ -35,7 +35,7 @@ for worktree in "${WORKTREES[@]}"; do
   # Start server (docker-compose)
   cd "$WORKTREE_PATH"
   echo "Starting server..."
-  docker-compose up -d cephylas
+  docker-compose -f docker-compose.yml -f "$SCRIPT_DIR/docker-compose.prod.yml" up -d --build cephylas
   sleep 5  # Wait for startup
 
   # Run benchmark
@@ -46,7 +46,7 @@ for worktree in "${WORKTREES[@]}"; do
 
   # Stop server
   echo "Stopping server..."
-  docker-compose down
+  docker-compose -f docker-compose.yml -f "$SCRIPT_DIR/docker-compose.prod.yml" down
 done
 
 echo ""
