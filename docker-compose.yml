@@ -3,6 +3,13 @@ services:
     build:
       dockerfile: ./core/Dockerfile
     container_name: cephylas
+    ports:
+      - "7878:7878"
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 50M
     volumes:
       - ./log:/app/log
       - ./core:/app
