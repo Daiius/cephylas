@@ -1,6 +1,7 @@
 
 use std::collections::{ VecDeque, HashMap, };
-use std::sync::{ Arc, RwLock, };
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use super::log::option_to_string;
 

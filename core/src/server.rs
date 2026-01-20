@@ -1,133 +1,18 @@
 
-use std::io::{ Read, Write };
+use std::net::SocketAddr;
+use std::sync::Arc;
 
-use crate::log_cache::SharedUsageCache;
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode, Method};
+use hyper_util::rt::TokioIo;
+use tokio::net::TcpListener;
 
+use crate::log_cache::{self, SharedUsageCache};
 use super::error;
-use super::log_cache;
-
-
-/// HTTPリクエストを一時的に記録する構造体
-/// 一時的で良いので参照を使う
-/// (大本はbuffer)
-#[allow(dead_code)] // http_versionは読み取るが使用しない
-struct Request<'a> {
-    method: &'a str,
-    uri: &'a str,
-    http_version: &'a str,
-}
-
-impl<'a> TryFrom<&'a str> for Request<'a> {
-    type Error = error::Error;
-    fn try_from(value: &'a str) -> Result<Self, Self::Error> {
-        if let [method, uri, http_version] = 
-            value.lines().next()
-            .map(|l| l.split(' '))
-            .ok_or("cannot find first line of request data")?
-            .collect::<Vec<&str>>()[..]
-        {
-            Ok(Request { method, uri, http_version })
-        } else {
-            Err(
-                error::Error::OtherError(
-                    "invalid format in the first line of reqest"
-                    .to_string()
-                )
-            )
-        }
-    }
-}
-
-enum StatusCode {
-    Ok,
-    MethodNotAllowed,
-    InternalServerError,
-    NotFound,
-}
-
-/// GET以外のリクエストが来た際には一律で405を返します
-///
-/// 一般的なルータは
-/// Fn(url: &str, stream: &mut TcpStream, log_cache: &SharedUsageCache)
-///   -> Result<bool, error::Error>
-/// 型としていますが、エラーを返すだけなので簡略化します
-fn handle_method_not_allowed(
-    stream: &mut std::net::TcpStream,
-) -> Result<StatusCode, error::Error> {
-    let response = "HTTP/1.1 405 MethodNotAllowed\r\n\r\n";
-    stream.write(response.as_bytes())?;
-    stream.flush()?;
-    Ok(StatusCode::MethodNotAllowed)
-}
-
-/// ルータ内でエラーが発生などした場合には500を返します
-/// 
-/// 一般的なルータは
-/// Fn(url: &str, stream: &mut TcpStream, log_cache: &SharedUsageCache)
-///   -> Result<bool, error::Error>
-/// 型としていますが、エラーを返すだけなので簡略化します
-fn handle_generic_error(
-    stream: &mut std::net::TcpStream,
-    e: &error::Error,
-) -> Result<StatusCode, error::Error> {
-    let response = format!(
-        "HTTP/1.1 500 InternalError\r\n\r\n {}",
-        e.to_string(),
-    );
-    stream.write(response.as_bytes())?;
-    stream.flush()?;
-
-    Ok(StatusCode::InternalServerError)
-}
-
-/// どのルートにもマッチしなかった場合には404を返します
-///
-/// 一般的なルータは
-/// Fn(url: &str, stream: &mut TcpStream, log_cache: &SharedUsageCache)
-///   -> Result<bool, error::Error>
-/// 型としていますが、エラーを返すだけなので簡略化します
-fn route_not_found(
-    stream: &mut std::net::TcpStream,
-) -> Result<StatusCode, error::Error> {
-    let response = "HTTP/1.1 404 NotFound\r\n\r\n";
-    stream.write(response.as_bytes())?;
-    stream.flush()?;
-
-    Ok(StatusCode::NotFound)
-}
-
-/// リソース使用状況を記録しているコンテナの名前を
-/// アルファベット順に返します
-///
-/// ルータは以下の型に統一して配列に格納し、
-/// ループを回して順番にマッチするか否か確認しています
-/// Fn(url: &str, stream: &mut TcpStream, log_cache: &SharedUsageCache)
-///   -> Result<bool, error::Error>
-/// 型としており、bool型はマッチしたか否かを返します
-/// 処理に失敗すればError型を返します
-fn route_containers(
-    stream: &mut std::net::TcpStream,
-    log_cache: &log_cache::SharedUsageCache,
-) -> Result<StatusCode, error::Error> {
-    let lock = log_cache.read().map_err(|e| e.to_string())?;
-    let container_names = lock.cpu.container_names();
-    let data = container_names
-        .iter()
-        .map(|s| format!("\"{}\"", s))
-        .collect::<Vec<String>>()
-        .join(",");
-    let body = format!("[{}]", data);
-    let body_bytes = body.as_bytes();
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        body_bytes.len(),
-    );
-    stream.write(response.as_bytes())?;
-    stream.write(body_bytes)?;
-    stream.flush()?;
-
-    Ok(StatusCode::Ok)
-}
 
 /// 注意: かなり微妙な実装です
 /// ログは1日でローテーションされるので(運用の仕方次第......)
@@ -136,21 +21,20 @@ fn limited_convert_time_string_to_f32(
     time_str: &str
 ) -> Result<f32, error::Error> {
     // ISO time string は YYYY/MM/ddTHH:mm:ss.nnnnn という形式
-    if let [_year_month_date, time] = 
+    if let [_year_month_date, time] =
         time_str.split('T').collect::<Vec<&str>>()[..]
     {
         // 今はyear, month, dateは無視...
-        if let [hours, minutes, seconds] = 
-            time.split(':').collect::<Vec<&str>>()[..] 
+        if let [hours, minutes, seconds] =
+            time.split(':').collect::<Vec<&str>>()[..]
         {
-            //println!("h,m,s = {},{},{}", hours, minutes, seconds);
             let seconds = str::parse::<f32>(&seconds.replace("Z",""))
                 .map_err(|e| e.to_string())?;
             let minutes = str::parse::<f32>(minutes)
                 .map_err(|e| e.to_string())?;
             let hours = str::parse::<f32>(hours)
                 .map_err(|e| e.to_string())?;
-            
+
             return Ok(
                 ((hours * 60.0) + minutes) * 60.0 + seconds
             )
@@ -170,22 +54,60 @@ pub fn data_to_json<T: ToString>(data: Vec<&T>) -> String {
     )
 }
 
+fn json_response(body: String) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .header("Connection", "close")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap()
+}
+
+fn not_found_response() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(Full::new(Bytes::new()))
+        .unwrap()
+}
+
+fn method_not_allowed_response() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .body(Full::new(Bytes::new()))
+        .unwrap()
+}
+
+fn internal_error_response(msg: &str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .body(Full::new(Bytes::from(msg.to_string())))
+        .unwrap()
+}
+
+/// リソース使用状況を記録しているコンテナの名前を
+/// アルファベット順に返します
+async fn route_containers(
+    log_cache: &SharedUsageCache,
+) -> Response<Full<Bytes>> {
+    let lock = log_cache.read().await;
+    let container_names = lock.cpu.container_names();
+    let data = container_names
+        .iter()
+        .map(|s| format!("\"{}\"", s))
+        .collect::<Vec<String>>()
+        .join(",");
+    let body = format!("[{}]", data);
+    json_response(body)
+}
+
 /// CPU/メモリ使用状況を返すルートです
-///
-/// ルータは以下の型に統一して配列に格納し、
-/// ループを回して順番にマッチするか否か確認しています
-/// Fn(url: &str, stream: &mut TcpStream, log_cache: &SharedUsageCache)
-///   -> Result<bool, error::Error>
-/// 型としており、bool型はマッチしたか否かを返します
-/// 処理に失敗すればError型を返します
-fn route_cpu_or_memory_usage(
-    stream: &mut std::net::TcpStream,
-    log_cache: &log_cache::SharedUsageCache,
+async fn route_cpu_or_memory_usage(
+    log_cache: &SharedUsageCache,
     container_name: &str,
     resource_type: &str,
-) -> Result<StatusCode, error::Error> {
+) -> Response<Full<Bytes>> {
     let downsample_option = log_cache::DownsampleOption::default();
-    let lock = log_cache.read().map_err(|e| e.to_string())?;
+    let lock = log_cache.read().await;
 
     let data = match resource_type {
         "cpu" => lock.cpu
@@ -194,7 +116,7 @@ fn route_cpu_or_memory_usage(
                 &downsample_option,
                 |c| (
                     limited_convert_time_string_to_f32(&c.time)
-                        .unwrap(), 
+                        .unwrap(),
                     c.percentage.unwrap_or_default()
                 ),
             )
@@ -213,29 +135,19 @@ fn route_cpu_or_memory_usage(
         _ => None,
     };
 
-    if let Some(data) = data {
-        let body_bytes = data.as_bytes();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body_bytes.len(),
-        );
-        stream.write(response.as_bytes())?;
-        stream.write(body_bytes)?;
-        stream.flush()?;
-        return Ok(StatusCode::Ok);
+    match data {
+        Some(body) => json_response(body),
+        None => not_found_response(),
     }
-
-    Ok(StatusCode::NotFound)
 }
 
-fn route_io_usage(
-    stream: &mut std::net::TcpStream,
-    log_cache: &log_cache::SharedUsageCache,
+async fn route_io_usage(
+    log_cache: &SharedUsageCache,
     container_name: &str,
     read_or_write: &str,
-) -> Result<StatusCode, error::Error> {
+) -> Response<Full<Bytes>> {
     let downsample_option = log_cache::DownsampleOption::default();
-    let lock = log_cache.read().map_err(|e| e.to_string())?;
+    let lock = log_cache.read().await;
 
     let data = match read_or_write {
         "read" => lock.io
@@ -244,7 +156,7 @@ fn route_io_usage(
                 &downsample_option,
                 |r| (
                     limited_convert_time_string_to_f32(&r.time)
-                        .unwrap(), 
+                        .unwrap(),
                     r.readkBps.unwrap_or_default() as f32
                 ),
             )
@@ -263,29 +175,19 @@ fn route_io_usage(
         _ => None,
     };
 
-    if let Some(data) = data {
-        let body_bytes = data.as_bytes();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body_bytes.len()
-        );
-        stream.write(response.as_bytes())?;
-        stream.write(body_bytes)?;
-        stream.flush()?;
-        return Ok(StatusCode::Ok);
+    match data {
+        Some(body) => json_response(body),
+        None => not_found_response(),
     }
-
-    Ok(StatusCode::NotFound)
 }
 
-fn route_net_usage(
-    stream: &mut std::net::TcpStream,
+async fn route_net_usage(
     log_cache: &SharedUsageCache,
     container_name: &str,
     recv_or_send: &str,
-) -> Result<StatusCode, error::Error> {
+) -> Response<Full<Bytes>> {
     let downsample_option = log_cache::DownsampleOption::default();
-    let lock = log_cache.read().map_err(|e| e.to_string())?;
+    let lock = log_cache.read().await;
 
     let data = match recv_or_send {
         "recv" => lock.net
@@ -294,7 +196,7 @@ fn route_net_usage(
                 &downsample_option,
                 |r| (
                     limited_convert_time_string_to_f32(&r.time)
-                        .unwrap(), 
+                        .unwrap(),
                     r.recvkBps.unwrap_or_default() as f32
                 ),
             )
@@ -313,73 +215,64 @@ fn route_net_usage(
         _ => None,
     };
 
-    if let Some(data) = data {
-        let body_bytes = data.as_bytes();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            body_bytes.len(),
-        );
-        stream.write(response.as_bytes())?;
-        stream.write(body_bytes)?;
-        stream.flush()?;
-
-        return Ok(StatusCode::Ok);
+    match data {
+        Some(body) => json_response(body),
+        None => not_found_response(),
     }
-
-    Ok(StatusCode::NotFound)
 }
 
-fn handle_connection(
-    stream: &mut std::net::TcpStream,
-    log_cache: &log_cache::SharedUsageCache,
-) -> Result<(), error::Error> {
-    let mut buffer = [0; 1024];
-    stream.read(&mut buffer)?;
-
-    let request_data = String::from_utf8_lossy(&buffer[..]);
-    //println!("Request: {}", request_data);
-
-    let request = Request::try_from(request_data.as_ref())?;
-    if request.method != "GET" {
-        handle_method_not_allowed(stream)?;
-        return Ok(());
+async fn handle_request(
+    req: Request<Incoming>,
+    cache: SharedUsageCache,
+) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+    if req.method() != Method::GET {
+        return Ok(method_not_allowed_response());
     }
 
-    // match式を使った単純なものに書き直せそう
-    let parts: Vec<&str> = request.uri.split('/')
+    let path = req.uri().path();
+    let parts: Vec<&str> = path.split('/')
         .filter(|s| !s.is_empty())
         .collect();
-    let result = match &parts[..] {
-        ["containers"] => 
-            route_containers(stream, log_cache),
+
+    let response = match &parts[..] {
+        ["containers"] =>
+            route_containers(&cache).await,
         ["containers", container_name, resource_type] =>
-            route_cpu_or_memory_usage(stream, log_cache, container_name, resource_type),
+            route_cpu_or_memory_usage(&cache, container_name, resource_type).await,
         ["containers", container_name, "io", read_or_write] =>
-            route_io_usage(stream, log_cache, container_name, read_or_write),
+            route_io_usage(&cache, container_name, read_or_write).await,
         ["containers", container_name, "net", recv_or_send] =>
-            route_net_usage(stream, log_cache, container_name, recv_or_send),
-        _ => route_not_found(stream)
+            route_net_usage(&cache, container_name, recv_or_send).await,
+        _ => not_found_response()
     };
 
-    match result {
-        Ok(StatusCode::NotFound) => route_not_found(stream)?,
-        Err(e) => handle_generic_error(stream, &e)?,
-        _ => { /* do nothing... */ StatusCode::Ok }
-    };
-
-    Ok(())
+    Ok(response)
 }
 
-pub fn start_server(
-    log_cache: &log_cache::SharedUsageCache
+pub async fn start_server(
+    cache: SharedUsageCache
 ) -> Result<(), error::Error> {
-    let listener = std::net::TcpListener::bind("0.0.0.0:7878")?;
+    let addr = SocketAddr::from(([0, 0, 0, 0], 7878));
+    let listener = TcpListener::bind(addr).await?;
 
-    for stream in listener.incoming() {
-        let mut stream = stream?;
-        handle_connection(&mut stream, log_cache)?;
+    println!("Server listening on http://{}", addr);
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let io = TokioIo::new(stream);
+        let cache_clone = Arc::clone(&cache);
+
+        tokio::spawn(async move {
+            let service = service_fn(move |req| {
+                let cache = Arc::clone(&cache_clone);
+                async move { handle_request(req, cache).await }
+            });
+            if let Err(e) = http1::Builder::new()
+                .serve_connection(io, service)
+                .await
+            {
+                eprintln!("Error serving connection: {:?}", e);
+            }
+        });
     }
-
-    Ok(())
 }
-

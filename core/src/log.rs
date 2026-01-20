@@ -566,17 +566,17 @@ fn insert_usages_to_cache(
 
 }
 
-pub fn log_json(
-    log_cache: &log_cache::SharedUsageCache
+pub async fn log_loop(
+    log_cache: log_cache::SharedUsageCache
 ) -> Result<(), error::Error> {
-    let socket_path = "/var/run/docker.sock";
+    let socket_path = "/var/run/docker.sock".to_string();
 
     // create log dir if not exists
-    if std::fs::exists("./log")? {
+    if tokio::fs::try_exists("./log").await? {
         println!("./log directory exists.");
     } else {
         println!("creating ./log directory...");
-        std::fs::create_dir("./log")?;
+        tokio::fs::create_dir("./log").await?;
     }
 
     let now_as_millis = get_now_as_millis()?;
@@ -592,21 +592,21 @@ pub fn log_json(
         let millis_to_wait = timing.saturating_sub(get_now_as_millis()?) as u64;
         println!("waiting {} millis...", millis_to_wait);
 
-        std::thread::sleep(
+        tokio::time::sleep(
             std::time::Duration::from_millis(millis_to_wait)
-        );
+        ).await;
 
-        let stats = get_containers_stats(&socket_path)?;
-        //println!("stats: {}", stats.dump());
-        //println!("prev_stats: {}", prev_stats.dump());
-
+        let socket_path_clone = socket_path.clone();
+        let stats = tokio::task::spawn_blocking(move || {
+            get_containers_stats(&socket_path_clone)
+        }).await.map_err(|e| error::Error::OtherError(e.to_string()))??;
 
         let first_stat = stats.values().next();
         let first_prev_stat = prev_stats.values().next();
-            
+
         let log_condition = first_stat
             .zip(first_prev_stat)
-            .map(|(a, b)| !a.cpu.total.is_none() 
+            .map(|(a, b)| !a.cpu.total.is_none()
                  && !b.cpu.total.is_none()
             )
             .unwrap_or(false);
@@ -615,23 +615,22 @@ pub fn log_json(
 
         if log_condition {
             let usage_result = calc_usages(
-                &(tick.as_millis() as u16), 
+                &(tick.as_millis() as u16),
                 &stats, &prev_stats
             );
             if let Ok(usage) = usage_result {
                 //println!("{}", usage);
                 log_daily(DAILY_LOG_PATH, usage.to_string())?;
-                let mut lock = log_cache.write()
-                    .expect("failed to get write lock for log_cache");
+                let mut lock = log_cache.write().await;
 
-                let container_names = 
+                let container_names =
                     usage.usages.keys().cloned()
                     .collect::<Vec<String>>();
                 for container_name in container_names {
                     // usage中のデータをキャッシュへ移動
                     insert_usages_to_cache(
-                        &container_name, 
-                        &usage, 
+                        &container_name,
+                        &usage,
                         &mut (*lock),
                     );
                 }
@@ -686,7 +685,7 @@ fn json_to_usage(
     })
 }
 
-pub fn read_log(
+pub async fn read_log(
     log_cache: &log_cache::SharedUsageCache
 ) -> Result<(), error::Error> {
 
@@ -717,15 +716,14 @@ pub fn read_log(
                             break;
                         }
                         //println!("{:?}", usages);
-                        let mut lock = log_cache.write()
-                            .expect("cannot lock log_cache"); 
-                        let container_names = 
+                        let mut lock = log_cache.write().await;
+                        let container_names =
                             usages.usages.keys().cloned()
                             .collect::<Vec<String>>();
                         for container_name in container_names {
                             insert_usages_to_cache(
-                                &container_name, 
-                                &usages, 
+                                &container_name,
+                                &usages,
                                 &mut (*lock)
                             );
                         }
@@ -743,8 +741,8 @@ pub fn read_log(
     }
 
     println!(
-        "{}/{} lines are successfully processed.", 
-        iline_success, 
+        "{}/{} lines are successfully processed.",
+        iline_success,
         nlines - nlines_to_skip
     );
 
