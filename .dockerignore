@@ -1,0 +1,19 @@
+# Git
+.git
+.gitignore
+
+# Node
+node_modules
+**/node_modules
+
+# Rust build outputs
+target/
+
+# Next.js build outputs
+.next
+
+# Logs
+*.log
+
+# OS
+.DS_Store
