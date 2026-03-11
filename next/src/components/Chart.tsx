@@ -80,7 +80,7 @@ export const Chart = ({
   }, [mounted, datasets]);
 
   return (
-    <div className='w-full h-[80vh]'>
+    <div className='w-full h-[80svh]'>
       <canvas 
         id={chartId ?? 'chartjs-canvas'}
         className={clsx(
