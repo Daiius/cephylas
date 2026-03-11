@@ -1,8 +1,8 @@
-FROM node:20
+FROM node:22-slim
 
 WORKDIR /app
 
-RUN npm install -g pnpm
+RUN corepack enable
 
 CMD ["pnpm", "run", "dev"]
 
