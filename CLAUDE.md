@@ -78,6 +78,24 @@ services:
 - Chart.js 4 + chartjs-adapter-luxon
 - Chart.js 型は `next/src/types/chartjs.d.ts` で declaration merging 拡張（`containerName` を dataset に持たせる）
 
+## UI 構成
+
+- **`Header.tsx`**: cephylas アイコン中央寄せのみ。サイドバー / ハンバーガーは廃止 (mini-legend が凡例兼フィルタを兼ねるため不要に)。
+- **`MiniLegend.tsx`**: 各チャート上端に表示する**凡例兼フィルタ**。色ドット + コンテナ名のチップを `<button aria-pressed>` で並べる。クリック/タップで `FilterContext.toggle` を呼んで該当コンテナの表示/非表示を切替。フィルタ状態は URL `?hidden=a,b,c` で永続化 (`FilterContext.tsx` の `history.replaceState`)。
+- **`Chart.tsx`**: Chart.js のデフォルト凡例 (`plugins.legend.display`) は無効、tooltip も `interaction.mode = 'nearest'` + `intersect: false` + `hitRadius: 10` でホバー位置に最も近い 1 点だけ表示する。タイトルは Chart.js ではなく HTML `<h3>` 側で出してミニ凡例の上に置く。
+- **色割り当て**: `borderColorFor(index)` でアルファベット順 index に Tableau 10 を順に当てる。N <= 10 なら衝突なし、先頭 = blue。コンテナ追加で alphabetical 位置が変わると色がシフトする点は妥協。
+
+## FilterContext API
+
+`next/src/components/FilterContext.tsx` の Provider が表示/非表示状態の単一の真実 (`hidden: ReadonlySet<string>`) を持ち、URL ?hidden= と同期する。
+
+```ts
+const { hidden, toggle, setAll, clear } = useFilter();
+toggle(name);              // 1 件 on/off
+setAll(['a','b']);         // hidden を ['a','b'] に置換 (= a,b を非表示)
+clear();                   // hidden を空に (= 全表示)
+```
+
 ## 既知の落とし穴・気をつける点
 
 - **`next/src/app/page.tsx` の `dynamic = 'force-dynamic'`**: Next.js キャッシュを完全に無効化している。cacheComponents 移行時はここを外す。
@@ -86,6 +104,7 @@ services:
 - **`core/src/server.rs` の TCP listener はメインスレッドで逐次処理**。並列フェッチ化するならここをスレッド化必須。
 - **`limited_convert_time_string_to_f32`**（`server.rs:135`）は日付を捨てて時刻だけを秒に変換している。日次ローテ前提。日跨ぎでバグる可能性あり。
 - **`core/src/log.rs`** の Docker API レスポンスで `time == "0001-01-01T00:00:00Z"` のケースが実在する。`break` で無視している。
+- **`@headlessui/react`, `@heroicons/react`** が `next/package.json` に残っているが mini-legend に一本化した過程で未使用になっている。次の機会に削除。
 
 ## Git worktree 運用メモ
 
