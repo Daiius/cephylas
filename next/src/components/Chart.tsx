@@ -51,13 +51,24 @@ export const Chart = ({
       options: {
         animation: false,
         maintainAspectRatio: false,
+        // ホバー位置に最も近い 1 点だけ tooltip に出す (mode: 'nearest')。
+        // intersect: false でカーソルが点の上になくてもヒットさせ、
+        // hitRadius と合わせて当たり判定を拡張する。
+        interaction: {
+          mode: 'nearest',
+          intersect: false,
+        },
         plugins: {
           // タイトルは HTML 側で出してミニ凡例の上に置く。
           title: { display: false },
           legend: { display: false },
         },
         elements: {
-          point: { radius: 0 },
+          point: {
+            radius: 0,        // 通常は非表示
+            hoverRadius: 4,   // ホバー時のみ表示してフィードバック
+            hitRadius: 10,    // 当たり判定だけ広げる (実描画より大きく)
+          },
           line: { borderWidth: 2 },
         },
         scales: {
