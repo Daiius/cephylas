@@ -1,7 +1,9 @@
 
 import z from 'zod';
 
-const API_URL = process.env.API_URL!;
+// dev (host): localhost フォールバック
+// prod (Vercel): API_URL を環境変数で `https://api.faveo-systema.net/cephylas` 等に設定
+const API_URL = process.env.API_URL ?? 'http://localhost:7878';
 
 export type FetchResult<T> = 
   | { ok: true;  data: T; }

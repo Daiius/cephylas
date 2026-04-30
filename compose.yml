@@ -14,37 +14,6 @@ services:
       - ./log:/app/log
       - ./core:/app
 
-  cephylas-nextjs:
-    build:
-      context: .
-      dockerfile: Dockerfile.dev
-    container_name: cephylas-nextjs-dev
-    working_dir: /workspace
-    env_file:
-      - .env.development
-    command: pnpm --filter web dev
-    expose:
-      - "3000"
-    develop:
-      watch:
-        - action: sync
-          path: ./next
-          target: /workspace/next
-          ignore:
-            - node_modules/
-            - .next/
-            - "*.tsbuildinfo"
-        - action: rebuild
-          path: pnpm-lock.yaml
-
-  webserver:
-    image: nginx:latest
-    container_name: cephylas-webserver
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-    ports:
-      - 80:80
-
 networks:
   default:
     name: cephylas-network
