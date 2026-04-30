@@ -38,9 +38,9 @@ export const Sidebar = ({
       </div>
 
       <ul className='flex flex-col'>
-        {containers.map((name) => {
+        {containers.map((name, i) => {
           const isHidden = hidden.has(name);
-          const color = borderColorFor(name);
+          const color = borderColorFor(i);
           return (
             <li key={name}>
               <label

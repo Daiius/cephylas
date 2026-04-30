@@ -2,24 +2,16 @@
 // ref: https://www.tableau.com/blog/colors-upgrade-tableau-10-56782
 const palette = [
   '#4e79a7', // blue
-  '#59a14f', // green
-  '#9c755f', // brown
   '#f28e2b', // orange
-  '#edc948', // yellow
-  '#bab0ac', // gray
   '#e15759', // red
-  '#b07aa1', // purple
   '#76b7b2', // teal
+  '#59a14f', // green
+  '#edc948', // yellow
+  '#b07aa1', // purple
   '#ff9da7', // pink
+  '#9c755f', // brown
+  '#bab0ac', // gray
 ] as const;
-
-const hash = (s: string): number => {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) {
-    h = (h * 31 + s.charCodeAt(i)) | 0;
-  }
-  return Math.abs(h);
-};
 
 const hexToRgba = (hex: string, alpha: number): string => {
   const h = hex.replace('#', '');
@@ -29,8 +21,11 @@ const hexToRgba = (hex: string, alpha: number): string => {
   return `rgba(${r},${g},${b},${alpha})`;
 };
 
-export const borderColorFor = (containerName: string): string =>
-  palette[hash(containerName) % palette.length];
+// core はアルファベット順でコンテナ名を返すので、その順序の index を渡せば
+// 先頭コンテナ = palette[0] = blue になり、N <= palette.length なら衝突しない。
+// 新規コンテナの追加で alphabetical 位置が変わると色がシフトする点は妥協。
+export const borderColorFor = (index: number): string =>
+  palette[index % palette.length];
 
-export const backgroundColorFor = (containerName: string): string =>
-  hexToRgba(borderColorFor(containerName), 0.5);
+export const backgroundColorFor = (index: number): string =>
+  hexToRgba(borderColorFor(index), 0.5);

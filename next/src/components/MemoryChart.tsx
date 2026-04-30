@@ -19,15 +19,15 @@ export const MemoryChart = async ({
   const containerNames = containersResponse.data;
 
   const datasets: AppDataset[] = [];
-  for (const containerName of containerNames) {
+  for (const [i, containerName] of containerNames.entries()) {
     const response = await fetchMemoryStatus(containerName);
     if (!response.ok) return (<div>メモリ使用率取得中...</div>);
     datasets.push({
       containerName,
       label: containerName,
       data: response.data,
-      borderColor: borderColorFor(containerName),
-      backgroundColor: backgroundColorFor(containerName),
+      borderColor: borderColorFor(i),
+      backgroundColor: backgroundColorFor(i),
     });
   }
 

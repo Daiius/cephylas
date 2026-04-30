@@ -19,15 +19,18 @@ export const IoChart = async ({
   const containerNames = containersResponse.data;
 
   const datasets: AppDataset[] = [];
-  for (const containerName of containerNames) {
+  for (const [i, containerName] of containerNames.entries()) {
+    const border = borderColorFor(i);
+    const bg = backgroundColorFor(i);
+
     const responseRead = await fetchIoStatus(containerName, 'read');
     if (!responseRead.ok) return (<div>IO read 取得中...</div>);
     datasets.push({
       containerName,
       label: `${containerName} read`,
       data: responseRead.data,
-      borderColor: borderColorFor(containerName),
-      backgroundColor: backgroundColorFor(containerName),
+      borderColor: border,
+      backgroundColor: bg,
       borderDash: [1, 0],
     });
 
@@ -37,8 +40,8 @@ export const IoChart = async ({
       containerName,
       label: `${containerName} write`,
       data: responseWrite.data,
-      borderColor: borderColorFor(containerName),
-      backgroundColor: backgroundColorFor(containerName),
+      borderColor: border,
+      backgroundColor: bg,
       borderDash: [5, 5],
     });
   }

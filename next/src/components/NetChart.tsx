@@ -19,15 +19,18 @@ export const NetChart = async ({
   const containerNames = containersResponse.data;
 
   const datasets: AppDataset[] = [];
-  for (const containerName of containerNames) {
+  for (const [i, containerName] of containerNames.entries()) {
+    const border = borderColorFor(i);
+    const bg = backgroundColorFor(i);
+
     const responseRecv = await fetchNetStatus(containerName, 'recv');
     if (!responseRecv.ok) return (<div>Net recv 取得中...</div>);
     datasets.push({
       containerName,
       label: `${containerName} recv`,
       data: responseRecv.data,
-      borderColor: borderColorFor(containerName),
-      backgroundColor: backgroundColorFor(containerName),
+      borderColor: border,
+      backgroundColor: bg,
       borderDash: [1, 0],
     });
 
@@ -37,8 +40,8 @@ export const NetChart = async ({
       containerName,
       label: `${containerName} send`,
       data: responseSend.data,
-      borderColor: borderColorFor(containerName),
-      backgroundColor: backgroundColorFor(containerName),
+      borderColor: border,
+      backgroundColor: bg,
       borderDash: [5, 5],
     });
   }
