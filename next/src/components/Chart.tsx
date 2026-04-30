@@ -8,10 +8,14 @@ import 'chartjs-adapter-luxon';
 
 import { useFilter } from './FilterContext';
 
-type LineData = { x?: string; y?: number | null }[];
-export type AppDataset = ChartDataset<'line', LineData> & {
-  containerName: string;
-};
+// 時間軸チャートの 1 点。Chart.js の Point は { x: number; y: number } だが
+// time scale だと文字列を runtime で受け付けるので独自に定義する。
+export type TimedPoint = { x?: string; y?: number | null };
+type TimedSeries = TimedPoint[];
+
+// containerName は src/types/chartjs.d.ts の declaration merging で
+// ChartDatasetProperties 自体に生えているので、ここで再宣言は不要。
+export type AppDataset = ChartDataset<'line', TimedSeries>;
 
 export type ChartProps = {
   chartId: string;
@@ -29,18 +33,18 @@ export const Chart = ({
   className,
 }: ChartProps) => {
   const refCanvas = useRef<HTMLCanvasElement | null>(null);
-  const refChart = useRef<ChartJs<'line', LineData> | null>(null);
+  const refChart = useRef<ChartJs<'line', TimedSeries> | null>(null);
   const { hidden } = useFilter();
 
   useEffect(() => {
     if (!refCanvas.current) return;
 
-    refChart.current = new ChartJs<'line', LineData>(refCanvas.current, {
+    refChart.current = new ChartJs<'line', TimedSeries>(refCanvas.current, {
       type: 'line',
       data: {
         datasets: datasets.map((d) => ({
           ...d,
-          hidden: hidden.has(d.containerName),
+          hidden: d.containerName ? hidden.has(d.containerName) : false,
         })),
       },
       options: {
@@ -79,8 +83,7 @@ export const Chart = ({
     const chart = refChart.current;
     if (!chart) return;
     chart.data.datasets.forEach((d) => {
-      const containerName = (d as unknown as AppDataset).containerName;
-      d.hidden = hidden.has(containerName);
+      d.hidden = d.containerName ? hidden.has(d.containerName) : false;
     });
     chart.update('none');
   }, [hidden]);
