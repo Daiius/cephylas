@@ -22,12 +22,12 @@ export default function RootLayout({
   children: ReactNode,
 }>) {
   return (
-  <html lang='en'>
+  <html lang='en' data-theme='light'>
     <body
       suppressHydrationWarning
       className={clsx(
         'antialiased',
-        'min-h-screen bg-slate-100',
+        'min-h-screen bg-base-100',
       )}
     >
       {children}

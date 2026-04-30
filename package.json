@@ -1,0 +1,14 @@
+{
+  "name": "cephylas",
+  "private": true,
+  "scripts": {
+    "dev": "docker compose watch",
+    "down": "docker compose down",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "dev:web": "pnpm --filter web dev"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

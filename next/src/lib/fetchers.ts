@@ -142,7 +142,7 @@ export const fetchIoStatus = async (
 // Net
 const NetUsageDataSchema = z.array(
   z.object({
-    time: z.string().nullish(),
+    time: z.string().optional(),
     recvkBps: z.number().nullish(),
     sendkBps: z.number().nullish(),
   })

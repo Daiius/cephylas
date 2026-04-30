@@ -1,4 +1,16 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 
+/* chart.js のダークテーマ対応がないため light のみで運用 */
+@plugin "daisyui" {
+  themes: light --default;
+  logs: false;
+}
+
+@theme {
+  --animate-appear: appear 0.5s ease-in-out;
+
+  @keyframes appear {
+    0% { opacity: 0; }
+    100% { opacity: 1; }
+  }
+}

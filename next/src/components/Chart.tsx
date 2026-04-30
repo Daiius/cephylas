@@ -8,7 +8,8 @@ import 'chartjs-adapter-luxon';
 
 import { useFilter } from './FilterContext';
 
-export type AppDataset = ChartDataset<'line', { x?: string; y?: number | null }[]> & {
+type LineData = { x?: string; y?: number | null }[];
+export type AppDataset = ChartDataset<'line', LineData> & {
   containerName: string;
 };
 
@@ -28,13 +29,13 @@ export const Chart = ({
   className,
 }: ChartProps) => {
   const refCanvas = useRef<HTMLCanvasElement | null>(null);
-  const refChart = useRef<ChartJs<'line'> | null>(null);
+  const refChart = useRef<ChartJs<'line', LineData> | null>(null);
   const { hidden } = useFilter();
 
   useEffect(() => {
     if (!refCanvas.current) return;
 
-    refChart.current = new ChartJs(refCanvas.current, {
+    refChart.current = new ChartJs<'line', LineData>(refCanvas.current, {
       type: 'line',
       data: {
         datasets: datasets.map((d) => ({
@@ -78,7 +79,7 @@ export const Chart = ({
     const chart = refChart.current;
     if (!chart) return;
     chart.data.datasets.forEach((d) => {
-      const containerName = (d as AppDataset).containerName;
+      const containerName = (d as unknown as AppDataset).containerName;
       d.hidden = hidden.has(containerName);
     });
     chart.update('none');

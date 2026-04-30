@@ -27,23 +27,37 @@ export default async function Home({
 
   return (
     <FilterProvider initialHiddenParam={hiddenParam}>
-      <Header />
-      <div className='flex flex-col md:flex-row md:items-start'>
-        <Sidebar containers={containers} />
-        <main className='flex-1 min-w-0 px-4 pb-4'>
-          <Suspense fallback={<ChartSkeleton />}>
-            <CpuChart />
-          </Suspense>
-          <Suspense fallback={<ChartSkeleton />}>
-            <MemoryChart />
-          </Suspense>
-          <Suspense fallback={<ChartSkeleton />}>
-            <IoChart />
-          </Suspense>
-          <Suspense fallback={<ChartSkeleton />}>
-            <NetChart />
-          </Suspense>
-        </main>
+      <div className='drawer lg:drawer-open'>
+        <input
+          id='cephylas-drawer'
+          type='checkbox'
+          className='drawer-toggle'
+        />
+        <div className='drawer-content flex flex-col min-h-screen'>
+          <Header />
+          <main className='flex-1 px-4 pb-4'>
+            <Suspense fallback={<ChartSkeleton />}>
+              <CpuChart />
+            </Suspense>
+            <Suspense fallback={<ChartSkeleton />}>
+              <MemoryChart />
+            </Suspense>
+            <Suspense fallback={<ChartSkeleton />}>
+              <IoChart />
+            </Suspense>
+            <Suspense fallback={<ChartSkeleton />}>
+              <NetChart />
+            </Suspense>
+          </main>
+        </div>
+        <div className='drawer-side z-40'>
+          <label
+            htmlFor='cephylas-drawer'
+            aria-label='close sidebar'
+            className='drawer-overlay'
+          />
+          <Sidebar containers={containers} />
+        </div>
       </div>
     </FilterProvider>
   );
