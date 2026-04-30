@@ -7,6 +7,7 @@ import { Chart as ChartJs, type ChartDataset } from 'chart.js/auto';
 import 'chartjs-adapter-luxon';
 
 import { useFilter } from './FilterContext';
+import { MiniLegend } from './MiniLegend';
 
 // 時間軸チャートの 1 点。Chart.js の Point は { x: number; y: number } だが
 // time scale だと文字列を runtime で受け付けるので独自に定義する。
@@ -51,7 +52,8 @@ export const Chart = ({
         animation: false,
         maintainAspectRatio: false,
         plugins: {
-          title: { display: !!title, text: title },
+          // タイトルは HTML 側で出してミニ凡例の上に置く。
+          title: { display: false },
           legend: { display: false },
         },
         elements: {
@@ -89,12 +91,18 @@ export const Chart = ({
   }, [hidden]);
 
   return (
-    <div className='w-full h-[80svh]'>
-      <canvas
-        ref={refCanvas}
-        id={chartId}
-        className={clsx(className)}
-      />
+    <div className='w-full mb-2'>
+      {title && (
+        <h3 className='text-sm font-semibold px-2 pt-2'>{title}</h3>
+      )}
+      <MiniLegend datasets={datasets} />
+      <div className='w-full h-[75svh]'>
+        <canvas
+          ref={refCanvas}
+          id={chartId}
+          className={clsx(className)}
+        />
+      </div>
     </div>
   );
 };
