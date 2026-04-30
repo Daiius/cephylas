@@ -30,7 +30,7 @@ export const MiniLegend = ({ datasets }: { datasets: AppDataset[] }) => {
   if (uniq.length === 0) return null;
 
   return (
-    <ul className='flex flex-wrap gap-x-1 gap-y-1 px-2 py-1 text-xs leading-none'>
+    <ul className='flex flex-wrap gap-1 px-2 py-1 text-sm leading-none'>
       {uniq.map(({ name, color }) => {
         const isHidden = hidden.has(name);
         return (
@@ -40,7 +40,8 @@ export const MiniLegend = ({ datasets }: { datasets: AppDataset[] }) => {
               onClick={() => toggle(name)}
               aria-pressed={!isHidden}
               className={clsx(
-                'flex items-center gap-1.5 px-1.5 py-1 rounded-selector cursor-pointer',
+                'flex items-center gap-2 px-2.5 py-1.5 rounded-selector cursor-pointer',
+                'border border-transparent',
                 'hover:bg-base-300/60 active:bg-base-300',
                 'transition-opacity',
                 isHidden && 'opacity-40 line-through',
@@ -48,7 +49,7 @@ export const MiniLegend = ({ datasets }: { datasets: AppDataset[] }) => {
             >
               <span
                 aria-hidden
-                className='inline-block w-2.5 h-2.5 rounded-full shrink-0'
+                className='inline-block w-3 h-3 rounded-full shrink-0'
                 style={{ backgroundColor: color }}
               />
               <span className='truncate max-w-[12rem]' title={name}>{name}</span>
