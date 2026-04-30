@@ -1,17 +1,16 @@
 import clsx from 'clsx';
-import { Chart } from '@/components/Chart';
+import { Chart, type AppDataset } from '@/components/Chart';
+import { borderColorFor, backgroundColorFor } from '@/lib/colors';
 
 import {
   fetchContainers,
   fetchMemoryStatus,
-  MemoryUsageDatasets,
 } from '@/lib/fetchers';
-
 
 export const MemoryChart = async ({
   className,
 }: {
-  className?: string,
+  className?: string;
 }) => {
   const containersResponse = await fetchContainers();
   if (!containersResponse.ok) {
@@ -19,23 +18,26 @@ export const MemoryChart = async ({
   }
   const containerNames = containersResponse.data;
 
-  const memoryUsageDatasets: MemoryUsageDatasets = [];
+  const datasets: AppDataset[] = [];
   for (const containerName of containerNames) {
     const response = await fetchMemoryStatus(containerName);
-    if (!response.ok) return (<div>CPU使用率取得中...</div>);
-    memoryUsageDatasets.push({
+    if (!response.ok) return (<div>メモリ使用率取得中...</div>);
+    datasets.push({
+      containerName,
       label: containerName,
       data: response.data,
+      borderColor: borderColorFor(containerName),
+      backgroundColor: backgroundColorFor(containerName),
     });
   }
 
   return (
-    <Chart 
+    <Chart
       className={clsx(className)}
       chartId='chartjs-memory-usage'
-      datasets={memoryUsageDatasets} 
-      title='Memory usage (%)' 
+      datasets={datasets}
+      title='Memory usage (%)'
+      yLabel='%'
     />
   );
 };
-

@@ -1,41 +1,41 @@
 import clsx from 'clsx';
-import { Chart } from '@/components/Chart';
+import { Chart, type AppDataset } from '@/components/Chart';
+import { borderColorFor, backgroundColorFor } from '@/lib/colors';
 
 import {
   fetchContainers,
   fetchCpuStatus,
-  CpuUsageDatasets,
 } from '@/lib/fetchers';
-
-
-export type CpuChartProps = {
-  className?: string;
-}
 
 export const CpuChart = async ({
   className,
-}: CpuChartProps) => {
+}: {
+  className?: string;
+}) => {
   const containersResponse = await fetchContainers();
   if (!containersResponse.ok) { return (<div>コンテナ名取得中...</div>); }
   const containerNames = containersResponse.data;
 
-  const cpuUsageDatasets: CpuUsageDatasets = [];
+  const datasets: AppDataset[] = [];
   for (const containerName of containerNames) {
     const response = await fetchCpuStatus(containerName);
     if (!response.ok) return (<div>CPU使用率取得中...</div>);
-    cpuUsageDatasets.push({
+    datasets.push({
+      containerName,
       label: containerName,
       data: response.data,
+      borderColor: borderColorFor(containerName),
+      backgroundColor: backgroundColorFor(containerName),
     });
   }
 
   return (
-    <Chart 
+    <Chart
       className={clsx(className)}
       chartId='chartjs-cpu-usage'
-      datasets={cpuUsageDatasets} 
-      title='CPU usage (%)' 
+      datasets={datasets}
+      title='CPU usage (%)'
+      yLabel='%'
     />
   );
 };
-
