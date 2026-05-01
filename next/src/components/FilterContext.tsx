@@ -15,6 +15,7 @@ type FilterContextValue = {
   hidden: ReadonlySet<string>;
   toggle: (containerName: string) => void;
   setAll: (containerNames: readonly string[]) => void;
+  isolate: (containerName: string, allNames: readonly string[]) => void;
   clear: () => void;
 };
 
@@ -78,13 +79,20 @@ export const FilterProvider = ({
     setHidden(new Set(containerNames));
   }, []);
 
+  const isolate = useCallback(
+    (containerName: string, allNames: readonly string[]) => {
+      setHidden(new Set(allNames.filter((n) => n !== containerName)));
+    },
+    [],
+  );
+
   const clear = useCallback(() => {
     setHidden(new Set());
   }, []);
 
   const value = useMemo(
-    () => ({ hidden, toggle, setAll, clear }),
-    [hidden, toggle, setAll, clear],
+    () => ({ hidden, toggle, setAll, isolate, clear }),
+    [hidden, toggle, setAll, isolate, clear],
   );
 
   return (
