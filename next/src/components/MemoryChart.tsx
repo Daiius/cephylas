@@ -1,4 +1,5 @@
 import clsx from 'clsx';
+import { cacheLife, cacheTag } from 'next/cache';
 import { Chart, type AppDataset } from '@/components/Chart';
 import { borderColorFor, backgroundColorFor } from '@/lib/colors';
 
@@ -12,6 +13,10 @@ export const MemoryChart = async ({
 }: {
   className?: string;
 }) => {
+  'use cache';
+  cacheLife({ revalidate: 10, expire: 60, stale: 10 });
+  cacheTag('chart:memory');
+
   const containersResponse = await fetchContainers();
   if (!containersResponse.ok) {
     return (<div>コンテナ名取得中...</div>);

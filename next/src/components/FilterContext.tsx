@@ -40,19 +40,20 @@ const syncUrl = (set: ReadonlySet<string>) => {
   window.history.replaceState(null, '', url.toString());
 };
 
-export const FilterProvider = ({
-  children,
-  initialHiddenParam,
-}: {
-  children: ReactNode;
-  initialHiddenParam?: string;
-}) => {
-  const [hidden, setHidden] = useState<Set<string>>(() =>
-    parseHiddenParam(initialHiddenParam),
-  );
+export const FilterProvider = ({ children }: { children: ReactNode }) => {
+  // SSR では空集合 (= 全表示) で描画する。cacheComponents 構成上、
+  // searchParams を server 側で読むと page 全体が dynamic になってしまうため、
+  // URL の ?hidden= は client mount 時に読み取って state に反映する。
+  // 一瞬全 chip が pressed で表示されてから filtered になるフラッシュは許容。
+  const [hidden, setHidden] = useState<Set<string>>(() => new Set());
 
-  // 初回マウント時の URL は initialHiddenParam と一致しているので上書きしない。
-  // 以降の変更だけ history に反映する。
+  // mount 時に URL → state を同期。SSR 中は実行されない。
+  useEffect(() => {
+    const param = new URLSearchParams(window.location.search).get('hidden');
+    if (param) setHidden(parseHiddenParam(param));
+  }, []);
+
+  // 以降の hidden 変更を URL に書き戻す。初回 (mount) は同期処理に任せて skip。
   // 注: dev では Next.js が history.replaceState を傍受して
   // 内部 Router の state を更新するため、StrictMode の二重実行で
   // "Cannot update a component (Router) while rendering FilterProvider" の

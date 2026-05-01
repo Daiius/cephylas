@@ -8,20 +8,9 @@ import { ChartSkeleton } from '@/components/ChartSkeleton';
 import { Header } from '@/components/Header';
 import { FilterProvider } from '@/components/FilterContext';
 
-export const dynamic = 'force-dynamic';
-
-type SearchParams = Promise<{ hidden?: string | string[] }>;
-
-export default async function Home({
-  searchParams,
-}: {
-  searchParams: SearchParams;
-}) {
-  const sp = await searchParams;
-  const hiddenParam = Array.isArray(sp.hidden) ? sp.hidden.join(',') : sp.hidden;
-
+export default function Home() {
   return (
-    <FilterProvider initialHiddenParam={hiddenParam}>
+    <FilterProvider>
       <Header />
       <main className='px-4 pb-4'>
         <Suspense fallback={<ChartSkeleton />}>
