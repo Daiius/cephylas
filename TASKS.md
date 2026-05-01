@@ -4,27 +4,30 @@
 
 `feat/v2-web` で web 側の v2 化を一気通貫で実施中。現時点のコミット (新しい順):
 
-1. `feat(legend): mini-legend のダブルクリック/タップで isolate / restore に対応`
-2. `chore(deps): mini-legend 一本化で未使用になった @headlessui/react と @heroicons/react を削除`
-3. `refactor: サイドバー / drawer / ハンバーガーを撤廃、mini-legend に一本化`
-4. `feat(legend): mini-legend をクリック/タップで表示/非表示切替可能に`
-5. `feat(chart): tooltip の当たり判定を拡張`
-6. `fix(colors): Tableau 10 を正典順に並べ替え + 色割り当てを index-based に変更`
-7. `feat: 各チャートに inline mini-legend を表示`
-8. `refactor: Next.js を docker から外し host 起動 + prod 構成を Vercel 前提に整理`
-9. `chore: web パッケージを 1.0.0 へ bump`
-10. `refactor(types): Chart.js を declaration merging で拡張し as キャストを撤去`
-11. `refactor: pnpm workspace + Tailwind 4 / daisyUI 5 + compose watch`
-12. `feat: チャートカラーを Tableau 10 パレットに変更`
-13. `docs: Claude Code 用ドキュメントと dev override 用 gitignore 追加`
-14. `feat: コンテナ表示フィルタのサイドバー化`
+1. `feat(cache): cacheComponents 移行 / 各 chart を 'use cache' 化`
+2. `chore(deps): Next.js を 16.1.6 → 16.2.4 へアップデート`
+3. `feat(legend): mini-legend のダブルクリック/タップで isolate / restore に対応`
+4. `chore(deps): mini-legend 一本化で未使用になった @headlessui/react と @heroicons/react を削除`
+5. `refactor: サイドバー / drawer / ハンバーガーを撤廃、mini-legend に一本化`
+6. `feat(legend): mini-legend をクリック/タップで表示/非表示切替可能に`
+7. `feat(chart): tooltip の当たり判定を拡張`
+8. `fix(colors): Tableau 10 を正典順に並べ替え + 色割り当てを index-based に変更`
+9. `feat: 各チャートに inline mini-legend を表示`
+10. `refactor: Next.js を docker から外し host 起動 + prod 構成を Vercel 前提に整理`
+11. `chore: web パッケージを 1.0.0 へ bump`
+12. `refactor(types): Chart.js を declaration merging で拡張し as キャストを撤去`
+13. `refactor: pnpm workspace + Tailwind 4 / daisyUI 5 + compose watch`
+14. `feat: チャートカラーを Tableau 10 パレットに変更`
+15. `docs: Claude Code 用ドキュメントと dev override 用 gitignore 追加`
+16. `feat: コンテナ表示フィルタのサイドバー化`
 
 到達した形:
 - 凡例 + フィルタは **mini-legend (`MiniLegend.tsx`) に統合**。サイドバー / drawer / ハンバーガーは廃止
 - mini-legend の操作: シングルクリックで toggle (250ms 遅延発火)、ダブルクリックで isolate / restore
 - 色は Tableau 10 を **alphabetical index** で割当 (先頭 = blue、N <= 10 で衝突なし)
 - Chart.js: `mode: 'nearest'` + `intersect: false` + `hitRadius: 10` で当たり判定広め、tooltip は 1 点
-- フィルタ状態は URL `?hidden=a,b,c` で永続化、`history.replaceState` で navigation を回避
+- フィルタ状態は URL `?hidden=a,b,c` で永続化 (client mount 時に読み出し)、`history.replaceState` で navigation を回避
+- **cacheComponents 有効**: 各 chart server component を `'use cache'` 化 (`cacheTag('chart:cpu')` 等)、`fetchContainers` のみ fetcher 側でも cache。page は Partial Prerender (`◐ /`)
 - 開発は `pnpm dev` 一発 (core を docker、web を host で並列起動)
 - 本番は Vercel + 自前 VPS API (`api.faveo-systema.net/cephylas`) 構成
 
@@ -41,23 +44,12 @@
 - `core/src/server.rs` の `for stream in listener.incoming()` を `std::thread::spawn` でハンドラを別スレッドへ。簡易 thread pool でも可
 - 並列度に応じて `RwLock` の read 競合が増えるが、read 中心なので問題ないはず
 
-### 2. PR 3: cacheComponents 移行
-
-**ゴール**: `dynamic = 'force-dynamic'` を撤廃し、`'use cache'` + `cacheLife({ revalidate: 10 })` でキャッシュ。
-
-実装方針:
-- `next.config.ts` に `experimental.cacheComponents: true` を追加
-- `lib/fetchers.ts` の各 fetcher に `'use cache'` ディレクティブを追加
-- `cacheLife({ revalidate: 10 })` — log 投入間隔と一致
-- `cacheTag('containers')` / `cacheTag(\`cpu:${name}\`)` で revalidation key を整理
-- `app/page.tsx` の `dynamic = 'force-dynamic'` を削除
-- `<Suspense fallback={<ChartSkeleton />}>` は維持
-
-### 3. prod 移行 (おそらく PR 3 と同時)
+### 2. prod 移行
 
 `feat/v2-web` で `next/Dockerfile.prod` を削除済 (Vercel が build するので)。Vercel 側に必要な調整:
 - Vercel project の Root Directory を `next` に設定 (monorepo 構造のため)
 - Vercel の Env Vars で `API_URL=https://api.faveo-systema.net/cephylas` (or 想定 URL) を設定
+- cacheComponents が有効なので、Vercel の Data Cache が自然に効く想定 (10s revalidate)
 
 ## 直近の小バグ・改善
 

@@ -84,7 +84,7 @@ services:
 - **`MiniLegend.tsx`**: 各チャート上端に表示する**凡例兼フィルタ**。色ドット + コンテナ名のチップを `<button aria-pressed>` で並べる。
   - シングルクリック/タップ: `FilterContext.toggle` を呼んで表示/非表示切替。double 検知のため 250ms 遅延発火
   - ダブルクリック/タップ: 通常状態 → そのチップだけ表示 (`isolate`)、単独表示中 → 全表示に戻す (`clear`)。同チップへの 250ms 以内 2 連打を `pendingRef` のタイムスタンプ比較で判定
-  - フィルタ状態は URL `?hidden=a,b,c` で永続化 (`FilterContext.tsx` の `history.replaceState`)
+  - フィルタ状態は URL `?hidden=a,b,c` で永続化 (`FilterContext.tsx` の `history.replaceState`)。cacheComponents 構成のため URL は client mount 時に読み出す (server で `searchParams` を await すると page 全体が dynamic 化するため)
   - iOS の double-tap zoom 抑止のため `touch-manipulation` クラスを付与
 - **`Chart.tsx`**: Chart.js のデフォルト凡例 (`plugins.legend.display`) は無効、tooltip も `interaction.mode = 'nearest'` + `intersect: false` + `hitRadius: 10` でホバー位置に最も近い 1 点だけ表示する。タイトルは Chart.js ではなく HTML `<h3>` 側で出してミニ凡例の上に置く。
 - **色割り当て**: `borderColorFor(index)` でアルファベット順 index に Tableau 10 を順に当てる。N <= 10 なら衝突なし、先頭 = blue。コンテナ追加で alphabetical 位置が変わると色がシフトする点は妥協。
@@ -101,10 +101,19 @@ isolate(name, allNames);        // name 以外を hidden (= name だけ表示)
 clear();                        // hidden を空に (= 全表示)
 ```
 
+## キャッシュ構成 (cacheComponents)
+
+- `next.config.ts` で `cacheComponents: true` を有効化
+- 各 chart server component (`CpuChart.tsx` 等) の冒頭で `'use cache'` + `cacheLife({ revalidate: 10, expire: 60, stale: 10 })` + `cacheTag('chart:cpu')` 等を宣言。fetch + データ整形 + JSX 構築までまるごと cache 単位
+- 4 chart で共有される `fetchContainers` のみ fetcher 側でも `'use cache'` (`cacheTag('containers')`)。dedup 兼共有 cache
+- それ以外の `fetchCpuStatus` 等は cache 指定なし (chart 側 cache に内包される)
+- `FetchResult` の error 側は `{ message: string }` (serializable)。Error インスタンスを返すと `'use cache'` の境界で serialize できないため
+- `app/page.tsx` は `dynamic` 指定なし。build 結果で Partial Prerender (`◐ /`) になる
+- 不変条件: cache された関数内では server-only な dynamic API (`cookies()`, `headers()`, `searchParams` の await 等) を呼ばない
+
 ## 既知の落とし穴・気をつける点
 
-- **`next/src/app/page.tsx` の `dynamic = 'force-dynamic'`**: Next.js キャッシュを完全に無効化している。cacheComponents 移行時はここを外す。
-- **`fetchContainers()` が 4 チャートで個別に呼ばれている**（`CpuChart.tsx` など）。`core` の単一スレッドサーバには負荷。`react.cache()` か並列化したい。
+- **`fetchContainers()` が 4 チャートで個別に呼ばれている**（`CpuChart.tsx` など）。`'use cache'` 化で dedup されるので問題は薄まったが、コア側の負荷は依然として 1 リクエストにつき N+1 直列。
 - **N+1 直列フェッチ**: `for (const c of containers) { await fetchXxx(c) }` が CPU/Mem/IO/Net 全部にある。`Promise.all` 化推奨。
 - **`core/src/server.rs` の TCP listener はメインスレッドで逐次処理**。並列フェッチ化するならここをスレッド化必須。
 - **`limited_convert_time_string_to_f32`**（`server.rs:135`）は日付を捨てて時刻だけを秒に変換している。日次ローテ前提。日跨ぎでバグる可能性あり。
