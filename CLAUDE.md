@@ -104,7 +104,6 @@ clear();                   // hidden を空に (= 全表示)
 - **`core/src/server.rs` の TCP listener はメインスレッドで逐次処理**。並列フェッチ化するならここをスレッド化必須。
 - **`limited_convert_time_string_to_f32`**（`server.rs:135`）は日付を捨てて時刻だけを秒に変換している。日次ローテ前提。日跨ぎでバグる可能性あり。
 - **`core/src/log.rs`** の Docker API レスポンスで `time == "0001-01-01T00:00:00Z"` のケースが実在する。`break` で無視している。
-- **`@headlessui/react`, `@heroicons/react`** が `next/package.json` に残っているが mini-legend に一本化した過程で未使用になっている。次の機会に削除。
 
 ## Git worktree 運用メモ
 

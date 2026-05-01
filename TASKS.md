@@ -80,6 +80,5 @@
 
 ## 直近の小バグ・改善
 
-- `next/package.json` に `@headlessui/react`, `@heroicons/react` が残っているが mini-legend 一本化で完全未使用 → 次のコミットで削除
 - `Chart.tsx` の `datasets: any` 型は `AppDataset` でほぼ解決、残りも `TimedPoint` / `TimedSeries` で型付き
 - `nginx.conf` の `/` ルート (Next.js プロキシ) は Vercel hosting に移行したので未使用。`/api/` も使わない設計 → `/cephylas/*` で core にルーティングする形に書き換える整理が必要 (本番側の都合に合わせて)
