@@ -4,29 +4,30 @@
 
 `feat/v2-web` で web 側の v2 化を一気通貫で実施中。現時点のコミット (新しい順):
 
-1. `feat(cache): cacheComponents 移行 / 各 chart を 'use cache' 化`
-2. `chore(deps): Next.js を 16.1.6 → 16.2.4 へアップデート`
-3. `feat(legend): mini-legend のダブルクリック/タップで isolate / restore に対応`
-4. `chore(deps): mini-legend 一本化で未使用になった @headlessui/react と @heroicons/react を削除`
-5. `refactor: サイドバー / drawer / ハンバーガーを撤廃、mini-legend に一本化`
-6. `feat(legend): mini-legend をクリック/タップで表示/非表示切替可能に`
-7. `feat(chart): tooltip の当たり判定を拡張`
-8. `fix(colors): Tableau 10 を正典順に並べ替え + 色割り当てを index-based に変更`
-9. `feat: 各チャートに inline mini-legend を表示`
-10. `refactor: Next.js を docker から外し host 起動 + prod 構成を Vercel 前提に整理`
-11. `chore: web パッケージを 1.0.0 へ bump`
-12. `refactor(types): Chart.js を declaration merging で拡張し as キャストを撤去`
-13. `refactor: pnpm workspace + Tailwind 4 / daisyUI 5 + compose watch`
-14. `feat: チャートカラーを Tableau 10 パレットに変更`
-15. `docs: Claude Code 用ドキュメントと dev override 用 gitignore 追加`
-16. `feat: コンテナ表示フィルタのサイドバー化`
+1. `refactor(filter): hidden の URL 永続化を撤去、純粋に react state のみで管理`
+2. `feat(cache): cacheComponents 移行 / 各 chart を 'use cache' 化`
+3. `chore(deps): Next.js を 16.1.6 → 16.2.4 へアップデート`
+4. `feat(legend): mini-legend のダブルクリック/タップで isolate / restore に対応`
+5. `chore(deps): mini-legend 一本化で未使用になった @headlessui/react と @heroicons/react を削除`
+6. `refactor: サイドバー / drawer / ハンバーガーを撤廃、mini-legend に一本化`
+7. `feat(legend): mini-legend をクリック/タップで表示/非表示切替可能に`
+8. `feat(chart): tooltip の当たり判定を拡張`
+9. `fix(colors): Tableau 10 を正典順に並べ替え + 色割り当てを index-based に変更`
+10. `feat: 各チャートに inline mini-legend を表示`
+11. `refactor: Next.js を docker から外し host 起動 + prod 構成を Vercel 前提に整理`
+12. `chore: web パッケージを 1.0.0 へ bump`
+13. `refactor(types): Chart.js を declaration merging で拡張し as キャストを撤去`
+14. `refactor: pnpm workspace + Tailwind 4 / daisyUI 5 + compose watch`
+15. `feat: チャートカラーを Tableau 10 パレットに変更`
+16. `docs: Claude Code 用ドキュメントと dev override 用 gitignore 追加`
+17. `feat: コンテナ表示フィルタのサイドバー化`
 
 到達した形:
 - 凡例 + フィルタは **mini-legend (`MiniLegend.tsx`) に統合**。サイドバー / drawer / ハンバーガーは廃止
 - mini-legend の操作: シングルクリックで toggle (250ms 遅延発火)、ダブルクリックで isolate / restore
 - 色は Tableau 10 を **alphabetical index** で割当 (先頭 = blue、N <= 10 で衝突なし)
 - Chart.js: `mode: 'nearest'` + `intersect: false` + `hitRadius: 10` で当たり判定広め、tooltip は 1 点
-- フィルタ状態は URL `?hidden=a,b,c` で永続化 (client mount 時に読み出し)、`history.replaceState` で navigation を回避
+- フィルタ状態は **react state のみ** で管理 (URL 永続化なし)。リロードで全表示にリセット
 - **cacheComponents 有効**: 各 chart server component を `'use cache'` 化 (`cacheTag('chart:cpu')` 等)、`fetchContainers` のみ fetcher 側でも cache。page は Partial Prerender (`◐ /`)
 - 開発は `pnpm dev` 一発 (core を docker、web を host で並列起動)
 - 本番は Vercel + 自前 VPS API (`api.faveo-systema.net/cephylas`) 構成
