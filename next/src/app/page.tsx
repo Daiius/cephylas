@@ -1,22 +1,18 @@
 import { Suspense } from 'react';
 
-//export const revalidate = 10;
-export const dynamic = 'force-dynamic';
-
 import { CpuChart } from '@/components/CpuChart';
 import { MemoryChart } from '@/components/MemoryChart';
 import { IoChart } from '@/components/IoChart';
 import { NetChart } from '@/components/NetChart';
 import { ChartSkeleton } from '@/components/ChartSkeleton';
 import { Header } from '@/components/Header';
+import { FilterProvider } from '@/components/FilterContext';
 
-
-export default async function Home() {
-
+export default function Home() {
   return (
-    <>
+    <FilterProvider>
       <Header />
-      <div className='px-4 pb-4'>
+      <main className='px-4 pb-4'>
         <Suspense fallback={<ChartSkeleton />}>
           <CpuChart />
         </Suspense>
@@ -29,8 +25,7 @@ export default async function Home() {
         <Suspense fallback={<ChartSkeleton />}>
           <NetChart />
         </Suspense>
-      </div>
-    </>
+      </main>
+    </FilterProvider>
   );
 }
-

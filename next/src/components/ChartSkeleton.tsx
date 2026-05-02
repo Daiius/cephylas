@@ -1,10 +1,3 @@
-import { clsx } from 'clsx';
-
 export const ChartSkeleton = () => (
-  <div className={clsx(
-    'w-full h-[80svh] rounded-lg shadow-xl',
-    'bg-slate-200',
-  )}>
-  </div>
+  <div className='w-full h-[80svh] rounded-box bg-base-200 skeleton' />
 );
-

@@ -1,0 +1,12 @@
+services:
+  cephylas:
+    env_file:
+      - .env.production
+
+  webserver:
+    image: nginx:latest
+    container_name: cephylas-webserver
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - 80:80

@@ -1,94 +1,119 @@
 'use client'
 
 import { clsx } from 'clsx'
-import {
-  useEffect,
-  useRef,
-  useState,
-} from 'react'
+import { useEffect, useRef } from 'react'
 
-// Chart.js v4 あたりから
-// 必要なモジュールのみをimport出来る様に変更された
-// 多少はメモリ消費が減る...???
-// 全部importする場合には以下でOK
-import { Chart as ChartJs } from 'chart.js/auto';
+import { Chart as ChartJs, type ChartDataset } from 'chart.js/auto';
 import 'chartjs-adapter-luxon';
 
-export type ChartProps = { 
-  chartId: string,
-  datasets: any,
-  title?: string,
-  className?: string,
-}
+import { useFilter } from './FilterContext';
+import { MiniLegend } from './MiniLegend';
+
+// 時間軸チャートの 1 点。Chart.js の Point は { x: number; y: number } だが
+// time scale だと文字列を runtime で受け付けるので独自に定義する。
+export type TimedPoint = { x?: string; y?: number | null };
+type TimedSeries = TimedPoint[];
+
+// containerName は src/types/chartjs.d.ts の declaration merging で
+// ChartDatasetProperties 自体に生えているので、ここで再宣言は不要。
+export type AppDataset = ChartDataset<'line', TimedSeries>;
+
+export type ChartProps = {
+  chartId: string;
+  datasets: AppDataset[];
+  title?: string;
+  yLabel?: string;
+  className?: string;
+};
 
 export const Chart = ({
   chartId,
   datasets,
   title,
+  yLabel,
   className,
 }: ChartProps) => {
-
-  const [mounted, setMounted] = useState<boolean>(false);
-  const refCanvas = useRef<HTMLCanvasElement|null>(null);
-  const refChart = useRef<ChartJs|null>(null);
+  const refCanvas = useRef<HTMLCanvasElement | null>(null);
+  const refChart = useRef<ChartJs<'line', TimedSeries> | null>(null);
+  const { hidden } = useFilter();
 
   useEffect(() => {
-    if (mounted) {
-      refCanvas.current =
-        document.getElementById(chartId ?? 'chartjs-canvas') as HTMLCanvasElement;
-      if (refCanvas.current == null) {
-        throw new Error('Chart.js container is null.');
-      }
+    if (!refCanvas.current) return;
 
-      console.log('datasets: ', datasets);
-      refChart.current = new ChartJs(
-        refCanvas.current,
-        {
-          type: 'line',
-          data: { datasets: datasets == null ? {} : datasets },
-          options: {
-            animation: false,
-            //aspectRatio: 1,
-            maintainAspectRatio: false,
-            plugins: {
-              title: {
-                display: true,
-                text: title,
-              },
-            },
-            elements: {
-              point: { radius: 0 },
-              line: { borderWidth: 2 },
-            },
-            scales: {
-              x: {
-                type: 'time',
-                time: { 
-                  unit: 'minute',
-                },
-              },
-              y: { min: 0 },
-            }
-          }
-        }
-      );
-    } else { 
-      setMounted(true); 
-    }
+    refChart.current = new ChartJs<'line', TimedSeries>(refCanvas.current, {
+      type: 'line',
+      data: {
+        datasets: datasets.map((d) => ({
+          ...d,
+          hidden: d.containerName ? hidden.has(d.containerName) : false,
+        })),
+      },
+      options: {
+        animation: false,
+        maintainAspectRatio: false,
+        // ホバー位置に最も近い 1 点だけ tooltip に出す (mode: 'nearest')。
+        // intersect: false でカーソルが点の上になくてもヒットさせ、
+        // hitRadius と合わせて当たり判定を拡張する。
+        interaction: {
+          mode: 'nearest',
+          intersect: false,
+        },
+        plugins: {
+          // タイトルは HTML 側で出してミニ凡例の上に置く。
+          title: { display: false },
+          legend: { display: false },
+        },
+        elements: {
+          point: {
+            radius: 0,        // 通常は非表示
+            hoverRadius: 4,   // ホバー時のみ表示してフィードバック
+            hitRadius: 10,    // 当たり判定だけ広げる (実描画より大きく)
+          },
+          line: { borderWidth: 2 },
+        },
+        scales: {
+          x: { type: 'time', time: { unit: 'minute' } },
+          y: {
+            min: 0,
+            title: yLabel ? { display: true, text: yLabel } : undefined,
+          },
+        },
+      },
+    });
 
-    return () => refChart.current?.destroy();
-  }, [mounted, datasets]);
+    return () => {
+      refChart.current?.destroy();
+      refChart.current = null;
+    };
+    // datasets を依存に入れると毎回 destroy/create される。
+    // datasets はサーバから new array で来るので、本来は安定化したいが
+    // PR 1 では動作優先で再生成を許容する。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [datasets]);
+
+  // hidden の変更だけは update('none') で軽く反映
+  useEffect(() => {
+    const chart = refChart.current;
+    if (!chart) return;
+    chart.data.datasets.forEach((d) => {
+      d.hidden = d.containerName ? hidden.has(d.containerName) : false;
+    });
+    chart.update('none');
+  }, [hidden]);
 
   return (
-    <div className='w-full h-[80svh]'>
-      <canvas 
-        id={chartId ?? 'chartjs-canvas'}
-        className={clsx(
-          className,
-        )}
-      >
-      </canvas>
+    <div className='w-full mb-2'>
+      {title && (
+        <h3 className='text-sm font-semibold px-2 pt-2'>{title}</h3>
+      )}
+      <MiniLegend datasets={datasets} />
+      <div className='w-full h-[75svh]'>
+        <canvas
+          ref={refCanvas}
+          id={chartId}
+          className={clsx(className)}
+        />
+      </div>
     </div>
-  )
+  );
 };
-

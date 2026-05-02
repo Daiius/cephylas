@@ -1,12 +1,16 @@
-
+import { cacheLife, cacheTag } from 'next/cache';
 import z from 'zod';
 
-const API_URL = process.env.API_URL!;
+// dev (host): localhost フォールバック
+// prod (Vercel): API_URL を環境変数で `https://api.faveo-systema.net/cephylas` 等に設定
+const API_URL = process.env.API_URL ?? 'http://localhost:7878';
 
-export type FetchResult<T> = 
+// 'use cache' で返すため、Error インスタンスではなく serializable な形にする。
+export type FetchResult<T> =
   | { ok: true;  data: T; }
-  | { ok: false; error: Error; }
+  | { ok: false; error: { message: string }; }
   ;
+
 const fetchWithZod = async <T>(
   url: string,
   schema: z.ZodSchema<T>
@@ -15,9 +19,9 @@ const fetchWithZod = async <T>(
     const response = await fetch(url);
     if (!response.ok) {
       console.error(response.statusText);
-      return { 
-        ok: false, 
-        error: new Error(`fetch failed with ${response.status}`),
+      return {
+        ok: false,
+        error: { message: `fetch failed with ${response.status}` },
       };
     }
     const json = await response.json();
@@ -27,19 +31,21 @@ const fetchWithZod = async <T>(
     console.error(err);
     return {
       ok: false,
-      error:
-        err instanceof Error
-        ? err
-        : new Error('Unknown error')
+      error: { message: err instanceof Error ? err.message : 'Unknown error' },
     };
   }
 }
 
 // Containers
 const containersSchema = z.array(z.string());
-export const fetchContainers = async ()
-  : Promise<FetchResult<z.infer<typeof containersSchema>>> => 
-await fetchWithZod(`${API_URL}/containers`, containersSchema);
+export const fetchContainers = async (): Promise<
+  FetchResult<z.infer<typeof containersSchema>>
+> => {
+  'use cache';
+  cacheLife({ revalidate: 10, expire: 60, stale: 10 });
+  cacheTag('containers');
+  return fetchWithZod(`${API_URL}/containers`, containersSchema);
+};
 
 // CPU
 const CpuUsageDataSchema = z.array(
@@ -59,9 +65,9 @@ export type CpuUsageDatasets = {
 
 export const fetchCpuStatus = async (
   containerName: string
-): Promise<FetchResult<z.infer<typeof CpuUsageDatasetSchema>>> => { 
+): Promise<FetchResult<z.infer<typeof CpuUsageDatasetSchema>>> => {
   const result = await fetchWithZod(
-    `${API_URL}/containers/${containerName}/cpu`, 
+    `${API_URL}/containers/${containerName}/cpu`,
     CpuUsageDataSchema,
   );
   return result.ok
@@ -86,9 +92,9 @@ export type MemoryUsageDatasets = {
 
 export const fetchMemoryStatus = async (
   containerName: string
-): Promise<FetchResult<z.infer<typeof MemoryUsageDatasetSchema>>> => { 
+): Promise<FetchResult<z.infer<typeof MemoryUsageDatasetSchema>>> => {
   const result = await fetchWithZod(
-    `${API_URL}/containers/${containerName}/memory`, 
+    `${API_URL}/containers/${containerName}/memory`,
     CpuUsageDataSchema,
   );
   return result.ok
@@ -142,7 +148,7 @@ export const fetchIoStatus = async (
 // Net
 const NetUsageDataSchema = z.array(
   z.object({
-    time: z.string().nullish(),
+    time: z.string().optional(),
     recvkBps: z.number().nullish(),
     sendkBps: z.number().nullish(),
   })
