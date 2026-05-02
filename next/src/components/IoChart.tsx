@@ -23,12 +23,20 @@ export const IoChart = async ({
   }
   const containerNames = containersResponse.data;
 
+  // 並列フェッチ。read + write × N コンテナを全部同時に発射する。
+  // core が単一スレッドな現状は逐次処理に degrade するが、
+  // core をスレッド化した時点で web 側は無修正で恩恵を受ける。
+  const [reads, writes] = await Promise.all([
+    Promise.all(containerNames.map((name) => fetchIoStatus(name, 'read'))),
+    Promise.all(containerNames.map((name) => fetchIoStatus(name, 'write'))),
+  ]);
+
   const datasets: AppDataset[] = [];
   for (const [i, containerName] of containerNames.entries()) {
     const border = borderColorFor(i);
     const bg = backgroundColorFor(i);
 
-    const responseRead = await fetchIoStatus(containerName, 'read');
+    const responseRead = reads[i];
     if (!responseRead.ok) return (<div>IO read 取得中...</div>);
     datasets.push({
       containerName,
@@ -39,7 +47,7 @@ export const IoChart = async ({
       borderDash: [1, 0],
     });
 
-    const responseWrite = await fetchIoStatus(containerName, 'write');
+    const responseWrite = writes[i];
     if (!responseWrite.ok) return (<div>IO write 取得中...</div>);
     datasets.push({
       containerName,

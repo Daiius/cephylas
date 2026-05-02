@@ -23,13 +23,17 @@ export const MemoryChart = async ({
   }
   const containerNames = containersResponse.data;
 
+  // 並列フェッチ。core が単一スレッドな現状は逐次処理に degrade するが、
+  // core をスレッド化した時点で web 側は無修正で恩恵を受ける。
+  const responses = await Promise.all(
+    containerNames.map((name) => fetchMemoryStatus(name)),
+  );
   const datasets: AppDataset[] = [];
-  for (const [i, containerName] of containerNames.entries()) {
-    const response = await fetchMemoryStatus(containerName);
+  for (const [i, response] of responses.entries()) {
     if (!response.ok) return (<div>メモリ使用率取得中...</div>);
     datasets.push({
-      containerName,
-      label: containerName,
+      containerName: containerNames[i],
+      label: containerNames[i],
       data: response.data,
       borderColor: borderColorFor(i),
       backgroundColor: backgroundColorFor(i),

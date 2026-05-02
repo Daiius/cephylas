@@ -23,12 +23,20 @@ export const NetChart = async ({
   }
   const containerNames = containersResponse.data;
 
+  // 並列フェッチ。recv + send × N コンテナを全部同時に発射する。
+  // core が単一スレッドな現状は逐次処理に degrade するが、
+  // core をスレッド化した時点で web 側は無修正で恩恵を受ける。
+  const [recvs, sends] = await Promise.all([
+    Promise.all(containerNames.map((name) => fetchNetStatus(name, 'recv'))),
+    Promise.all(containerNames.map((name) => fetchNetStatus(name, 'send'))),
+  ]);
+
   const datasets: AppDataset[] = [];
   for (const [i, containerName] of containerNames.entries()) {
     const border = borderColorFor(i);
     const bg = backgroundColorFor(i);
 
-    const responseRecv = await fetchNetStatus(containerName, 'recv');
+    const responseRecv = recvs[i];
     if (!responseRecv.ok) return (<div>Net recv 取得中...</div>);
     datasets.push({
       containerName,
@@ -39,7 +47,7 @@ export const NetChart = async ({
       borderDash: [1, 0],
     });
 
-    const responseSend = await fetchNetStatus(containerName, 'send');
+    const responseSend = sends[i];
     if (!responseSend.ok) return (<div>Net send 取得中...</div>);
     datasets.push({
       containerName,
