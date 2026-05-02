@@ -113,8 +113,8 @@ clear();                        // hidden を空に (= 全表示)
 
 ## 既知の落とし穴・気をつける点
 
-- **`fetchContainers()` が 4 チャートで個別に呼ばれている**（`CpuChart.tsx` など）。`'use cache'` 化で dedup されるので問題は薄まったが、コア側の負荷は依然として 1 リクエストにつき N+1 直列。
-- **N+1 直列フェッチ**: `for (const c of containers) { await fetchXxx(c) }` が CPU/Mem/IO/Net 全部にある。`Promise.all` 化推奨。
+- **`fetchContainers()` が 4 チャートで個別に呼ばれている**（`CpuChart.tsx` など）。`'use cache'` 化で dedup されるので問題は薄まったが、コア側の負荷は依然として 1 リクエストにつき N。
+- **コア側は単一スレッド**: web 側は `Promise.all` で並列フェッチを発射しているが、`core/src/server.rs` の TCP listener がシングルスレッド逐次処理なので実際には serialize される。core をスレッド化すれば web 側無修正で並列が効く。
 - **`core/src/server.rs` の TCP listener はメインスレッドで逐次処理**。並列フェッチ化するならここをスレッド化必須。
 - **`limited_convert_time_string_to_f32`**（`server.rs:135`）は日付を捨てて時刻だけを秒に変換している。日次ローテ前提。日跨ぎでバグる可能性あり。
 - **`core/src/log.rs`** の Docker API レスポンスで `time == "0001-01-01T00:00:00Z"` のケースが実在する。`break` で無視している。

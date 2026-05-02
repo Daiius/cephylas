@@ -4,23 +4,24 @@
 
 `feat/v2-web` で web 側の v2 化を一気通貫で実施中。現時点のコミット (新しい順):
 
-1. `refactor(filter): hidden の URL 永続化を撤去、純粋に react state のみで管理`
-2. `feat(cache): cacheComponents 移行 / 各 chart を 'use cache' 化`
-3. `chore(deps): Next.js を 16.1.6 → 16.2.4 へアップデート`
-4. `feat(legend): mini-legend のダブルクリック/タップで isolate / restore に対応`
-5. `chore(deps): mini-legend 一本化で未使用になった @headlessui/react と @heroicons/react を削除`
-6. `refactor: サイドバー / drawer / ハンバーガーを撤廃、mini-legend に一本化`
-7. `feat(legend): mini-legend をクリック/タップで表示/非表示切替可能に`
-8. `feat(chart): tooltip の当たり判定を拡張`
-9. `fix(colors): Tableau 10 を正典順に並べ替え + 色割り当てを index-based に変更`
-10. `feat: 各チャートに inline mini-legend を表示`
-11. `refactor: Next.js を docker から外し host 起動 + prod 構成を Vercel 前提に整理`
-12. `chore: web パッケージを 1.0.0 へ bump`
-13. `refactor(types): Chart.js を declaration merging で拡張し as キャストを撤去`
-14. `refactor: pnpm workspace + Tailwind 4 / daisyUI 5 + compose watch`
-15. `feat: チャートカラーを Tableau 10 パレットに変更`
-16. `docs: Claude Code 用ドキュメントと dev override 用 gitignore 追加`
-17. `feat: コンテナ表示フィルタのサイドバー化`
+1. `perf(charts): N+1 直列フェッチを Promise.all で並列化`
+2. `refactor(filter): hidden の URL 永続化を撤去、純粋に react state のみで管理`
+3. `feat(cache): cacheComponents 移行 / 各 chart を 'use cache' 化`
+4. `chore(deps): Next.js を 16.1.6 → 16.2.4 へアップデート`
+5. `feat(legend): mini-legend のダブルクリック/タップで isolate / restore に対応`
+6. `chore(deps): mini-legend 一本化で未使用になった @headlessui/react と @heroicons/react を削除`
+7. `refactor: サイドバー / drawer / ハンバーガーを撤廃、mini-legend に一本化`
+8. `feat(legend): mini-legend をクリック/タップで表示/非表示切替可能に`
+9. `feat(chart): tooltip の当たり判定を拡張`
+10. `fix(colors): Tableau 10 を正典順に並べ替え + 色割り当てを index-based に変更`
+11. `feat: 各チャートに inline mini-legend を表示`
+12. `refactor: Next.js を docker から外し host 起動 + prod 構成を Vercel 前提に整理`
+13. `chore: web パッケージを 1.0.0 へ bump`
+14. `refactor(types): Chart.js を declaration merging で拡張し as キャストを撤去`
+15. `refactor: pnpm workspace + Tailwind 4 / daisyUI 5 + compose watch`
+16. `feat: チャートカラーを Tableau 10 パレットに変更`
+17. `docs: Claude Code 用ドキュメントと dev override 用 gitignore 追加`
+18. `feat: コンテナ表示フィルタのサイドバー化`
 
 到達した形:
 - 凡例 + フィルタは **mini-legend (`MiniLegend.tsx`) に統合**。サイドバー / drawer / ハンバーガーは廃止
@@ -34,15 +35,18 @@
 
 ## 次にやる候補
 
-### 1. PR 2: 並列化 + Rust スレッド化
+### 1. core 側の TCP listener スレッド化 (`feat/v2-core` 想定)
 
-**ゴール**: 4 × N の直列フェッチを並列化、ボトルネックの Rust 側もマルチスレッド受付に。`feat/v2-core` ブランチ予定。
+**ゴール**: 単一スレッド逐次処理になっている `core/src/server.rs` をマルチスレッド化し、web 側で既に発射されている並列フェッチを実効化する。
+
+現状:
+- web 側は `Promise.all` で 4 chart 内の N+1 を並列化済 (`feat: cacheComponents 移行` と `perf(charts): Promise.all 化` のコミットで導入)
+- `fetchContainers` だけ fetcher 側で `'use cache'` & `cacheTag('containers')` のため 4 chart で共有 (request 内 dedup + 10s revalidate)
+- ただし `core/src/server.rs` の `for stream in listener.incoming()` がメインスレッドで逐次処理しているため、HTTP 並列接続が受付段階で serialize されてしまう
 
 実装方針:
-- `fetchContainers()` を `react.cache()` でメモ化（リクエスト単位）
-- 各 Chart の `for ... await` を `Promise.all` に
-- もしくは `core` 側に `/containers/all/cpu` 系の bulk endpoint を追加（より理想的）
-- `core/src/server.rs` の `for stream in listener.incoming()` を `std::thread::spawn` でハンドラを別スレッドへ。簡易 thread pool でも可
+- `for stream in listener.incoming()` 内のハンドラを `std::thread::spawn` で別スレッドへ。簡易 thread pool でも可
+- もしくは `core` 側に `/containers/all/cpu` 系の bulk endpoint を追加 (1 リクエストで全コンテナ分返す。より理想的)
 - 並列度に応じて `RwLock` の read 競合が増えるが、read 中心なので問題ないはず
 
 ### 2. prod 移行
