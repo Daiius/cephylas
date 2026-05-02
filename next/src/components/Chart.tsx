@@ -72,7 +72,31 @@ export const Chart = ({
           line: { borderWidth: 2 },
         },
         scales: {
-          x: { type: 'time', time: { unit: 'minute' } },
+          x: {
+            type: 'time',
+            // データ範囲ではなく目盛境界 (= unit の startOf) に合わせて min/max を
+            // 拡張する。auto 選択された unit (hour / minute) の境界に min が
+            // 揃うので、24h レンジでは 0:00, 1:00,… のようにキリのいい時刻で
+            // 目盛が切れる。
+            bounds: 'ticks',
+            time: {
+              // unit を固定すると "データ開始分:秒 = startOf(minute) " 起点で
+              // stepSize 分刻みの目盛になり、0:01, 0:04,… のような半端な
+              // 時刻になる。unit は Chart.js に自動選択させる (24h なら hour,
+              // 数十分なら minute)。
+              minUnit: 'minute',
+              displayFormats: {
+                minute: 'HH:mm',
+                hour: 'HH:mm',
+              },
+              tooltipFormat: 'yyyy-MM-dd HH:mm:ss',
+            },
+            ticks: {
+              maxRotation: 0,
+              autoSkip: true,
+              autoSkipPadding: 20,
+            },
+          },
           y: {
             min: 0,
             title: yLabel ? { display: true, text: yLabel } : undefined,
