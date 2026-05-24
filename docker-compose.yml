@@ -9,7 +9,7 @@ services:
       resources:
         limits:
           cpus: '2'
-          memory: 50M
+          #memory: 50M
     volumes:
       - ./log:/app/log
       - ./core:/app
@@ -27,7 +27,7 @@ services:
       - /app/.next
 
   webserver:
-    image: nginx:latest
+    image: nginx:alpine
     container_name: cephylas-webserver
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
