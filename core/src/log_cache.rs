@@ -206,9 +206,24 @@ impl UsageCache {
     /// その tick でデータが来なかったコンテナにも掛かります
     /// 点が1つも無くなったコンテナは、一覧からも消えます
     pub fn prune(&mut self) {
+        self.prune_from(None);
+    }
+
+    /// prune と同じですが、現在時刻も窓の基準に加えます
+    /// (最新の点の時刻と現在時刻の、遅い方から数える)
+    ///
+    /// 新しい点が1つも来なくなっても、時間の経過で古い点が捨てられます
+    /// 稼働中の tick から呼びます。復元では使いません
+    /// (過去のログを読むときは、ログの最後の行が基準になる)
+    pub fn prune_at(&mut self, now_ms: i64) {
+        self.prune_from(Some(now_ms));
+    }
+
+    fn prune_from(&mut self, now_ms: Option<i64>) {
         let latest = self.map.values()
             .filter_map(|points| points.back())
             .map(|point| point.time_ms)
+            .chain(now_ms)
             .max();
         let Some(latest) = latest else { return; };
         let oldest_to_keep = latest.saturating_sub(WINDOW_MILLIS);
@@ -401,6 +416,34 @@ mod tests {
             cache.downsample("db", &DownsampleOption::default(), Series::Cpu)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn prune_at_expires_points_without_new_data() {
+        let mut cache = UsageCache::new();
+        for i in 0..360 {
+            push_tick(&mut cache, &["web", "db"], BASE_MS + i * TICK_MS);
+        }
+        let last = BASE_MS + 359 * TICK_MS;
+
+        // 現在時刻が最新の点より前でも、最新の点が基準のまま（何も捨てない）
+        cache.prune_at(BASE_MS - WINDOW_MILLIS);
+        assert_eq!(times(&cache, "web").len(), 360);
+
+        // 新しい点が来なくても、時間が経てば古い点から捨てられる
+        cache.prune_at(BASE_MS + WINDOW_MILLIS + 100 * TICK_MS);
+        assert_eq!(times(&cache, "web").len(), 260);
+        assert_eq!(times(&cache, "db").len(), 260);
+        // 最後の点からちょうど24時間までは残る
+        cache.prune_at(last + WINDOW_MILLIS);
+        assert_eq!(times(&cache, "web"), vec![last]);
+        assert_eq!(cache.container_names(), vec!["db", "web"]);
+        // 24時間を過ぎると、全コンテナが一覧から消える
+        cache.prune_at(last + WINDOW_MILLIS + 1);
+        assert!(cache.container_names().is_empty());
+        // 空のキャッシュでも壊れない
+        cache.prune_at(last);
+        assert!(cache.container_names().is_empty());
     }
 
     #[test]

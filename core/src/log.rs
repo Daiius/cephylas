@@ -420,23 +420,63 @@ fn collect_stats<F: FnMut(&str) -> Result<Stats, error::Error>>(
 /// - 統計を採れたコンテナは、今回の値に置き換える
 /// - 一覧に載っているが採れなかったコンテナは、前回の値をそのまま残す
 ///   (次に採れた tick で、実際の経過時間を使って1点を記録できる)
+/// - 採れたが時刻が前回と同じコンテナも、前回の値をそのまま残す
+///   (その tick は記録されないので、置き換えると積算値の増分が記録から落ちる)
 /// - 一覧に載っていないコンテナは消す（止まったコンテナの値を持ち続けない）
+///
+/// 時刻が前回より戻ったコンテナは、今回の値に置き換えます
+/// (前回の値を残すと、時計が前回の時刻を追い越すまで記録できなくなる)
 fn carry_over_stats(
     prev_stats: &mut HashMap<String, Stats>,
     collected: Collected,
 ) {
     prev_stats.retain(|name, _| collected.listed.contains(name));
-    prev_stats.extend(collected.stats);
+    for (name, stats) in collected.stats {
+        let time_millis = |stats: &Stats| {
+            stats.time.as_deref().and_then(valid_time_millis)
+        };
+        let same_time = prev_stats.get(&name)
+            .and_then(time_millis)
+            .zip(time_millis(&stats))
+            .is_some_and(|(prev, current)| prev == current);
+        if !same_time {
+            prev_stats.insert(name, stats);
+        }
+    }
 }
 
-/// 1 tick 分の処理: 算出 → ログへ追記 → キャッシュへ追加
+/// 1 tick 分の処理: 算出 → ログへ追記 → キャッシュへ追加 → 古い点の削除
 ///
 /// 記録したら true、記録するものが無ければ false を返します
 /// 失敗した tick は何も記録せずにエラーを返します。呼び出し側は次の tick へ進みます
 /// - 収集（コンテナ一覧の取得）に失敗した場合、前回の統計は変えません
 /// - ログへの追記に失敗した場合、キャッシュにも入れません
 ///   （ログとキャッシュの内容を揃えるため）。前回の統計は更新します
+///
+/// now_millis（現在時刻）が分かっていれば、記録の有無や成否に関わらず、
+/// 現在時刻から見て古くなった点をキャッシュから捨てます
+/// (コンテナが1つも動いていない間も、止まったコンテナが24時間で消えるように)
 fn run_tick<W: FnOnce(&str) -> Result<(), error::Error>>(
+    millis: u16,
+    now_millis: Option<i64>,
+    collected: Result<Collected, error::Error>,
+    prev_stats: &mut HashMap<String, Stats>,
+    write_log: W,
+    log_cache: &log_cache::SharedUsageCache,
+) -> Result<bool, error::Error> {
+    let result = record_tick(
+        millis, collected, prev_stats, write_log, log_cache,
+    );
+    if let Some(now_millis) = now_millis {
+        log_cache.write()
+            .expect("failed to get write lock for log_cache")
+            .prune_at(now_millis);
+    }
+
+    result
+}
+
+fn record_tick<W: FnOnce(&str) -> Result<(), error::Error>>(
     millis: u16,
     collected: Result<Collected, error::Error>,
     prev_stats: &mut HashMap<String, Stats>,
@@ -708,8 +748,12 @@ pub fn log_json(
         println!("waiting {} millis...", wait.as_millis());
         std::thread::sleep(wait);
 
+        // 待ったあとの現在時刻。取れなければ、この tick では時間による削除をしない
+        let now_millis = get_now_as_millis().ok()
+            .and_then(|now| i64::try_from(now).ok());
         let result = run_tick(
             tick.as_millis() as u16,
+            now_millis,
             get_containers_stats(socket_path),
             &mut prev_stats,
             |line| log_daily(DAILY_LOG_PATH, line),
@@ -1048,9 +1092,16 @@ mod tests {
             &mut self,
             collected: Result<Collected, error::Error>,
         ) -> Result<bool, error::Error> {
+            self.tick_at(None, collected)
+        }
+        fn tick_at(
+            &mut self,
+            now_millis: Option<i64>,
+            collected: Result<Collected, error::Error>,
+        ) -> Result<bool, error::Error> {
             let lines = &mut self.lines;
             run_tick(
-                TICK_MILLIS, collected, &mut self.prev_stats,
+                TICK_MILLIS, now_millis, collected, &mut self.prev_stats,
                 |line| { lines.push(line.to_string()); Ok(()) },
                 &self.cache,
             )
@@ -1183,7 +1234,7 @@ mod tests {
 
         // ログへの追記に失敗した tick。キャッシュにも入れず、次の tick は通常どおり
         let failed = run_tick(
-            TICK_MILLIS, tick(50, 5_000_000), &mut logger.prev_stats,
+            TICK_MILLIS, None, tick(50, 5_000_000), &mut logger.prev_stats,
             |_| Err("disk full (expected in this test)".into()),
             &logger.cache,
         );
@@ -1196,6 +1247,88 @@ mod tests {
             &("2026-01-01T00:00:55.000Z".to_string(), Some(200)),
         );
         assert_eq!(logger.lines.len(), 3);
+    }
+
+    #[test]
+    fn stats_with_the_same_time_do_not_replace_the_previous_stats() {
+        let mut logger = Logger::new();
+        let tick = |read: &str, bytes: u64| Ok(collected(vec![
+            ("web", written(read, bytes)),
+        ]));
+        logger.tick(tick("2026-01-01T00:00:00Z", 0)).unwrap();
+        assert!(logger.tick(tick("2026-01-01T00:00:10Z", 1_000_000)).unwrap());
+        // 時刻は同じ（ミリ秒未満だけ違う）だが、積算値は進んでいる。この tick は記録されない
+        assert!(!logger.tick(tick("2026-01-01T00:00:10.000999Z", 2_000_000)).unwrap());
+        assert_eq!(logger.prev_stats["web"].io.write, Some(1_000_000));
+        // 次の点は、最後に記録できた値からの差分（2,000,000 バイト / 10秒）になる
+        // 前回値を置き換えていると 1,000,000 バイト分が落ちて 100 kB/s になる
+        assert!(logger.tick(tick("2026-01-01T00:00:20Z", 3_000_000)).unwrap());
+        assert_eq!(logger.writes("web"), vec![
+            ("2026-01-01T00:00:10.000Z".to_string(), Some(100)),
+            ("2026-01-01T00:00:20.000Z".to_string(), Some(200)),
+        ]);
+
+        // 時刻が戻った場合は置き換える（残すと、時計が追いつくまで記録できない）
+        assert!(!logger.tick(tick("2026-01-01T00:00:05Z", 3_500_000)).unwrap());
+        assert_eq!(
+            logger.prev_stats["web"].time.as_deref(),
+            Some("2026-01-01T00:00:05Z"),
+        );
+        // 戻った時刻からは差分を取れる（キャッシュには、最新の点より新しくなるまで入らない）
+        assert!(logger.tick(tick("2026-01-01T00:00:15Z", 4_500_000)).unwrap());
+        assert!(logger.lines.last().unwrap().contains(r#""writekBps":100"#));
+    }
+
+    #[test]
+    fn stopped_containers_expire_even_when_nothing_is_recorded() {
+        const BASE_MS: i64 = 1_767_225_600_000; // 2026-01-01T00:00:00Z
+        const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+        let mut logger = Logger::new();
+        logger.tick_at(Some(BASE_MS), Ok(collected(vec![
+            ("web", written("2026-01-01T00:00:00Z", 0)),
+        ]))).unwrap();
+        logger.tick_at(Some(BASE_MS + 10_000), Ok(collected(vec![
+            ("web", written("2026-01-01T00:00:10Z", 1_000_000)),
+        ]))).unwrap();
+        let names = |logger: &Logger| {
+            logger.cache.read().unwrap().container_names()
+                .into_iter().cloned().collect::<Vec<String>>()
+        };
+        assert_eq!(names(&logger), vec!["web"]);
+
+        // 最後のコンテナが止まり、記録するものが無い tick が続く
+        let last = BASE_MS + 10_000;
+        assert!(!logger.tick_at(Some(last + DAY_MS), Ok(collected(vec![]))).unwrap());
+        assert_eq!(names(&logger), vec!["web"]);
+        // 24時間を過ぎると、新しい点が無くても一覧から消える
+        assert!(!logger.tick_at(Some(last + DAY_MS + 10_000), Ok(collected(vec![]))).unwrap());
+        assert!(names(&logger).is_empty());
+
+        // 収集に失敗し続けている間も同じ
+        let mut logger = Logger::new();
+        logger.tick_at(Some(BASE_MS), Ok(collected(vec![
+            ("web", written("2026-01-01T00:00:00Z", 0)),
+        ]))).unwrap();
+        logger.tick_at(Some(BASE_MS + 10_000), Ok(collected(vec![
+            ("web", written("2026-01-01T00:00:10Z", 1_000_000)),
+        ]))).unwrap();
+        let failed = logger.tick_at(
+            Some(last + DAY_MS + 10_000),
+            Err("cannot list containers (expected in this test)".into()),
+        );
+        assert!(failed.is_err());
+        assert!(names(&logger).is_empty());
+
+        // 現在時刻が分からない tick では、時間による削除をしない
+        let mut logger = Logger::new();
+        logger.tick(Ok(collected(vec![
+            ("web", written("2026-01-01T00:00:00Z", 0)),
+        ]))).unwrap();
+        logger.tick(Ok(collected(vec![
+            ("web", written("2026-01-01T00:00:10Z", 1_000_000)),
+        ]))).unwrap();
+        logger.tick(Ok(collected(vec![]))).unwrap();
+        assert_eq!(names(&logger), vec!["web"]);
     }
 
     #[test]
