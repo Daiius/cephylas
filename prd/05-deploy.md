@@ -78,7 +78,7 @@ dev だけに要る設定は `compose.dev.yml` に置く。本番は `compose.de
   - core は以前の経路（コンテナ別の API）を残しているので、core を先に更新しても
     以前の web は動き続ける（[02](./02-core.md) §REST API（現行））。
   - **`/usages/*` への切り替えは、この順序を必要としない。** web が互換の経路を持ち、
-    core に `/usages/*` が無ければコンテナ別の API から同じ内容を組み立てる
+    `/usages/*` の応答が 2xx 以外ならコンテナ別の API から同じ内容を組み立てる
     （[03](./03-web.md) §古い core 向けの互換の経路）。core と web のどちらを先に配置しても動く。
     互換の経路は、本番の core を更新したあとで削除する（計画中）。
 - **nginx は core への中継だけを行う**（`nginx.conf`）。web は Vercel にあるので、

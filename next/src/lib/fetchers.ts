@@ -40,26 +40,32 @@ export type Usages<K extends UsageKind> = z.infer<(typeof usagesSchemas)[K]>;
  * 全コンテナ分の系列を 1 リクエストで取得する。例外は投げない。
  * cache は宣言しない (呼び出す chart 側の 'use cache' に含まれる)。
  *
- * 🧹 `/usages/{kind}` が 404 のときに限り、コンテナ別の API から同じ形を組み立てる
- * (`/usages` を持たない古い core 向けの一時的な経路。fetchers-legacy.ts)。
- * 404 以外の失敗 (接続失敗、500、検証の失敗) では切り替えず、失敗を返す。
+ * 🧹 `/usages/{kind}` の応答が 2xx 以外のステータスだったときは、コンテナ別の API から
+ * 同じ形を組み立てる (`/usages` を持たない古い core 向けの一時的な経路。
+ * fetchers-legacy.ts)。古い core の手前で 404 以外 (403 など) が返る構成でも
+ * 表示できるよう、ステータスは限定しない。
+ * 次の場合は切り替えず、失敗を返す。
+ * - 接続そのものの失敗 (fetch が例外を投げる)。同じ宛先なので試しても無駄である
+ * - 2xx だが本文が不正 (JSON として読めない、検証の失敗)。`/usages` を持つ core の
+ *   不具合であり、黙って別の経路に逃がさない
  */
 export const fetchUsages = async <K extends UsageKind>(
   kind: K,
 ): Promise<FetchResult<Usages<K>>> => {
   try {
     const response = await fetch(`${API_URL}/usages/${kind}`);
-    if (!response.ok && response.status !== 404) {
-      console.error(response.statusText);
-      return {
-        ok: false,
-        error: { message: `fetch failed with ${response.status}` },
-      };
+    let json: unknown;
+    if (response.ok) {
+      json = await response.json();
+    } else {
+      // どちらの経路が使われているかを、サーバ側のログで確かめられるようにする。
+      console.error(
+        `fetchUsages(${kind}): /usages/${kind} responded with ${response.status}; ` +
+          'falling back to the per-container API',
+      );
+      json = await fetchUsagesFromContainerApis(API_URL, kind);
     }
     // どちらの経路で得た値も、同じ schema で検証する。
-    const json: unknown = response.ok
-      ? await response.json()
-      : await fetchUsagesFromContainerApis(API_URL, kind);
     // kind から schema を引いているので、検証を通った値は Usages<K> である
     // (generic な添字アクセスでは TypeScript がこの対応を追えない)。
     const data = usagesSchemas[kind].parse(json) as Usages<K>;
