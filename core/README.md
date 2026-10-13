@@ -1,15 +1,28 @@
-# Cephylas Docker Container Telemetrer
-Simple server load logging system for Linux systems,
-written in Rust.
+# Cephylas core
+
+Docker container のリソース使用率を記録し、REST API で返す Rust 製の単一バイナリ。
 
 Cephylas comes from "cephonodes hylas", a kind of moth with clear wings.
 
-## Memo
+**仕様は [prd/02-core.md](../prd/02-core.md) にある**（収集 / 使用率の算出 / ログ形式 /
+キャッシュ / ダウンサンプリング / REST API / 既知の問題）。
+
+## 実行
+
+```bash
+cargo run            # ./log/log_daily を読み書きし、/var/run/docker.sock を読む
+```
+
+`0.0.0.0:7878` で待ち受ける。開発時の起動方法は [AGENTS.md](../AGENTS.md) を参照。
+
+## データ構造
+
 ```mermaid
 classDiagram
     class Usages {
         time: String
-        stats: Vec(HashMap(String,Usage))
+        millis: u16
+        usages: HashMap(String, Usage)
     }
     class Usage {
         cpu: CpuUsage
@@ -17,128 +30,45 @@ classDiagram
         io: IoUsage
         net: NetUsage
     }
-
-    class LogCache
-    note for LogCache "HashMap(String,Usages)"
-
-    class LogCacheUsage {
-        cpu: Vec(CpuUsage)
-        memory: Vec(MemoryUsage)
-        io: Vec(IoUsage)
-        net: Vec(NetUsage)
+    class UsageCache {
+        cpu: UsageCacheMap(TimedCpuUsage)
+        memory: UsageCacheMap(TimedMemoryUsage)
+        io: UsageCacheMap(TimedIoUsage)
+        net: UsageCacheMap(TimedNetUsage)
     }
+    class UsageCacheMap {
+        map: HashMap(String, LogVec)
+    }
+    Usages --> Usage : コンテナ名ごと
+    UsageCache --> UsageCacheMap : 種別ごと
+    note for Usages "ログ 1 行 = 1 tick"
+    note for UsageCacheMap "LogVec は最大 8640 点の VecDeque"
 ```
-```mermaid
-sequenceDiagram
-    participant docker as (Docker socket)
-    participant stream as TcpStream
-    participant buffer as buffer<br/>String
-    participant container_names as container names<br/>String
-    participant struct as Usages<br/>struct
-    participant map as HashMap&lt;ContainerName,UsageData&gt;
-    participant log as (log file)
-    participant cache as LogCache<br/>a
-    
-    note over docker,cache : log cache initialization
 
-    note over docker,cache : log record in every ticks
-
-    docker -->> stream : /containers<br/>/stats
-    stream -->> buffer : stream.read(&mut buffer)
-    buffer -->> map : container_name
-    buffer -->> map : UsageData
-
-
-```
+## 処理の流れ
 
 ```mermaid
 sequenceDiagram
-    actor user
-    participant cephylas
-    box cephylas/* 
-        participant watch
-        participant log
-        participant time
+    participant docker as Docker Engine<br/>(unix socket)
+    participant logger as logger thread
+    participant log as log/log_daily
+    participant cache as UsageCache<br/>(Arc RwLock)
+    participant server as server thread
+    participant web as Next.js
 
-    end
-    participant ./daily
-    participant ./weekly
+    note over logger,cache : 起動時: ログ末尾 8640 行からキャッシュを復元
 
-    user ->> cephylas : start with config
-    cephylas ->> watch : watch(config: &Config)
-    loop every daily unit time
-        watch ->> log : log_daily()
-        log ->> time : format_time(&time)<br/>using libc crate
-        time -->> log : (time string)
-        log ->> ./daily : json line log<br/>using json crate
-        opt every weekly unit time
-            watch ->> log : log_weekly()
-            log ->> ./daily : read data to summarize
-            ./daily -->> log : 
-            log ->> ./weekly : write summarized data
+    loop 10 秒ごと
+        logger ->> docker : GET /containers/json
+        loop コンテナごと
+            logger ->> docker : GET /containers/{name}/stats
         end
+        note over logger : 前回との差分から使用率を算出
+        logger ->> log : JSONL を 1 行追記
+        logger ->> cache : 各系列に 1 点追加
     end
+
+    web ->> server : GET /containers/{name}/cpu など
+    server ->> cache : 読み取り + ダウンサンプリング
+    server -->> web : JSON
 ```
-
-
-```mermaid
-sequenceDiagram
-    actor user
-    participant app as cephylas<br/>application
-    participant worker as cephylas<br/>worker
-    participant os as Linux
-    participant database as database
-
-    user ->> app    : run
-    app  ->> worker : start
-    activate worker
-    loop Every second
-        worker ->> os  : check <br/>cpu/network/disk 
-        os -->> worker : /proc/stats <br/>/proc/net/dev
-        opt detect change | active state | 10min passed
-            worker ->> app   : log data with timestamp
-            app ->> database : record log data to database
-        end
-    end
-    user ->> app : terminate
-    app  ->> worker : stop
-    deactivate worker
-```
-
-## Log summarization plan
-```mermaid
-sequenceDiagram
-    participant app as cephylas<br/>application
-    participant daily
-    participant daily.1
-    participant weekly
-    participant weekly.1
-    participant monthly
-    participant monthly.1
-
-    app ->> daily : add log<br/>@daily unit time
-
-    opt every weekly unit time
-        daily ->> app: read latest<br/> ?? data length
-        app ->> weekly : summarize and add
-    end
-
-    opt every monthly unit time
-        weekly ->> app: read latest<br/> ?? data
-        app ->> monthly: summarize and add
-    end
-
-    opt every 00:00
-        daily -->> daily.1 : rename
-        app ->> daily.1 : delete old daily log
-    end
-
-    opt every Monday 00:00
-        weekly -->> weekly.1 : rename
-    end
-
-    opt every 1st
-        monthly -->> monthly.1 : rename
-    end
-```
-
