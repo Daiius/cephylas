@@ -10,10 +10,13 @@ use super::log_cache;
 const LISTEN_ADDR: &str = "0.0.0.0:7878";
 /// 同時に処理する接続数の上限。超えた接続は枠が空くまで待たせる
 const MAX_CONNECTIONS: usize = 16;
-/// 1回の読み書きの待ち時間の上限。リクエスト行を読み切るまでの上限も兼ねる
+/// 1回の読み書きの待ち時間の上限
+/// リクエスト行とヘッダ（空行まで）を読み切るまでの、合計の上限も兼ねる
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// リクエスト行（1行目）の長さの上限。超えたら400を返す
 const MAX_REQUEST_LINE_BYTES: usize = 1024;
+/// リクエスト行とヘッダを合わせた長さ（空行まで）の上限。超えたら431を返す
+const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
 /// accept自体が失敗したときに次を試すまでの待ち時間
 /// (ファイル記述子の枯渇などで失敗が続くときに空回りしないため)
 const ACCEPT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
@@ -54,6 +57,7 @@ enum StatusCode {
     BadRequest,
     NotFound,
     MethodNotAllowed,
+    RequestHeaderFieldsTooLarge,
     InternalServerError,
 }
 
@@ -64,6 +68,8 @@ impl StatusCode {
             StatusCode::BadRequest => "400 Bad Request",
             StatusCode::NotFound => "404 Not Found",
             StatusCode::MethodNotAllowed => "405 Method Not Allowed",
+            StatusCode::RequestHeaderFieldsTooLarge =>
+                "431 Request Header Fields Too Large",
             StatusCode::InternalServerError => "500 Internal Server Error",
         }
     }
@@ -220,13 +226,19 @@ fn series_json(
 
 /// リソース使用状況を記録しているコンテナの名前を
 /// アルファベット順に並べたjson文字列を返します
+///
+/// 名前は /usages/{kind} のキーと同じ規則でエスケープします
+/// (ログから復元した名前に引用符などがあっても、本文が壊れないように)
 fn container_names_json(cache: &log_cache::UsageCache) -> String {
-    let data = cache.container_names()
-        .iter()
-        .map(|s| format!("\"{}\"", s))
-        .collect::<Vec<String>>()
-        .join(",");
-    format!("[{}]", data)
+    let mut out = String::from("[");
+    for (i, name) in cache.container_names().iter().enumerate() {
+        if i > 0 { out.push(','); }
+        // String への書き込みは失敗しない
+        let _ = write_json_string(&mut out, name);
+    }
+    out.push(']');
+
+    out
 }
 
 /// 枠を取り直して本文を組み立てる回数の上限
@@ -460,7 +472,7 @@ fn respond(
 
 /// 次の1回のreadで待つ時間の上限を変えられるストリーム
 ///
-/// リクエスト行の読み取りを合計時間で打ち切るために使います
+/// リクエスト行とヘッダの読み取りを合計時間で打ち切るために使います
 /// (readごとの固定のタイムアウトだけでは、期限の直前に届いたデータで
 ///  待ち時間が延び、合計が上限を超えてしまう)
 trait ReadDeadline {
@@ -473,42 +485,88 @@ impl ReadDeadline for std::net::TcpStream {
     }
 }
 
-/// リクエスト行の読み取り結果
-enum RequestLine {
+/// リクエストの先頭（リクエスト行とヘッダ）の読み取り結果
+enum RequestHead {
     /// 1バイトも受け取らずに終わった
     /// (相手が閉じた、無言のままタイムアウトした、など)
     Closed,
-    /// MAX_REQUEST_LINE_BYTES を超えた
-    TooLong,
+    /// リクエスト行が MAX_REQUEST_LINE_BYTES を超えた
+    LineTooLong,
+    /// 空行が来ないまま MAX_REQUEST_HEAD_BYTES を超えた
+    TooLarge,
+    /// リクエスト行。ヘッダは空行（または相手が送信を終えたところ）まで読み捨ててある
     Line(String),
 }
 
-/// 最初の改行までを読みます。ヘッダは解釈しません
+/// ヘッダの終わり（空行）を探す状態。届いたバイトを先頭から順に渡します
 ///
-/// timeout はリクエスト行を読み切るまでの合計の上限です
+/// 空行は \r\n\r\n のほか、\n\n も受け付けます
+/// リクエスト行の直後の空行（ヘッダが1つも無い場合）も終わりとして扱います
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BlankLineScan {
+    /// 行の途中
+    InLine,
+    /// 改行の直後
+    AfterNewline,
+    /// 改行の直後に \r が来たところ
+    AfterNewlineCr,
+    /// 空行まで読んだ
+    Found,
+}
+
+impl BlankLineScan {
+    fn feed(self, byte: u8) -> Self {
+        match (self, byte) {
+            (BlankLineScan::Found, _) => BlankLineScan::Found,
+            (BlankLineScan::AfterNewline | BlankLineScan::AfterNewlineCr, b'\n') =>
+                BlankLineScan::Found,
+            (BlankLineScan::AfterNewline, b'\r') => BlankLineScan::AfterNewlineCr,
+            (_, b'\n') => BlankLineScan::AfterNewline,
+            _ => BlankLineScan::InLine,
+        }
+    }
+}
+
+/// リクエスト行を読み、続くヘッダを空行まで読み捨てます。ヘッダは解釈しません
+///
+/// ヘッダを読み残したまま応答して閉じると、OSが接続をリセットして、
+/// 送りきれていない応答を捨てることがあります。それを避けるために読み切ります
+/// 本文（ボディ）は読みません。空行より先のバイトは、同じreadで届いた分を除いて
+/// 受信バッファに残します
+///
+/// - リクエスト行が長すぎても、形式が不正でも、空行までは読み捨てます
+/// - 空行までの合計が MAX_REQUEST_HEAD_BYTES を超えたら、そこで読むのをやめます
+/// - 相手が送信を終えた（EOF）場合は、そこまでを受け取ったものとして扱います
+///
+/// timeout は、リクエスト行とヘッダを読み切るまでの合計の上限です
 /// 少しずつ送り続けて接続を占有されないよう、readのたびに残り時間だけ待ち、
-/// 期限を過ぎてから届いた分は（改行やEOFであっても）受け付けません
-fn read_request_line<R: Read + ReadDeadline>(
+/// 期限を過ぎてから届いた分は（空行やEOFであっても）受け付けません
+fn read_request_head<R: Read + ReadDeadline>(
     stream: &mut R,
     timeout: Duration,
-) -> Result<RequestLine, error::Error> {
+) -> Result<RequestHead, error::Error> {
     let started = Instant::now();
-    let mut received: Vec<u8> = Vec::new();
+    // これまでに受け取ったバイト数（リクエスト行とヘッダの合計）
+    let mut total: usize = 0;
+    // リクエスト行（最初の改行の手前まで）。上限を1バイト超えたところで伸ばすのをやめる
+    let mut line: Vec<u8> = Vec::new();
+    let mut line_ended = false;
+    let mut scan = BlankLineScan::InLine;
     let mut chunk = [0; 1024];
 
     // 期限切れ。1バイトも受け取っていなければエラーとして扱わない
-    let timed_out = |received: &Vec<u8>| {
-        if received.is_empty() {
-            Ok(RequestLine::Closed)
+    let timed_out = |total: usize| {
+        if total == 0 {
+            Ok(RequestHead::Closed)
         } else {
-            Err("timed out while reading the request line".into())
+            Err("timed out while reading the request line and headers".into())
         }
     };
 
-    loop {
+    'read: loop {
         let remaining = timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            return timed_out(&received);
+            return timed_out(total);
         }
         if let Err(e) = stream.limit_next_read(remaining) {
             return Err(e.into());
@@ -518,50 +576,70 @@ fn read_request_line<R: Read + ReadDeadline>(
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             // プリコネクトや死活監視でログが増えないよう、
             // 1バイトも受け取っていない接続の失敗はエラーとして扱わない
-            Err(_) if received.is_empty() => return Ok(RequestLine::Closed),
+            Err(_) if total == 0 => return Ok(RequestHead::Closed),
             Err(e) => return Err(e.into()),
         };
         if started.elapsed() > timeout {
-            return timed_out(&received);
+            return timed_out(total);
         }
         if n == 0 {
-            if received.is_empty() {
-                return Ok(RequestLine::Closed);
+            if total == 0 {
+                return Ok(RequestHead::Closed);
             }
+            // 相手はこれ以上送らない。読み残しも無い
             break;
         }
-        received.extend_from_slice(&chunk[..n]);
 
-        if let Some(end) = received.iter().position(|b| *b == b'\n') {
-            received.truncate(end);
-            break;
-        }
-        if received.len() > MAX_REQUEST_LINE_BYTES {
-            return Ok(RequestLine::TooLong);
+        for byte in &chunk[..n] {
+            total += 1;
+            if total > MAX_REQUEST_HEAD_BYTES {
+                // これ以上は待たない。読み残しがあれば、応答は届かないことがある
+                return Ok(if line.len() > MAX_REQUEST_LINE_BYTES {
+                    RequestHead::LineTooLong
+                } else {
+                    RequestHead::TooLarge
+                });
+            }
+            if !line_ended {
+                if *byte == b'\n' {
+                    line_ended = true;
+                } else if line.len() <= MAX_REQUEST_LINE_BYTES {
+                    line.push(*byte);
+                }
+            }
+            scan = scan.feed(*byte);
+            if scan == BlankLineScan::Found {
+                break 'read;
+            }
         }
     }
 
-    if received.len() > MAX_REQUEST_LINE_BYTES {
-        return Ok(RequestLine::TooLong);
+    if line.len() > MAX_REQUEST_LINE_BYTES {
+        return Ok(RequestHead::LineTooLong);
     }
-    Ok(RequestLine::Line(String::from_utf8_lossy(&received).into_owned()))
+    Ok(RequestHead::Line(String::from_utf8_lossy(&line).into_owned()))
 }
 
 /// 1本の接続を処理します。1接続につき1リクエストです
 ///
-/// TcpStream固有の操作（書き込みのタイムアウトの設定など）はaccept側で行い、
-/// ここは Read + Write と ReadDeadline だけに依存させています
+/// 応答は、ヘッダを空行まで読み捨ててから書きます（read_request_head）
+/// 期限内に空行まで届かなければ、応答せずにエラーを返します
+///
+/// TcpStream固有の操作（書き込みのタイムアウトの設定、書き込み側を閉じる操作など）は
+/// accept側で行い、ここは Read + Write と ReadDeadline だけに依存させています
 /// （メモリ上のストリームで試験するため）
 fn handle_connection<S: Read + Write + ReadDeadline>(
     stream: &mut S,
     log_cache: &log_cache::SharedUsageCache,
     timeout: Duration,
 ) -> Result<(), error::Error> {
-    let response = match read_request_line(stream, timeout)? {
+    let response = match read_request_head(stream, timeout)? {
         // 何も送らなかった相手には何も返さない
-        RequestLine::Closed => return Ok(()),
-        RequestLine::TooLong => Response::empty(StatusCode::BadRequest),
-        RequestLine::Line(line) => respond(&line, log_cache),
+        RequestHead::Closed => return Ok(()),
+        RequestHead::LineTooLong => Response::empty(StatusCode::BadRequest),
+        RequestHead::TooLarge =>
+            Response::empty(StatusCode::RequestHeaderFieldsTooLarge),
+        RequestHead::Line(line) => respond(&line, log_cache),
     };
 
     write_response(stream, &response)
@@ -633,8 +711,11 @@ fn dispatch(
         .name("connection".to_string())
         .spawn(move || {
             let _slot = slot;
-            if let Err(e) = handle_connection(&mut stream, &log_cache, timeout) {
-                eprintln!("server: connection error: {}", e);
+            match handle_connection(&mut stream, &log_cache, timeout) {
+                // 応答を書き終えたら、書き込み側を先に閉じる（送り終わりを相手に伝える）
+                // 相手がすでに切っていれば失敗するが、できることは無いので無視する
+                Ok(()) => { let _ = stream.shutdown(std::net::Shutdown::Write); }
+                Err(e) => eprintln!("server: connection error: {}", e),
             }
         });
     if let Err(e) = spawned {
@@ -2231,6 +2312,416 @@ mod tests {
         let mut response = String::new();
         let _ = stream.read_to_string(&mut response);
         assert_eq!(response, "");
+
+        assert_json_ok(&tcp_get_containers(addr));
+    }
+
+    #[test]
+    fn container_names_are_escaped_like_the_usages_keys() {
+        // 通常の名前では、エスケープする前と1バイトも変わらない
+        let plain = create_shared_cache();
+        let names = ["web", "db", "api_1", "my-app.v2", "Api", "0"];
+        {
+            let mut lock = plain.write().unwrap();
+            for name in names {
+                assert!(lock.insert(name, point_at(BASE_MS)));
+            }
+        }
+        let mut sorted = names.to_vec();
+        sorted.sort();
+        let unescaped = format!(
+            "[{}]",
+            sorted.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<String>>().join(","),
+        );
+        assert_eq!(body_of(&plain, "/containers"), unescaped);
+        assert_eq!(body_of(&plain, "/containers"), r#"["0","Api","api_1","db","my-app.v2","web"]"#);
+        assert_eq!(body_of(&create_shared_cache(), "/containers"), "[]");
+
+        // 引用符・バックスラッシュ・制御文字があっても、本文は正しいjsonで、元の名前に戻る
+        let odd_names = ["we\"b", "d\\b", "a\nb\tc\u{1}", "\"", "\\", "日本語"];
+        let odd = create_shared_cache();
+        {
+            let mut lock = odd.write().unwrap();
+            for name in odd_names {
+                assert!(lock.insert(name, point_at(BASE_MS)));
+            }
+        }
+        let body = body_of(&odd, "/containers");
+        assert!(!body.contains('\n') && !body.contains('\u{1}'), "{:?}", body);
+        let parsed = json::parse(&body).unwrap();
+        let mut restored: Vec<&str> = parsed.members().map(|n| n.as_str().unwrap()).collect();
+        let mut expected = odd_names.to_vec();
+        restored.sort();
+        expected.sort();
+        assert_eq!(restored, expected);
+        // /usages/{kind} のキーと同じ名前の集合になる
+        let usages = assert_json_ok(&get(&odd, "/usages/cpu"));
+        let mut keys: Vec<&str> = usages.entries().map(|(k, _)| k).collect();
+        keys.sort();
+        assert_eq!(keys, expected);
+    }
+
+    /// cpu だけ値を持つ1点
+    fn point_at(time_ms: i64) -> UsagePoint {
+        UsagePoint {
+            time_ms,
+            cpu: Some(1.0),
+            memory: None,
+            read_kbps: None,
+            write_kbps: None,
+            recv_kbps: None,
+            send_kbps: None,
+        }
+    }
+
+    // ---- ヘッダの読み捨て（メモリ上のストリーム） ----
+
+    /// 1回のreadで1バイトずつ返すストリーム。読まれたバイト数を数える
+    struct OneByteStream {
+        input: Vec<u8>,
+        consumed: usize,
+        output: Vec<u8>,
+    }
+    impl OneByteStream {
+        fn new(input: &[u8]) -> Self {
+            OneByteStream { input: input.to_vec(), consumed: 0, output: Vec::new() }
+        }
+    }
+    impl Read for OneByteStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.input.get(self.consumed) {
+                Some(byte) => {
+                    buf[0] = *byte;
+                    self.consumed += 1;
+                    Ok(1)
+                }
+                None => Ok(0),
+            }
+        }
+    }
+    impl Write for OneByteStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    impl ReadDeadline for OneByteStream {
+        fn limit_next_read(&mut self, _: Duration) -> std::io::Result<()> { Ok(()) }
+    }
+
+    /// 合計が total バイトちょうどになる、/containers へのリクエスト（空行まで）
+    fn request_of_exactly(total: usize) -> Vec<u8> {
+        let fixed = "GET /containers HTTP/1.1\r\nX-Pad: \r\n\r\n".len();
+        let request = format!(
+            "GET /containers HTTP/1.1\r\nX-Pad: {}\r\n\r\n",
+            "p".repeat(total - fixed),
+        );
+        assert_eq!(request.len(), total);
+        request.into_bytes()
+    }
+
+    #[test]
+    fn blank_line_is_found_in_every_form() {
+        fn found_at(input: &[u8]) -> Option<usize> {
+            let mut scan = BlankLineScan::InLine;
+            for (i, byte) in input.iter().enumerate() {
+                scan = scan.feed(*byte);
+                if scan == BlankLineScan::Found { return Some(i + 1); }
+            }
+            None
+        }
+        assert_eq!(found_at(b"GET / HTTP/1.1\r\n\r\n"), Some(18));
+        assert_eq!(found_at(b"GET / HTTP/1.1\n\n"), Some(16));
+        assert_eq!(found_at(b"GET / HTTP/1.1\r\nA: b\r\n\r\nrest"), Some(24));
+        assert_eq!(found_at(b"GET / HTTP/1.1\nA: b\n\nrest"), Some(21));
+        // 改行の種類が混ざっていてもよい
+        assert_eq!(found_at(b"GET / HTTP/1.1\r\nA: b\n\r\n"), Some(23));
+        assert_eq!(found_at(b"GET / HTTP/1.1\nA: b\r\n\n"), Some(22));
+        // 先頭の改行だけでは空行にならない。行の途中の \r は改行ではない
+        assert_eq!(found_at(b"\n"), None);
+        assert_eq!(found_at(b"\r\n"), None);
+        assert_eq!(found_at(b"\n\n"), Some(2));
+        assert_eq!(found_at(b"A: b\r\r\nC: d\r\n"), None);
+        assert_eq!(found_at(b"A: b\n\r\rC: d\n"), None);
+        assert_eq!(found_at(b"GET / HTTP/1.1\r\nA: b\r\n"), None);
+    }
+
+    #[test]
+    fn headers_are_discarded_before_responding() {
+        let cache = small_cache();
+        let long_header = format!("Cookie: {}\r\n", "c".repeat(3000));
+        // ヘッダの長さや数、改行の種類に関わらず、応答は変わらない
+        for headers in [
+            "".to_string(),
+            "Host: x\r\n".to_string(),
+            long_header.clone(),
+            format!("Host: x\r\n{}Accept: */*\r\n", long_header.repeat(4)),
+        ] {
+            for (line, status) in [
+                ("GET /containers HTTP/1.1", "HTTP/1.1 200 OK"),
+                ("GET /unknown HTTP/1.1", "HTTP/1.1 404 Not Found"),
+                ("POST /containers HTTP/1.1", "HTTP/1.1 405 Method Not Allowed"),
+                ("garbage", "HTTP/1.1 400 Bad Request"),
+            ] {
+                let crlf = format!("{}\r\n{}\r\n", line, headers);
+                let lf = crlf.replace("\r\n", "\n");
+                for request in [crlf, lf] {
+                    assert_status(&exchange(&cache, request.as_bytes()), status);
+
+                    // 1バイトずつ届いても同じで、空行まで読んでから応答する
+                    let mut stream = OneByteStream::new(request.as_bytes());
+                    handle_connection(&mut stream, &cache, IO_TIMEOUT).unwrap();
+                    assert_eq!(stream.consumed, request.len());
+                    assert_status(&String::from_utf8(stream.output).unwrap(), status);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_is_read_past_the_blank_line() {
+        // 本文（ボディ）は読まない。空行の次のバイトには触らない
+        let cache = small_cache();
+        for (head, status) in [
+            (
+                "POST /containers HTTP/1.1\r\nContent-Length: 9\r\n\r\n",
+                "HTTP/1.1 405 Method Not Allowed",
+            ),
+            ("GET /containers HTTP/1.1\n\n", "HTTP/1.1 200 OK"),
+        ] {
+            let mut stream = OneByteStream::new(format!("{}body body", head).as_bytes());
+            handle_connection(&mut stream, &cache, IO_TIMEOUT).unwrap();
+            assert_eq!(stream.consumed, head.len());
+            assert_status(&String::from_utf8(stream.output).unwrap(), status);
+        }
+    }
+
+    #[test]
+    fn too_large_request_head_is_431() {
+        let cache = small_cache();
+        const TOO_LARGE: &str = "HTTP/1.1 431 Request Header Fields Too Large";
+
+        // 空行まで含めて上限ちょうどなら通る。1バイトでも超えれば431
+        assert_json_ok(&exchange(&cache, &request_of_exactly(MAX_REQUEST_HEAD_BYTES)));
+        let over = exchange(&cache, &request_of_exactly(MAX_REQUEST_HEAD_BYTES + 1));
+        assert_status(&over, TOO_LARGE);
+        // 本文は無い（内部の情報を載せない）
+        assert_eq!(split(&over).2, "");
+
+        // 上限を超えたところで読むのをやめる（残りを読み続けない）
+        let huge = request_of_exactly(MAX_REQUEST_HEAD_BYTES * 8);
+        let mut stream = OneByteStream::new(&huge);
+        handle_connection(&mut stream, &cache, IO_TIMEOUT).unwrap();
+        assert_eq!(stream.consumed, MAX_REQUEST_HEAD_BYTES + 1);
+        assert_status(&String::from_utf8(stream.output).unwrap(), TOO_LARGE);
+
+        // 空行が来ないまま続くヘッダも、多数の短いヘッダも同じ
+        let endless = format!("GET /containers HTTP/1.1\r\n{}", "A: b\r\n".repeat(4000));
+        assert_status(&exchange(&cache, endless.as_bytes()), TOO_LARGE);
+        // リクエスト行の内容に関わらず431（経路の判定より先に決まる）
+        let post = format!("POST /unknown HTTP/1.1\r\n{}", "A: b\r\n".repeat(4000));
+        assert_status(&exchange(&cache, post.as_bytes()), TOO_LARGE);
+
+        // リクエスト行が長すぎる場合は、全体が上限を超えても400のまま
+        let long_line = "a".repeat(MAX_REQUEST_HEAD_BYTES * 2);
+        assert_status(&exchange(&cache, long_line.as_bytes()), "HTTP/1.1 400 Bad Request");
+        let mut stream = OneByteStream::new(long_line.as_bytes());
+        handle_connection(&mut stream, &cache, IO_TIMEOUT).unwrap();
+        assert_eq!(stream.consumed, MAX_REQUEST_HEAD_BYTES + 1);
+    }
+
+    #[test]
+    fn too_long_request_line_is_400_after_discarding_headers() {
+        // リクエスト行が長すぎても、空行までは読み捨ててから400を返す
+        let cache = small_cache();
+        let request = format!(
+            "GET /{} HTTP/1.1\r\nHost: x\r\nCookie: {}\r\n\r\n",
+            "a".repeat(MAX_REQUEST_LINE_BYTES * 2),
+            "c".repeat(3000),
+        );
+        let mut stream = OneByteStream::new(request.as_bytes());
+        handle_connection(&mut stream, &cache, IO_TIMEOUT).unwrap();
+        assert_eq!(stream.consumed, request.len());
+        assert_status(
+            &String::from_utf8(stream.output).unwrap(),
+            "HTTP/1.1 400 Bad Request",
+        );
+    }
+
+    #[test]
+    fn stalled_headers_get_no_response() {
+        let cache = small_cache();
+        // リクエスト行は届いたが、空行が来ないまま止まった接続には応答しない
+        for prefix in [
+            &b"GET /containers HTTP/1.1\r\n"[..],
+            b"GET /containers HTTP/1.1\r\nHost: x\r\n",
+            b"GET /containers HTTP/1.1\r\nHost: x\r\n\r",
+            b"garbage\r\nHost: x\r\n",
+        ] {
+            let mut stalled = StallingStream {
+                prefix: std::io::Cursor::new(prefix.to_vec()),
+                output: Vec::new(),
+            };
+            assert!(handle_connection(&mut stalled, &cache, IO_TIMEOUT).is_err());
+            assert!(stalled.output.is_empty());
+        }
+    }
+
+    #[test]
+    fn header_deadline_is_shared_with_the_request_line() {
+        let cache = small_cache();
+        let timeout = Duration::from_millis(100);
+
+        // リクエスト行のあと、期限内に空行が届けば処理する
+        let mut in_time = SlowStream::new(
+            b"GET /containers HTTP/1.1\r\nHost: x\r\n", b"\r\n", Duration::from_millis(10),
+        );
+        handle_connection(&mut in_time, &cache, timeout).unwrap();
+        assert_json_ok(&String::from_utf8(in_time.output).unwrap());
+
+        // 空行が届くのが期限の後なら、応答せずに打ち切る
+        // ヘッダを待つのは残り時間までで、リクエスト行と合わせた合計が期限を大きく超えない
+        let mut late = SlowStream::new(
+            b"GET /containers HTTP/1.1\r\nHost: x\r\n", b"\r\n", Duration::from_millis(1000),
+        );
+        let started = Instant::now();
+        assert!(handle_connection(&mut late, &cache, timeout).is_err());
+        assert!(late.output.is_empty());
+        assert!(started.elapsed() < Duration::from_millis(700), "{:?}", started.elapsed());
+        assert_eq!(late.limits_seen.len(), 2);
+        assert!(late.limits_seen.iter().all(|limit| *limit <= timeout));
+        assert!(late.limits_seen[1] <= late.limits_seen[0]);
+    }
+
+    // ---- ヘッダの読み捨て（実際のTCP） ----
+
+    /// 相手が閉じるか失敗するまで読み、(届いたバイト列, 失敗の内容) を返す
+    /// (途中で接続が切られた場合も、そこまでに届いた分を捨てない)
+    fn read_until_closed(
+        stream: &mut std::net::TcpStream,
+    ) -> (Vec<u8>, Option<std::io::Error>) {
+        let mut received = Vec::new();
+        let mut chunk = [0; 64 * 1024];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => return (received, None),
+                Ok(n) => received.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return (received, Some(e)),
+            }
+        }
+    }
+
+    #[test]
+    fn large_body_arrives_in_full_after_long_headers() {
+        // 読み残しのあるソケットを閉じると、未送信の本文が捨てられて応答が途中で切れる
+        // ヘッダを読み切ってから応答すれば、数MBの本文も最後まで届く
+        let cache = widest_cache(64, 600);
+        let len = io_len(&cache);
+        assert!(len > 3_000_000, "{}", len);
+        let addr = spawn_server_with(cache, IO_TIMEOUT);
+
+        let request = format!(
+            "GET /usages/io HTTP/1.1\r\nHost: x\r\nCookie: {}\r\n\r\n",
+            "c".repeat(3000),
+        );
+        let mut stream = connect(addr);
+        stream.write_all(request.as_bytes()).unwrap();
+        let (received, error) = read_until_closed(&mut stream);
+        assert!(
+            error.is_none(),
+            "the response was cut off after {} bytes: {:?}", received.len(), error,
+        );
+
+        let response = String::from_utf8(received).unwrap();
+        let (status, headers, body) = split(&response);
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_common_headers(headers, body);
+        assert_eq!(body.len(), len);
+        assert_eq!(json::parse(body).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn error_responses_arrive_after_long_headers_over_tcp() {
+        let addr = spawn_server(IO_TIMEOUT);
+        let cookie = format!("Cookie: {}\r\n", "c".repeat(3000));
+        for (line, status) in [
+            ("GET /unknown HTTP/1.1", "HTTP/1.1 404 Not Found"),
+            ("DELETE /containers HTTP/1.1", "HTTP/1.1 405 Method Not Allowed"),
+            ("garbage", "HTTP/1.1 400 Bad Request"),
+        ] {
+            let request = format!("{}\r\nHost: x\r\n{}\r\n", line, cookie);
+            assert_status(&tcp_exchange(addr, request.as_bytes()), status);
+        }
+        // 長すぎるリクエスト行でも、ヘッダを読み切ってから400を返す
+        let long_line = format!(
+            "GET /{} HTTP/1.1\r\n{}\r\n", "a".repeat(MAX_REQUEST_LINE_BYTES * 2), cookie,
+        );
+        assert_status(&tcp_exchange(addr, long_line.as_bytes()), "HTTP/1.1 400 Bad Request");
+    }
+
+    #[test]
+    fn too_large_request_head_is_431_over_tcp() {
+        let addr = spawn_server(IO_TIMEOUT);
+
+        // 上限を1バイトだけ超える（サーバは届いた分をすべて読んでから431を返す）
+        let response = tcp_exchange(addr, &request_of_exactly(MAX_REQUEST_HEAD_BYTES + 1));
+        assert_status(&response, "HTTP/1.1 431 Request Header Fields Too Large");
+        assert_eq!(split(&response).2, "");
+        // 上限ちょうどは通る
+        assert_json_ok(&tcp_exchange(addr, &request_of_exactly(MAX_REQUEST_HEAD_BYTES)));
+    }
+
+    #[test]
+    fn headers_split_across_writes_are_served_over_tcp() {
+        let addr = spawn_server(IO_TIMEOUT);
+
+        let mut stream = connect(addr);
+        for part in [
+            &b"GET /cont"[..], b"ainers HTTP/1.1\r", b"\nHost: x\r\nCookie: abc",
+            b"def\r\n\r", b"\n",
+        ] {
+            stream.write_all(part).unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert_json_ok(&response);
+    }
+
+    #[test]
+    fn connection_stalled_in_headers_is_closed_after_timeout() {
+        let addr = spawn_server(TEST_TIMEOUT);
+
+        // リクエスト行は送るが、ヘッダの途中で止める
+        let mut stream = connect(addr);
+        let started = Instant::now();
+        stream.write_all(b"GET /containers HTTP/1.1\r\nHost: x\r\nCookie: abc").unwrap();
+        let mut response = String::new();
+        // 期限まで待たされたうえで、応答なしで閉じられる
+        stream.read_to_string(&mut response).unwrap();
+        assert_eq!(response, "");
+        assert!(started.elapsed() >= TEST_TIMEOUT / 2, "{:?}", started.elapsed());
+        assert!(started.elapsed() < IO_TIMEOUT, "{:?}", started.elapsed());
+
+        assert_json_ok(&tcp_get_containers(addr));
+    }
+
+    #[test]
+    fn late_blank_line_is_not_served_over_tcp() {
+        let addr = spawn_server(TEST_TIMEOUT);
+
+        // 期限の少し前にリクエスト行だけ送り、期限を過ぎてから空行を送る
+        // (期限がリクエスト行だけのものなら、ここで応答が返ってしまう)
+        let mut stream = connect(addr);
+        std::thread::sleep(TEST_TIMEOUT * 2 / 3);
+        stream.write_all(b"GET /containers HTTP/1.1\r\nHost: x\r\n").unwrap();
+        std::thread::sleep(TEST_TIMEOUT * 2 / 3);
+        // サーバ側はすでに閉じているので、書き込みも読み取りも失敗しうる
+        let _ = stream.write_all(b"\r\n");
+        let (received, _) = read_until_closed(&mut stream);
+        assert_eq!(received, b"");
 
         assert_json_ok(&tcp_get_containers(addr));
     }
