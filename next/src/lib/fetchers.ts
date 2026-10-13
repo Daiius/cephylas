@@ -2,7 +2,7 @@ import { cacheLife, cacheTag } from 'next/cache';
 import z from 'zod';
 
 // dev (host): localhost フォールバック
-// prod (Vercel): API_URL を環境変数で `https://api.faveo-systema.net/cephylas` 等に設定
+// prod (Vercel): API_URL を環境変数で `https://<api-domain>/cephylas` に設定
 const API_URL = process.env.API_URL ?? 'http://localhost:7878';
 
 // 'use cache' で返すため、Error インスタンスではなく serializable な形にする。

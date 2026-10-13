@@ -1,3 +1,7 @@
 .env*
 compose.override.yml
 node_modules
+
+# 個人ローカルのメモ・進行状況（.claude/local/.gitignore の `*` と二重の網）
+.claude/local/
+.claude/worktrees/
