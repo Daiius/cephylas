@@ -24,8 +24,8 @@ export const NetChart = async ({
   const containerNames = containersResponse.data;
 
   // 並列フェッチ。recv + send × N コンテナを全部同時に発射する。
-  // core が単一スレッドな現状は逐次処理に degrade するが、
-  // core をスレッド化した時点で web 側は無修正で恩恵を受ける。
+  // core は接続ごとにスレッドを起こして並列に処理する
+  // (同時 16 本まで。超えた分は断られず、枠が空くまで core 側で待つ)。
   const [recvs, sends] = await Promise.all([
     Promise.all(containerNames.map((name) => fetchNetStatus(name, 'recv'))),
     Promise.all(containerNames.map((name) => fetchNetStatus(name, 'send'))),
