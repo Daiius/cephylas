@@ -8,7 +8,7 @@
   },
   "devDependencies": {
     "@types/k6": "^0.52.0",
-    "esbuild": "^0.20.0",
+    "esbuild": "^0.28.2",
     "typescript": "^5.4.0"
   }
 }
