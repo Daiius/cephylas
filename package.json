@@ -2,10 +2,10 @@
   "name": "cephylas",
   "private": true,
   "scripts": {
-    "dev": "docker compose up -d cephylas && pnpm --filter web dev",
-    "dev:core": "docker compose up -d cephylas",
+    "dev": "pnpm dev:core && pnpm --filter web dev",
+    "dev:core": "docker compose -f compose.yml -f compose.dev.yml up -d cephylas",
     "dev:web": "pnpm --filter web dev",
-    "down": "docker compose down",
+    "down": "docker compose -f compose.yml -f compose.dev.yml down",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck"
   },

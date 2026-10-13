@@ -14,7 +14,7 @@
 | `pnpm dev` | core を Docker で起動し、Next.js をホストで起動する |
 | `pnpm dev:core` | core だけ起動する |
 | `pnpm dev:web` | Next.js だけ起動する |
-| `pnpm down` | `docker compose down` |
+| `pnpm down` | dev の core を止める |
 | `pnpm typecheck` | 全 workspace の `tsc --noEmit` |
 | `pnpm build` | 全 workspace の build |
 
@@ -22,19 +22,39 @@
 - `API_URL` が未設定なら、web は `http://localhost:7878` を叩く。
 - dev の core は `core/` をマウントして `cargo run` する（`core/Dockerfile`）。
   ソースを変えたらコンテナを再起動する。
-- `log/` をマウントし、`log/log_daily` を読み書きする。リポジトリにはサンプルのログを置いている。
+- `log/` をマウントし、`log/log_daily` を読み書きする。
 
-### 個人ごとの上書き
+### dev 用の compose
 
-`compose.override.yml`（gitignore 対象）で、開発機ごとの調整を入れる。
+**リポジトリを取ってきただけで、dev の収集まで動く。** `pnpm dev` / `pnpm dev:core` / `pnpm down` は、
+`compose.yml` に **`compose.dev.yml`** を重ねて読む。
 
-- **メモリ制限の緩和が必要である。** `compose.yml` の 50MB は本番向けの値で、
-  このままだと dev の `cargo build` が強制終了される。
-- ⚠ **`compose.yml` は Docker ソケットをマウントしていない。** core は
-  `/var/run/docker.sock` を読むので、統計を取るにはソケットのマウントを足す必要がある。
-  rootless Docker など、ソケットの場所が違う環境ではそのパスに合わせる。
-  現状はこの設定が override 任せになっており、リポジトリを取ってきただけでは収集が動かない。
-  **dev の compose だけで収集まで動く**のがあるべき姿である。
+`compose.dev.yml` は dev に必要な差分だけを持つ。
+
+- **メモリ制限を 2GB に緩める。** `compose.yml` の 50MB は本番向けの値で、
+  そのままだと dev の `cargo build` が強制終了される。
+- **Docker ソケットを読み取り専用でマウントする。** core は `/var/run/docker.sock` を読む。
+  rootless Docker など、ホスト側のソケットの場所が違う環境では、環境変数 `DOCKER_SOCK` で
+  場所を指定する（未設定なら `/var/run/docker.sock`）。
+
+🔒 **dev の都合を `compose.yml` に入れない。** `compose.yml` は本番も読む。
+dev だけに要る設定は `compose.dev.yml` に置く。本番は `compose.dev.yml` を読まない。
+
+⚠ ファイルを明示して読むので、`compose.override.yml` は自動では読まれない。
+開発機ごとの調整は、環境変数（`DOCKER_SOCK`）で行う。
+
+### リポジトリ内のログ
+
+`log/log_daily` は追跡対象で、過去に本番で採ったログがそのまま入っている。
+
+- **dev では、このログのグラフは起動から約 10 秒で消える。** キャッシュの窓は現在時刻から
+  24 時間なので（[02](./02-core.md) §キャッシュ）、古い時刻の点は最初の tick で窓の外になる。
+  以後は、開発機で実際に動いているコンテナの値が出る。
+- dev の core はこのファイルに追記するので、起動すると作業ツリーに差分が出る。**コミットしない。**
+- ⚠ **このファイルを追跡対象から外す・差し替える変更は、本番の配置手順と合わせて行う。**
+  本番でも同じパスに稼働中のログを書いており、リポジトリ側でこのファイルを変えると、
+  本番で更新を取り込むときに衝突するか、稼働中のログを失う。実際のコンテナ名が入っている点
+  （[04](./04-access-and-privacy.md) §gap）と合わせて、**検討中**である。
 
 ## 本番の形
 
