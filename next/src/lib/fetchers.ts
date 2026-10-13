@@ -1,5 +1,6 @@
 import z from 'zod';
 
+import { accessFetchInit } from '@/lib/access-headers';
 import { sortContainerNames } from '@/lib/colors';
 import { fetchUsagesFromContainerApis } from '@/lib/fetchers-legacy';
 
@@ -53,7 +54,9 @@ export const fetchUsages = async <K extends UsageKind>(
   kind: K,
 ): Promise<FetchResult<Usages<K>>> => {
   try {
-    const response = await fetch(`${API_URL}/usages/${kind}`);
+    // Cloudflare Access のサービストークン (設定されているときだけ付く)。
+    // 付けるときはリダイレクトを追わないので、3xx は下の「2xx 以外」に入る。
+    const response = await fetch(`${API_URL}/usages/${kind}`, accessFetchInit());
     let json: unknown;
     if (response.ok) {
       json = await response.json();

@@ -20,6 +20,8 @@ core は 1 プロセスの中で 2 本のスレッドを動かす。**logger** �
 （Server Component）だけで、API の URL はブラウザに渡さない。
 
 - 環境変数 `API_URL` はサーバ側だけで読む（`NEXT_PUBLIC_` を付けない）。
+  Cloudflare Access のサービストークンを渡す `CF_ACCESS_CLIENT_ID` /
+  `CF_ACCESS_CLIENT_SECRET` も同じである（[04](./04-access-and-privacy.md) §アクセス制限）。
 - クライアントコンポーネントから core を直接 fetch するコードを書かない。
 
 この線を引く理由は 2 つある。API の形を web の都合で自由に変えられること、そして
