@@ -419,6 +419,51 @@ fn collect_stats<F: FnMut(&str) -> Result<Stats, error::Error>>(
     Collected { listed: container_names, stats: stats_map }
 }
 
+/// 時刻が前回から進んでいない（同じ、または戻った）統計なら true を返します
+/// 前回の統計が無いコンテナは false です
+fn is_stalled(prev_stats: &HashMap<String, Stats>, name: &str, stats: &Stats) -> bool {
+    let time_millis = |stats: &Stats| {
+        stats.time.as_deref().and_then(valid_time_millis)
+    };
+    prev_stats.get(name)
+        .and_then(time_millis)
+        .zip(time_millis(stats))
+        .is_some_and(|(prev, current)| current <= prev)
+}
+
+/// この tick で前回の統計を置き換えるコンテナについて、core が測った経過時間を返します
+///
+/// 対象は、時刻が進まない統計が MAX_STALLED_TICKS 回目になるコンテナです
+/// Docker の時刻の差は使えない（0 以下）ので、前回の統計を採った時点からの
+/// 単調時計での経過時間を代わりに使い、置き換える tick でも1点を記録します
+/// (記録せずに置き換えると、そこまでの積算値の増分が記録から落ちる)
+fn stalled_elapsed_millis(
+    state: &LoggerState,
+    stats: &HashMap<String, Stats>,
+    monotonic_millis: u64,
+) -> HashMap<String, u64> {
+    stats.iter()
+        .filter(|(name, stats)| is_stalled(&state.prev_stats, name, stats))
+        .filter(|(name, _)|
+            state.stalled_ticks.get(*name).copied().unwrap_or(0) + 1
+                >= MAX_STALLED_TICKS
+        )
+        .filter_map(|(name, _)| {
+            let taken_at = state.taken_at.get(name)?;
+            let elapsed = monotonic_millis.checked_sub(*taken_at)?;
+            (elapsed > 0).then(|| (name.clone(), elapsed))
+        })
+        .collect()
+}
+
+/// 一覧に載っていないコンテナの状態を消します
+/// (止まったコンテナの値を持ち続けない)
+fn forget_unlisted(state: &mut LoggerState, listed: &[String]) {
+    state.prev_stats.retain(|name, _| listed.contains(name));
+    state.stalled_ticks.retain(|name, _| listed.contains(name));
+    state.taken_at.retain(|name, _| listed.contains(name));
+}
+
 /// 次の tick に向けて、前回の統計を更新します
 ///
 /// - 時刻が前回より進んだ統計を採れたコンテナは、今回の値に置き換える
@@ -429,31 +474,27 @@ fn collect_stats<F: FnMut(&str) -> Result<Stats, error::Error>>(
 ///   (その tick は記録されないので、置き換えると積算値の増分が記録から落ちる)
 /// - ただし、時刻が進まない統計が MAX_STALLED_TICKS 回続いたら、今回の値に置き換える
 ///   (時計が大きく巻き戻された場合に、追いつくまで記録が止まり続けないように)
-/// - 一覧に載っていないコンテナは消す（止まったコンテナの値を持ち続けない）
+///   置き換えるのは、その tick を stalled_elapsed に載せて記録できた場合だけ
+/// - 一覧に載っていないコンテナは消す
 fn carry_over_stats(
     state: &mut LoggerState,
     collected: Collected,
+    monotonic_millis: u64,
+    stalled_elapsed: &HashMap<String, u64>,
 ) {
-    state.prev_stats.retain(|name, _| collected.listed.contains(name));
-    state.stalled_ticks.retain(|name, _| collected.listed.contains(name));
+    forget_unlisted(state, &collected.listed);
 
     for (name, stats) in collected.stats {
-        let time_millis = |stats: &Stats| {
-            stats.time.as_deref().and_then(valid_time_millis)
-        };
-        let stalled = state.prev_stats.get(&name)
-            .and_then(time_millis)
-            .zip(time_millis(&stats))
-            .is_some_and(|(prev, current)| current <= prev);
-        if stalled {
-            let count = state.stalled_ticks.entry(name.clone()).or_insert(0);
-            *count += 1;
-            if *count < MAX_STALLED_TICKS {
-                continue;
-            }
+        if is_stalled(&state.prev_stats, &name, &stats)
+            && !stalled_elapsed.contains_key(&name)
+        {
+            let count = state.stalled_ticks.entry(name).or_insert(0);
+            *count = (*count + 1).min(MAX_STALLED_TICKS - 1);
+            continue;
         }
-        // 記録できた（または置き換えた）ので、数え直す
+        // 記録できたので、数え直す
         state.stalled_ticks.remove(&name);
+        state.taken_at.insert(name.clone(), monotonic_millis);
         state.prev_stats.insert(name, stats);
     }
 }
@@ -465,6 +506,8 @@ struct LoggerState {
     /// 時刻が進まない統計が続いている回数（続いているコンテナだけが入る）
     /// 統計を採れなかった tick では変えない
     stalled_ticks: HashMap<String, u8>,
+    /// 前回の統計を採った時点（単調時計のミリ秒）
+    taken_at: HashMap<String, u64>,
 }
 
 impl LoggerState {
@@ -472,6 +515,7 @@ impl LoggerState {
         LoggerState {
             prev_stats: HashMap::new(),
             stalled_ticks: HashMap::new(),
+            taken_at: HashMap::new(),
         }
     }
 }
@@ -481,22 +525,26 @@ impl LoggerState {
 /// 記録したら true、記録するものが無ければ false を返します
 /// 失敗した tick は何も記録せずにエラーを返します。呼び出し側は次の tick へ進みます
 /// - 収集（コンテナ一覧の取得）に失敗した場合、前回の統計は変えません
-/// - ログへの追記に失敗した場合、キャッシュにも入れません
-///   （ログとキャッシュの内容を揃えるため）。前回の統計は更新します
+/// - ログへの追記に失敗した場合、キャッシュにも入れず、前回の統計も進めません
+///   （ログとキャッシュの内容を揃え、増分を次に記録できた点に含めるため）
 ///
 /// now_millis（現在時刻）が分かっていれば、記録の有無や成否に関わらず、
 /// 現在時刻から見て古くなった点をキャッシュから捨てます
 /// (コンテナが1つも動いていない間も、止まったコンテナが24時間で消えるように)
+///
+/// monotonic_millis は、統計を採った時点の単調時計の値です
+/// 時刻が進まない統計が続いたコンテナの経過時間を測るのに使います
 fn run_tick<W: FnOnce(&str) -> Result<(), error::Error>>(
     millis: u16,
     now_millis: Option<i64>,
+    monotonic_millis: u64,
     collected: Result<Collected, error::Error>,
     state: &mut LoggerState,
     write_log: W,
     log_cache: &log_cache::SharedUsageCache,
 ) -> Result<bool, error::Error> {
     let result = record_tick(
-        millis, collected, state, write_log, log_cache,
+        millis, monotonic_millis, collected, state, write_log, log_cache,
     );
     if let Some(now_millis) = now_millis {
         log_cache.write()
@@ -509,6 +557,7 @@ fn run_tick<W: FnOnce(&str) -> Result<(), error::Error>>(
 
 fn record_tick<W: FnOnce(&str) -> Result<(), error::Error>>(
     millis: u16,
+    monotonic_millis: u64,
     collected: Result<Collected, error::Error>,
     state: &mut LoggerState,
     write_log: W,
@@ -517,11 +566,22 @@ fn record_tick<W: FnOnce(&str) -> Result<(), error::Error>>(
     let collected = collected?;
 
     // 起動後の最初の tick は前回の統計が無いので、何も記録されない
-    let usages = calc_usages(millis, &collected.stats, &state.prev_stats);
-    carry_over_stats(state, collected);
+    let stalled_elapsed = stalled_elapsed_millis(
+        state, &collected.stats, monotonic_millis,
+    );
+    let usages = calc_usages_with(
+        millis, &collected.stats, &state.prev_stats, &stalled_elapsed,
+    );
+    if let Some(usages) = &usages {
+        if let Err(e) = write_log(&usages.to_string()) {
+            // 前回の統計を進めない。増分は、次に記録できた点に含まれる
+            forget_unlisted(state, &collected.listed);
+            return Err(e);
+        }
+    }
+    carry_over_stats(state, collected, monotonic_millis, &stalled_elapsed);
     let Some(usages) = usages else { return Ok(false); };
 
-    write_log(&usages.to_string())?;
     let mut lock = log_cache.write()
         .expect("failed to get write lock for log_cache");
     store_usages(&usages, &mut lock);
@@ -565,16 +625,31 @@ fn rate_kb_per_s(
 /// - Docker が返した時刻が前回から進んでいない
 ///
 /// 記録できるコンテナが1つも無ければ None を返します
+#[cfg(test)]
 fn calc_usages(
     millis: u16,
     stats: &HashMap<String, Stats>,
     prev_stats: &HashMap<String, Stats>,
+) -> Option<Usages> {
+    calc_usages_with(millis, stats, prev_stats, &HashMap::new())
+}
+
+/// calc_usages と同じですが、Docker が返した時刻が前回から進んでいないコンテナでも、
+/// stalled_elapsed に経過時間（core が測ったミリ秒）があれば、それを使って記録します
+fn calc_usages_with(
+    millis: u16,
+    stats: &HashMap<String, Stats>,
+    prev_stats: &HashMap<String, Stats>,
+    stalled_elapsed: &HashMap<String, u64>,
 ) -> Option<Usages> {
 
     let mut usages: HashMap<String, Usage> = HashMap::new();
     // tick の時刻には、記録するコンテナのうち最も早く読めたものを使う
     // (時刻, コンテナ名, 元の文字列)。同時刻なら名前の順
     let mut tick_time: Option<(i64, &str, &str)> = None;
+    // 時刻が進んでいないコンテナの時刻は、ほかに候補が無いときだけ使う
+    // (古い時刻を tick の時刻にすると、全コンテナの点がキャッシュに入らなくなる)
+    let mut stalled_tick_time: Option<(i64, &str, &str)> = None;
 
     for (container_name, stats) in stats {
         let Some(prev_stats) = prev_stats.get(container_name) else {
@@ -585,17 +660,23 @@ fn calc_usages(
         let Some(prev_time_millis) = prev_stats.time.as_deref()
             .and_then(valid_time_millis) else { continue; };
         // 経過時間は設定上の間隔ではなく、Docker が返した時刻の差を使う
-        let elapsed_millis = time_millis - prev_time_millis;
-        if elapsed_millis <= 0 {
+        let docker_elapsed_millis = time_millis - prev_time_millis;
+        let (elapsed_millis, tick_time) = if docker_elapsed_millis > 0 {
+            (docker_elapsed_millis as u64, &mut tick_time)
+        } else if let Some(elapsed) = stalled_elapsed.get(container_name) {
+            (*elapsed, &mut stalled_tick_time)
+        } else {
+            continue;
+        };
+        if elapsed_millis == 0 {
             continue;
         }
-        let elapsed_millis = elapsed_millis as u64;
 
         let candidate = (time_millis, container_name.as_str(), time_str);
         if tick_time.is_none_or(|current|
             (candidate.0, candidate.1) < (current.0, current.1)
         ) {
-            tick_time = Some(candidate);
+            *tick_time = Some(candidate);
         }
 
         // CPU calculations
@@ -666,7 +747,7 @@ fn calc_usages(
         );
     }
 
-    let (_, _, time) = tick_time?;
+    let (_, _, time) = tick_time.or(stalled_tick_time)?;
 
     Some(Usages { time: time.to_string(), millis, usages })
 }
@@ -764,6 +845,8 @@ pub fn log_json(
     );
 
     let mut state = LoggerState::new();
+    // 経過時間を core 自身で測るための単調時計の起点
+    let started = std::time::Instant::now();
     // ここから先の失敗では止まらない。その tick を飛ばして次へ進む
     loop {
         let wait = match get_now_as_millis() {
@@ -781,10 +864,12 @@ pub fn log_json(
         // 待ったあとの現在時刻。取れなければ、この tick では時間による削除をしない
         let now_millis = get_now_as_millis().ok()
             .and_then(|now| i64::try_from(now).ok());
+        let collected = get_containers_stats(socket_path);
         let result = run_tick(
             tick.as_millis() as u16,
             now_millis,
-            get_containers_stats(socket_path),
+            started.elapsed().as_millis() as u64,
+            collected,
             &mut state,
             |line| log_daily(DAILY_LOG_PATH, line),
             log_cache,
@@ -1106,6 +1191,8 @@ mod tests {
 
     /// run_tick を、ログの追記先をメモリに差し替えて呼ぶ
     struct Logger {
+        /// 単調時計。tick のたびに10秒進める
+        mono_millis: u64,
         state: LoggerState,
         cache: log_cache::SharedUsageCache,
         lines: Vec<String>,
@@ -1113,6 +1200,7 @@ mod tests {
     impl Logger {
         fn new() -> Self {
             Logger {
+                mono_millis: 0,
                 state: LoggerState::new(),
                 cache: create_shared_cache(),
                 lines: Vec::new(),
@@ -1129,9 +1217,10 @@ mod tests {
             now_millis: Option<i64>,
             collected: Result<Collected, error::Error>,
         ) -> Result<bool, error::Error> {
+            self.mono_millis += 10_000;
             let lines = &mut self.lines;
             run_tick(
-                TICK_MILLIS, now_millis, collected, &mut self.state,
+                TICK_MILLIS, now_millis, self.mono_millis, collected, &mut self.state,
                 |line| { lines.push(line.to_string()); Ok(()) },
                 &self.cache,
             )
@@ -1262,19 +1351,24 @@ mod tests {
             ("2026-01-01T00:00:40.000Z".to_string(), Some(100)),
         ]);
 
-        // ログへの追記に失敗した tick。キャッシュにも入れず、次の tick は通常どおり
+        // ログへの追記に失敗した tick。キャッシュにも入れず、前回の統計も進めない
         let failed = run_tick(
-            TICK_MILLIS, None, tick(50, 5_000_000), &mut logger.state,
+            TICK_MILLIS, None, 1_000_000, tick(50, 5_000_000), &mut logger.state,
             |_| Err("disk full (expected in this test)".into()),
             &logger.cache,
         );
         assert!(failed.is_err());
         assert_eq!(logger.writes("web").len(), 2);
-        // 前回の統計は失敗した tick の値に進んでいるので、差分はその後の5秒分
-        assert!(logger.tick(tick(55, 6_000_000)).unwrap());
+        assert_eq!(
+            logger.state.prev_stats["web"].time.as_deref(),
+            Some("2026-01-01T00:00:40Z"),
+        );
+        // 次に書けた tick の点は、最後に記録できた値からの差分になる
+        // (2,400,000 バイト / 15秒)。失敗した tick の増分も落ちない
+        assert!(logger.tick(tick(55, 6_400_000)).unwrap());
         assert_eq!(
             logger.writes("web").last().unwrap(),
-            &("2026-01-01T00:00:55.000Z".to_string(), Some(200)),
+            &("2026-01-01T00:00:55.000Z".to_string(), Some(160)),
         );
         assert_eq!(logger.lines.len(), 3);
     }
@@ -1340,13 +1434,15 @@ mod tests {
     }
 
     #[test]
-    fn previous_stats_are_replaced_after_three_stalled_ticks() {
+    fn third_stalled_tick_is_recorded_with_the_elapsed_time_measured_by_core() {
         assert_eq!(MAX_STALLED_TICKS, 3);
         let mut logger = Logger::new();
         logger.tick(web_tick("2026-01-01T01:00:00Z", 0)).unwrap();
+        // 単調時計で 20秒の時点。ここまでは通常どおり
         assert!(logger.tick(web_tick("2026-01-01T01:00:10Z", 1_000_000)).unwrap());
+        assert_eq!(logger.mono_millis, 20_000);
 
-        // 時計が1時間戻された。1回目・2回目は前回値を残す
+        // 時計が1時間戻された。1回目・2回目は記録せず、前回値を残す
         assert!(!logger.tick(web_tick("2026-01-01T00:00:20Z", 2_000_000)).unwrap());
         assert!(!logger.tick(web_tick("2026-01-01T00:00:30Z", 3_000_000)).unwrap());
         assert_eq!(
@@ -1354,29 +1450,73 @@ mod tests {
             Some("2026-01-01T01:00:10Z"),
         );
         assert_eq!(logger.state.stalled_ticks["web"], 2);
-        // 3回目で、前回値を今回の値に置き換える（この tick も記録はしない）
-        assert!(!logger.tick(web_tick("2026-01-01T00:00:40Z", 4_000_000)).unwrap());
+
+        // 3回目（単調時計で 65秒の時点。tick が遅れた想定）で1点を記録する
+        // 差分は最後に記録できた統計から: (5,500,000 - 1,000,000) バイト
+        // 経過時間は core が測った 65 - 20 = 45秒 → 100 kB/s
+        logger.mono_millis = 55_000;
+        assert!(logger.tick(web_tick("2026-01-01T00:00:40Z", 5_500_000)).unwrap());
+        // 前回値は今回の値に置き換わり、回数は戻る
         assert_eq!(
             logger.state.prev_stats["web"].time.as_deref(),
             Some("2026-01-01T00:00:40Z"),
         );
         assert!(!logger.state.stalled_ticks.contains_key("web"));
-        assert_eq!(logger.lines.len(), 1);
 
-        // その次の tick から記録が再開する。差分は置き換えた値から（それまでの増分は含まない）
-        assert!(logger.tick(web_tick("2026-01-01T00:00:50Z", 6_000_000)).unwrap());
-        assert_eq!(logged(&logger), vec![
+        // その次の tick からは、Docker の時刻の差（10秒）で通常どおり記録する
+        // (単調時計では 30秒空いているが、使わない)
+        logger.mono_millis = 85_000;
+        assert!(logger.tick(web_tick("2026-01-01T00:00:50Z", 7_500_000)).unwrap());
+
+        let points = logged(&logger);
+        assert_eq!(points, vec![
             ("2026-01-01T01:00:10Z".to_string(), Some(100)),
+            ("2026-01-01T00:00:40Z".to_string(), Some(100)),
             ("2026-01-01T00:00:50Z".to_string(), Some(200)),
         ]);
+        // 増分が落ちていない: 速度 × 経過時間 の合計が、積算値の増分（7,500,000 バイト）に一致する
+        let elapsed_seconds = [10, 45, 10];
+        let total_kb: u32 = points.iter().zip(elapsed_seconds)
+            .map(|((_, rate), seconds)| rate.unwrap() * seconds)
+            .sum();
+        assert_eq!(total_kb, 7_500);
 
-        // 同じ統計が返り続ける場合も、同じ上限で置き換わる
+        // 同じ統計が返り続ける場合も、3回目で記録して数え直す
         let mut logger = Logger::new();
         logger.tick(web_tick("2026-01-01T00:00:00Z", 0)).unwrap();
-        for expected in [Some(1), Some(2), None] {
-            assert!(!logger.tick(web_tick("2026-01-01T00:00:00Z", 0)).unwrap());
-            assert_eq!(logger.state.stalled_ticks.get("web").copied(), expected);
+        for (recorded, count) in [(false, Some(1)), (false, Some(2)), (true, None)] {
+            assert_eq!(logger.tick(web_tick("2026-01-01T00:00:00Z", 0)).unwrap(), recorded);
+            assert_eq!(logger.state.stalled_ticks.get("web").copied(), count);
         }
+    }
+
+    #[test]
+    fn stalled_container_does_not_drag_the_tick_time_back() {
+        let mut logger = Logger::new();
+        let tick = |web_read: &str, db_bytes: u64| Ok(collected(vec![
+            ("web", written(web_read, 0)),
+            // db は同じ時刻の統計を返し続けるが、積算値は進んでいる
+            ("db", written("2026-01-01T00:00:10Z", db_bytes)),
+        ]));
+        logger.tick(Ok(collected(vec![
+            ("web", written("2026-01-01T00:00:00Z", 0)),
+            ("db", written("2026-01-01T00:00:00Z", 0)),
+        ]))).unwrap();
+        assert!(logger.tick(tick("2026-01-01T00:00:10Z", 1_000_000)).unwrap());
+        assert!(logger.tick(tick("2026-01-01T00:00:20Z", 2_000_000)).unwrap());
+        assert!(logger.tick(tick("2026-01-01T00:00:30Z", 3_000_000)).unwrap());
+        assert!(logger.tick(tick("2026-01-01T00:00:40Z", 4_000_000)).unwrap());
+
+        // tick の時刻は、Docker の時刻が進んだコンテナ（web）のものを使う
+        // db の古い時刻を使うと、web の点までキャッシュに入らなくなる
+        let last = json::parse(logger.lines.last().unwrap()).unwrap();
+        assert_eq!(last["time"], "2026-01-01T00:00:40Z");
+        assert_eq!(logger.writes("web").len(), 4);
+        // db は3回目で、core が測った 30秒で割った1点が入る
+        assert_eq!(logger.writes("db"), vec![
+            ("2026-01-01T00:00:10.000Z".to_string(), Some(100)),
+            ("2026-01-01T00:00:40.000Z".to_string(), Some(100)),
+        ]);
     }
 
     #[test]
@@ -1399,8 +1539,8 @@ mod tests {
         // 一覧の取得に失敗した tick でも変わらない
         assert!(logger.tick(Err("cannot list containers (expected in this test)".into())).is_err());
         assert_eq!(logger.state.stalled_ticks["web"], 2);
-        // 採れなかった tick を挟んでも、進まない統計の3回目で置き換わる
-        assert!(!logger.tick(web_tick("2026-01-01T00:01:00Z", 4_000_000)).unwrap());
+        // 採れなかった tick を挟んでも、進まない統計の3回目で記録して置き換わる
+        assert!(logger.tick(web_tick("2026-01-01T00:01:00Z", 4_000_000)).unwrap());
         assert_eq!(
             logger.state.prev_stats["web"].time.as_deref(),
             Some("2026-01-01T00:01:00Z"),
