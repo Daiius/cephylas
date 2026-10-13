@@ -69,12 +69,19 @@ const getJson = async <T>(
   return schema.parse(await response.json());
 };
 
-// 時刻を解釈できない要素は捨てる。t と v は必ず同じ長さになる。
+// 時刻として使える値 (エポックからのミリ秒) か。有限でない値と、0 以下を弾く
+// (core の valid_time_millis と同じ基準)。Docker が時刻を持たないときに返す
+// `0001-01-01T00:00:00Z` は、Date.parse では NaN にならず負の値になるので、
+// NaN の判定だけでは残り、横軸が西暦 1 年から始まってしまう。
+export const isValidTimeMillis = (t: number): boolean =>
+  Number.isFinite(t) && t > 0;
+
+// 時刻として使えない要素は捨てる。t と v は必ず同じ長さになる。
 const toSeries = (points: LegacyPoint[], field: ValueField): LegacySeries => {
   const series: LegacySeries = { t: [], v: [] };
   for (const point of points) {
     const t = point.time == null ? NaN : Date.parse(point.time);
-    if (Number.isNaN(t)) continue;
+    if (!isValidTimeMillis(t)) continue;
     series.t.push(t);
     series.v.push(point[field] ?? null);
   }
