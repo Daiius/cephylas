@@ -4,11 +4,15 @@ use std::collections::HashMap;
 use json;
 use super::error;
 use super::log_cache;
+use super::time;
 
 const DAILY_LOG_PATH: &str = "./log/log_daily";
 
 const DOCKER_API_CONTAINERS: &str = "/containers/json";
 const DOCKER_API_STATS: &str = "/containers/{}/stats?stream=false&one-shot=true";
+
+/// Docker が稀に返す「時刻が入っていない」ことを表す値
+const ZERO_TIME: &str = "0001-01-01T00:00:00Z";
 
 //
 // resource usage data structures
@@ -275,16 +279,21 @@ fn get_container_stats<
     container_name: U,
 ) -> Result<Stats, error::Error> {
     let response = call_docker_api(
-        socket_path, 
+        socket_path,
         DOCKER_API_STATS.replace("{}", container_name.as_ref()),
     )?;
+
+    parse_stats_response(&response)
+}
+
+/// Docker の stats API の応答（ヘッダ込みの文字列）から統計を取り出します
+fn parse_stats_response(response: &str) -> Result<Stats, error::Error> {
     let stats_data = response.lines()
         .find(|l| l.starts_with('{'))
         .ok_or("cannot find response json body")?;
     let stats = json::parse(stats_data)?;
-    let stats_json = reshape_json(&stats);
 
-    Ok(stats_json)
+    Ok(reshape_json(&stats))
 }
 
 fn reshape_json(
@@ -354,28 +363,48 @@ fn reshape_json(
 fn get_containers_stats<T: AsRef<std::path::Path>>(
     socket_path: T,
 ) -> Result<
-    HashMap<String, Stats>, 
+    HashMap<String, Stats>,
     error::Error
 > {
+    // 一覧を取れなければ、その tick は失敗として扱う
     let container_names = get_container_names(&socket_path)?;
 
+    // in one-shot mode, pre-stats are not available.
+    // we have to take diff by ourselves
+    Ok(collect_stats(
+        container_names,
+        |container_name| get_container_stats(&socket_path, container_name),
+    ))
+}
+
+/// コンテナごとに統計を取り、取れたものだけを集めます
+///
+/// 統計の取得に失敗したコンテナと、時刻が ZERO_TIME のコンテナは、
+/// そのコンテナだけを飛ばします（他のコンテナの収集は続ける）
+fn collect_stats<F: FnMut(&str) -> Result<Stats, error::Error>>(
+    container_names: Vec<String>,
+    mut fetch: F,
+) -> HashMap<String, Stats> {
     let mut stats_map: HashMap<String, Stats>
          = HashMap::new();
     for container_name in container_names {
-        // in one-shot mode, pre-stats are not available.
-        // we have to take diff by ourselves
-        let stats = get_container_stats(
-            &socket_path, &container_name
-        )?;
-        if stats.time == Some("0001-01-01T00:00:00Z".to_string()) {
-            // it's terrible, docker api sometimes returns unix epoc ZERO.
-            break;
+        match fetch(&container_name) {
+            Ok(stats) => {
+                if stats.time.as_deref() == Some(ZERO_TIME) {
+                    // it's terrible, docker api sometimes returns unix epoc ZERO.
+                    continue;
+                }
+                stats_map.insert(container_name, stats);
+            },
+            Err(e) => {
+                eprintln!(
+                    "failed to get stats of {}: {}", container_name, e
+                );
+            },
         }
-
-        stats_map.insert(container_name, stats);
     }
 
-    Ok(stats_map)
+    stats_map
 }
 
 fn get_now_as_millis() -> Result<u128, std::time::SystemTimeError> {
@@ -384,30 +413,68 @@ fn get_now_as_millis() -> Result<u128, std::time::SystemTimeError> {
     Ok(duration.as_millis())
 }
 
+/// 記録に使える時刻なら、エポックからのミリ秒にして返します
+/// 解釈できない時刻と ZERO_TIME（エポックより前）は None にします
+fn valid_time_millis(time_str: &str) -> Option<i64> {
+    time::iso8601_to_millis(time_str).ok().filter(|millis| *millis > 0)
+}
+
+/// 積算値（バイト）の差分を、実測の経過時間で割って kB/s にします
+/// bytes / ms = kB / s
+fn rate_kb_per_s(
+    current: Option<u64>,
+    previous: Option<u64>,
+    elapsed_millis: u64,
+) -> Option<u32> {
+    current.zip(previous).map(|(a, b)|
+        u32::try_from(a.saturating_sub(b) / elapsed_millis)
+            .unwrap_or(u32::MAX)
+    )
+}
+
+/// 前回の tick との差分から、1 tick 分の使用率を求めます
+///
+/// 次のコンテナは、その tick では記録しません（次の tick から記録される）
+/// - 前回の統計が無い
+/// - 今回または前回の時刻を解釈できない
+/// - Docker が返した時刻が前回から進んでいない
+///
+/// 記録できるコンテナが1つも無ければ None を返します
 fn calc_usages(
-    millis: &u16,
+    millis: u16,
     stats: &HashMap<String, Stats>,
     prev_stats: &HashMap<String, Stats>,
-) -> Result<Usages, error::Error> {
+) -> Option<Usages> {
 
-    let container_names = stats.keys();
+    let mut usages: HashMap<String, Usage> = HashMap::new();
+    // tick の時刻には、記録するコンテナのうち最も早く読めたものを使う
+    // (時刻, コンテナ名, 元の文字列)。同時刻なら名前の順
+    let mut tick_time: Option<(i64, &str, &str)> = None;
 
-    let time = stats.values().next()
-        .and_then(|s| s.time.clone())
-        .expect("time entry should exist");
-    let millis = millis.clone();
-    let mut usages = Usages {
-        time, millis, 
-        usages: HashMap::new(),
-    };
-    for container_name in container_names {
-        let stats = &stats[container_name];
-        //println!("calc stats: {}", stats);
-        let prev_stats = &prev_stats[container_name];
-        //println!("calc prev_stats: {}", prev_stats);
+    for (container_name, stats) in stats {
+        let Some(prev_stats) = prev_stats.get(container_name) else {
+            continue;
+        };
+        let Some(time_str) = stats.time.as_deref() else { continue; };
+        let Some(time_millis) = valid_time_millis(time_str) else { continue; };
+        let Some(prev_time_millis) = prev_stats.time.as_deref()
+            .and_then(valid_time_millis) else { continue; };
+        // 経過時間は設定上の間隔ではなく、Docker が返した時刻の差を使う
+        let elapsed_millis = time_millis - prev_time_millis;
+        if elapsed_millis <= 0 {
+            continue;
+        }
+        let elapsed_millis = elapsed_millis as u64;
+
+        let candidate = (time_millis, container_name.as_str(), time_str);
+        if tick_time.is_none_or(|current|
+            (candidate.0, candidate.1) < (current.0, current.1)
+        ) {
+            tick_time = Some(candidate);
+        }
 
         // CPU calculations
-        let cpu_delta = stats.cpu.total 
+        let cpu_delta = stats.cpu.total
            .zip(prev_stats.cpu.total)
            .map(|(a, b)| a.saturating_sub(b));
         let system_cpu_delta = stats.cpu.system
@@ -416,37 +483,35 @@ fn calc_usages(
         let cpu_percentage = cpu_delta
             .zip(system_cpu_delta)
             .zip(stats.cpu.ncpu)
-            .map(|((a, b), c)| 
+            .map(|((a, b), c)|
                  (a as f32) / (b as f32) * (c as f32) * 100_f32
-            );
-        //println!("cpu_percentage: {:?}", cpu_percentage);
+            )
+            // 分母が0だと NaN / inf になり、jsonとして書けない
+            .filter(|p| p.is_finite());
 
         // Memory calculations
         let memory_percentage = stats.memory.used
             .zip(stats.memory.available)
-            .map(|(a,b)| (a as f32) / (b as f32) * 100_f32);
+            .map(|(a,b)| (a as f32) / (b as f32) * 100_f32)
+            .filter(|p| p.is_finite());
 
         // IO calculations
-        let io_read_kb_per_s = stats.io.read
-            .zip(prev_stats.io.read)
-            .map(|(a,b)| a.saturating_sub(b) 
-                 / 1000 / (millis as u64 / 1000)
-            );
-        let io_write_kb_per_s = stats.io.write
-            .zip(prev_stats.io.write)
-            .map(|(a,b)| a.saturating_sub(b) 
-                 / 1000 / (millis as u64 / 1000)
-            );
+        let io_read_kb_per_s = rate_kb_per_s(
+            stats.io.read, prev_stats.io.read, elapsed_millis,
+        );
+        let io_write_kb_per_s = rate_kb_per_s(
+            stats.io.write, prev_stats.io.write, elapsed_millis,
+        );
 
         // Net calculations
-        let net_send_kb_per_s = stats.net.send
-            .zip(prev_stats.net.send)
-            .map(|(a,b)| a.saturating_sub(b) / millis as u64);
-        let net_recv_kb_per_s = stats.net.recv
-            .zip(prev_stats.net.recv)
-            .map(|(a,b)| a.saturating_sub(b) / millis as u64);
+        let net_send_kb_per_s = rate_kb_per_s(
+            stats.net.send, prev_stats.net.send, elapsed_millis,
+        );
+        let net_recv_kb_per_s = rate_kb_per_s(
+            stats.net.recv, prev_stats.net.recv, elapsed_millis,
+        );
 
-        usages.usages.insert(
+        usages.insert(
             container_name.to_string(),
             Usage {
                 cpu: CpuUsage {
@@ -461,14 +526,14 @@ fn calc_usages(
                     available: stats.memory.available,
                 },
                 io: IoUsage {
-                    readkBps: io_read_kb_per_s.map(|n| n as u32),
-                    writekBps: io_write_kb_per_s.map(|n| n as u32),
+                    readkBps: io_read_kb_per_s,
+                    writekBps: io_write_kb_per_s,
                     readkB: stats.io.read.map(|x| x / 1000),
                     writekB: stats.io.write.map(|x| x / 1000),
                 },
                 net: NetUsage {
-                    sendkBps: net_send_kb_per_s.map(|n| n as u32),
-                    recvkBps: net_recv_kb_per_s.map(|n| n as u32),
+                    sendkBps: net_send_kb_per_s,
+                    recvkBps: net_recv_kb_per_s,
                     sendkB: stats.net.send.map(|x| x / 1000),
                     recvkB: stats.net.recv.map(|x| x / 1000),
                 },
@@ -476,7 +541,9 @@ fn calc_usages(
         );
     }
 
-    Ok(usages)
+    let (_, _, time) = tick_time?;
+
+    Some(Usages { time: time.to_string(), millis, usages })
 }
 
 fn log_daily<T: AsRef<std::path::Path>, S: AsRef<str>>(
@@ -522,48 +589,33 @@ pub fn custom_dump(json: &json::JsonValue) -> String {
     }
 }
 
-fn insert_usages_to_cache(
-    container_name: &String,
+/// 1 tick 分の使用率をキャッシュへ入れ、古くなった点を捨てます
+/// tick の時刻を記録に使えなければ、何も入れずに false を返します
+fn store_usages(
     usages: &Usages,
     log_cache: &mut log_cache::UsageCache,
-) {
-    log_cache.cpu.insert(
-        container_name.clone(),
-        log_cache::TimedCpuUsage {
-            time: usages.time.clone(),
-            percentage:
-                usages.usages[container_name].cpu.percentage,
-        }
-    );
-    log_cache.memory.insert(
-        container_name.clone(),
-        log_cache::TimedMemoryUsage {
-            time: usages.time.clone(),
-            percentage:
-                usages.usages[container_name].memory.percentage
-        }
-    );
-    log_cache.io.insert(
-        container_name.clone(),
-        log_cache::TimedIoUsage {
-            time: usages.time.clone(),
-            readkBps:
-                usages.usages[container_name].io.readkBps,
-            writekBps:
-                usages.usages[container_name].io.writekBps,
-        }
-    );
-    log_cache.net.insert(
-        container_name.clone(),
-        log_cache::TimedNetUsage {
-            time: usages.time.clone(),
-            recvkBps:
-                usages.usages[container_name].net.recvkBps,
-            sendkBps: 
-                usages.usages[container_name].net.sendkBps,
-        }
-    );
+) -> bool {
+    let Some(time_ms) = valid_time_millis(&usages.time) else {
+        return false;
+    };
+    for (container_name, usage) in &usages.usages {
+        log_cache.insert(
+            container_name,
+            log_cache::UsagePoint {
+                time_ms,
+                cpu: usage.cpu.percentage,
+                memory: usage.memory.percentage,
+                read_kbps: usage.io.readkBps,
+                write_kbps: usage.io.writekBps,
+                recv_kbps: usage.net.recvkBps,
+                send_kbps: usage.net.sendkBps,
+            },
+        );
+    }
+    // データが来なかったコンテナの古い点も、ここで捨てる
+    log_cache.prune();
 
+    true
 }
 
 pub fn log_json(
@@ -597,45 +649,17 @@ pub fn log_json(
         );
 
         let stats = get_containers_stats(&socket_path)?;
-        //println!("stats: {}", stats.dump());
-        //println!("prev_stats: {}", prev_stats.dump());
 
-
-        let first_stat = stats.values().next();
-        let first_prev_stat = prev_stats.values().next();
-            
-        let log_condition = first_stat
-            .zip(first_prev_stat)
-            .map(|(a, b)| !a.cpu.total.is_none() 
-                 && !b.cpu.total.is_none()
-            )
-            .unwrap_or(false);
-
-        println!("log condition: {}", log_condition);
-
-        if log_condition {
-            let usage_result = calc_usages(
-                &(tick.as_millis() as u16), 
-                &stats, &prev_stats
-            );
-            if let Ok(usage) = usage_result {
-                //println!("{}", usage);
-                log_daily(DAILY_LOG_PATH, usage.to_string())?;
-                let mut lock = log_cache.write()
-                    .expect("failed to get write lock for log_cache");
-
-                let container_names = 
-                    usage.usages.keys().cloned()
-                    .collect::<Vec<String>>();
-                for container_name in container_names {
-                    // usage中のデータをキャッシュへ移動
-                    insert_usages_to_cache(
-                        &container_name, 
-                        &usage, 
-                        &mut (*lock),
-                    );
-                }
-            }
+        // 起動後の最初の tick は前回の統計が無いので、何も記録されない
+        let usages = calc_usages(
+            tick.as_millis() as u16,
+            &stats, &prev_stats,
+        );
+        if let Some(usages) = usages {
+            log_daily(DAILY_LOG_PATH, usages.to_string())?;
+            let mut lock = log_cache.write()
+                .expect("failed to get write lock for log_cache");
+            store_usages(&usages, &mut lock);
         }
 
         timing += tick.as_millis();
@@ -671,9 +695,9 @@ fn json_to_usage(
                     },
                     io: IoUsage {
                         readkB: v["io"]["readkB"].as_u64(),
-                        writekB: v["io"]["sendkB"].as_u64(),
+                        writekB: v["io"]["writekB"].as_u64(),
                         readkBps: v["io"]["readkBps"].as_u32(),
-                        writekBps: v["io"]["sendkBps"].as_u32(),
+                        writekBps: v["io"]["writekBps"].as_u32(),
                     },
                     net: NetUsage {
                         recvkB: v["net"]["recvkB"].as_u64(),
@@ -686,14 +710,66 @@ fn json_to_usage(
     })
 }
 
+/// 復元の結果
+#[derive(Debug, PartialEq)]
+struct RestoreSummary {
+    /// 読んだ行数（読み飛ばした先頭の行は含まない）
+    lines: u64,
+    /// キャッシュに入れた行数
+    restored: u64,
+}
+
+/// JSONL のログを読んで、キャッシュを復元します
+///
+/// 先頭の lines_to_skip 行は解釈せずに読み飛ばします
+/// 次の行は、その行だけを飛ばして続きを読みます
+/// - json として解釈できない行、必要な項目が無い行
+/// - time を解釈できない行、time が ZERO_TIME の行
+fn restore_from_reader<R: std::io::BufRead>(
+    mut reader: R,
+    lines_to_skip: u64,
+    log_cache: &mut log_cache::UsageCache,
+) -> Result<RestoreSummary, error::Error> {
+    let mut summary = RestoreSummary { lines: 0, restored: 0 };
+    let mut iline: u64 = 0;
+    let mut buffer: Vec<u8> = Vec::new();
+    loop {
+        buffer.clear();
+        if reader.read_until(b'\n', &mut buffer)? == 0 {
+            break;
+        }
+        iline += 1;
+        if iline <= lines_to_skip { continue; }
+        summary.lines += 1;
+
+        let parsed = std::str::from_utf8(&buffer)
+            .map_err(|e| error::Error::OtherError(e.to_string()))
+            .and_then(|line| Ok(json::parse(line.trim())?))
+            .and_then(|json| json_to_usage(&json));
+        match parsed {
+            Ok(usages) => {
+                // time が ZERO_TIME の行（docker api sometimes returns
+                // unix epoc ZERO）や解釈できない行は、ここで false になる
+                if store_usages(&usages, log_cache) {
+                    summary.restored += 1;
+                }
+            },
+            Err(e) => {
+                eprintln!("error in log line {}: {}", iline, e);
+            },
+        }
+    }
+
+    Ok(summary)
+}
+
 pub fn read_log(
     log_cache: &log_cache::SharedUsageCache
 ) -> Result<(), error::Error> {
 
+    // 1コンテナに入るのは1行につき1点までなので、末尾の MAX_LOG_LENGTH 行で足りる
     let nlines = check_nlines()?;
-    //println!("nlines: {}", nlines);
     let nlines_to_skip = nlines.saturating_sub(log_cache::MAX_LOG_LENGTH as u64);
-    //println!("nlines to skip: {}", nlines_to_skip);
 
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -701,51 +777,17 @@ pub fn read_log(
         .write(false)
         .open(DAILY_LOG_PATH)?;
     let reader = std::io::BufReader::new(file);
-    let mut iline = 0;
-    let mut iline_success = 0;
-    for line in std::io::BufRead::lines(reader) {
-        iline += 1;
-        if iline < nlines_to_skip { continue; }
 
-        let line = line?;
-        match json::parse(&line) {
-            Ok(json) => {
-                match json_to_usage(&json) {
-                    Ok(usages) => {
-                        if usages.time == "0001-01-01T00:00:00Z".to_string() {
-                            // it's terrible. docker api sometimes returns unix epoc ZERO.
-                            break;
-                        }
-                        //println!("{:?}", usages);
-                        let mut lock = log_cache.write()
-                            .expect("cannot lock log_cache"); 
-                        let container_names = 
-                            usages.usages.keys().cloned()
-                            .collect::<Vec<String>>();
-                        for container_name in container_names {
-                            insert_usages_to_cache(
-                                &container_name, 
-                                &usages, 
-                                &mut (*lock)
-                            );
-                        }
-                        iline_success += 1;
-                    },
-                    Err(e) => {
-                        eprintln!("error in log: {}", e);
-                    },
-                }
-            },
-            Err(e) => {
-                eprintln!("error in log json format: {}", e);
-            },
-        }
-    }
+    let summary = {
+        let mut lock = log_cache.write()
+            .expect("cannot lock log_cache");
+        restore_from_reader(reader, nlines_to_skip, &mut lock)?
+    };
 
     println!(
-        "{}/{} lines are successfully processed.", 
-        iline_success, 
-        nlines - nlines_to_skip
+        "{}/{} lines are successfully processed.",
+        summary.restored,
+        summary.lines,
     );
 
     Ok(())
@@ -756,10 +798,562 @@ fn check_nlines() -> Result<u64, error::Error> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .open(DAILY_LOG_PATH)?;
-    let reader = std::io::BufReader::new(file);
+    let mut reader = std::io::BufReader::new(file);
     let mut nlines: u64 = 0;
-    for _ in std::io::BufRead::lines(reader) {
+    let mut buffer: Vec<u8> = Vec::new();
+    loop {
+        buffer.clear();
+        if std::io::BufRead::read_until(&mut reader, b'\n', &mut buffer)? == 0 {
+            break;
+        }
         nlines += 1;
     }
     Ok(nlines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log_cache::{ create_shared_cache, DownsampleOption, Series };
+
+    const TICK_MILLIS: u16 = 10_000;
+
+    /// Docker の stats API が返す応答（ヘッダ込み）を組み立てる
+    /// 値はすべて積算値。cpu と system は ns、ほかはバイト
+    fn stats_response(
+        read: &str,
+        cpu_total_ns: u64,
+        system_ns: u64,
+        io: (u64, u64),
+        net: (u64, u64),
+    ) -> String {
+        format!(
+            concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: application/json\r\n",
+                "\r\n",
+                r#"{{"read":"{read}","preread":"0001-01-01T00:00:00Z","#,
+                r#""blkio_stats":{{"io_service_bytes_recursive":["#,
+                r#"{{"major":8,"minor":0,"op":"read","value":{io_read}}},"#,
+                r#"{{"major":8,"minor":0,"op":"write","value":{io_write}}},"#,
+                r#"{{"major":8,"minor":16,"op":"read","value":999999999}}]}},"#,
+                r#""cpu_stats":{{"cpu_usage":{{"total_usage":{cpu}}},"#,
+                r#""system_cpu_usage":{system},"online_cpus":2}},"#,
+                r#""memory_stats":{{"usage":300000,"stats":{{"cache":100000}},"limit":1000000}},"#,
+                r#""networks":{{"eth0":{{"rx_bytes":{rx},"tx_bytes":{tx}}},"#,
+                r#""eth1":{{"rx_bytes":777777777,"tx_bytes":777777777}}}}}}"#,
+                "\n",
+            ),
+            read = read,
+            cpu = cpu_total_ns,
+            system = system_ns,
+            io_read = io.0,
+            io_write = io.1,
+            rx = net.0,
+            tx = net.1,
+        )
+    }
+
+    fn stats_at(
+        read: &str,
+        cpu_total_ns: u64,
+        system_ns: u64,
+        io: (u64, u64),
+        net: (u64, u64),
+    ) -> Stats {
+        parse_stats_response(
+            &stats_response(read, cpu_total_ns, system_ns, io, net)
+        ).unwrap()
+    }
+
+    /// 時刻だけが違う、値が増えていない統計
+    fn idle_stats(read: &str) -> Stats {
+        stats_at(read, 0, 0, (0, 0), (0, 0))
+    }
+
+    fn stats_map(entries: Vec<(&str, Stats)>) -> HashMap<String, Stats> {
+        entries.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    }
+
+    #[test]
+    fn stats_response_is_reshaped() {
+        let stats = stats_at(
+            "2026-01-01T00:00:10.023034093Z",
+            5_000_000_000, 70_000_000_000,
+            (1000, 2000), (3000, 4000),
+        );
+        assert_eq!(stats.time.as_deref(), Some("2026-01-01T00:00:10.023034093Z"));
+        // ns -> ms
+        assert_eq!(stats.cpu.total, Some(5000));
+        assert_eq!(stats.cpu.system, Some(70_000));
+        assert_eq!(stats.cpu.ncpu, Some(2));
+        // usage - stats.cache
+        assert_eq!(stats.memory.used, Some(200_000));
+        assert_eq!(stats.memory.available, Some(1_000_000));
+        // 最初の read / write、eth0 だけ
+        assert_eq!(stats.io.read, Some(1000));
+        assert_eq!(stats.io.write, Some(2000));
+        assert_eq!(stats.net.recv, Some(3000));
+        assert_eq!(stats.net.send, Some(4000));
+
+        assert!(parse_stats_response("HTTP/1.1 500 Internal Server Error\r\n\r\n").is_err());
+        assert!(parse_stats_response("HTTP/1.1 200 OK\r\n\r\n{broken\n").is_err());
+        // 本文が統計の形でなくても panic せず、値が無いものとして扱う
+        let gone = parse_stats_response(
+            "HTTP/1.1 404 Not Found\r\n\r\n{\"message\":\"No such container\"}\n"
+        ).unwrap();
+        assert!(gone.time.is_none() && gone.cpu.total.is_none());
+    }
+
+    #[test]
+    fn collection_skips_only_the_affected_container() {
+        let names: Vec<String> = ["a", "b", "c", "d", "e"]
+            .iter().map(|s| s.to_string()).collect();
+        let mut asked: Vec<String> = Vec::new();
+        let stats = collect_stats(names, |name| {
+            asked.push(name.to_string());
+            match name {
+                // ZERO_TIME を返すコンテナ
+                "b" => Ok(idle_stats(ZERO_TIME)),
+                // 統計の取得に失敗するコンテナ
+                "d" => Err("connection refused (expected in this test)".into()),
+                _ => Ok(idle_stats("2026-01-01T00:00:10Z")),
+            }
+        });
+        // 途中で打ち切らず、全コンテナに問い合わせる
+        assert_eq!(asked, vec!["a", "b", "c", "d", "e"]);
+        let mut collected: Vec<&String> = stats.keys().collect();
+        collected.sort();
+        assert_eq!(collected, vec!["a", "c", "e"]);
+    }
+
+    #[test]
+    fn container_without_previous_stats_is_skipped() {
+        let prev = stats_map(vec![
+            ("web", idle_stats("2026-01-01T00:00:00Z")),
+        ]);
+        let now = stats_map(vec![
+            ("web", idle_stats("2026-01-01T00:00:10Z")),
+            ("db", idle_stats("2026-01-01T00:00:10.5Z")),
+        ]);
+        // 前回に無かった db があっても panic せず、db だけを飛ばす
+        let usages = calc_usages(TICK_MILLIS, &now, &prev).unwrap();
+        assert_eq!(usages.usages.keys().collect::<Vec<_>>(), vec!["web"]);
+
+        // 次の tick からは db も記録される
+        let next = stats_map(vec![
+            ("web", idle_stats("2026-01-01T00:00:20Z")),
+            ("db", idle_stats("2026-01-01T00:00:20.5Z")),
+        ]);
+        let usages = calc_usages(TICK_MILLIS, &next, &now).unwrap();
+        assert_eq!(usages.usages.len(), 2);
+
+        // 起動後の最初の tick（前回が空）と、コンテナが1つも無い tick は記録しない
+        assert!(calc_usages(TICK_MILLIS, &now, &HashMap::new()).is_none());
+        assert!(calc_usages(TICK_MILLIS, &HashMap::new(), &now).is_none());
+    }
+
+    #[test]
+    fn rates_use_the_measured_elapsed_time() {
+        // 2,000,000 バイト増えた。10秒なら 200 kB/s、20秒なら 100 kB/s
+        let before = || stats_at("2026-01-01T00:00:00Z", 0, 0, (1000, 0), (0, 500));
+        let after = |read: &str| stats_at(
+            read, 0, 0,
+            (2_001_000, 4_000_000), (6_000_000, 8_000_500),
+        );
+        let prev = stats_map(vec![
+            ("ten", before()), ("twenty", before()), ("uneven", before()),
+        ]);
+        let now = stats_map(vec![
+            ("ten", after("2026-01-01T00:00:10Z")),
+            ("twenty", after("2026-01-01T00:00:20Z")),
+            // 12.5秒。2,000,000 / 12,500 = 160
+            ("uneven", after("2026-01-01T00:00:12.500Z")),
+        ]);
+        let usages = calc_usages(TICK_MILLIS, &now, &prev).unwrap();
+
+        let ten = &usages.usages["ten"];
+        assert_eq!(ten.io.readkBps, Some(200));
+        assert_eq!(ten.io.writekBps, Some(400));
+        assert_eq!(ten.net.recvkBps, Some(600));
+        assert_eq!(ten.net.sendkBps, Some(800));
+
+        let twenty = &usages.usages["twenty"];
+        assert_eq!(twenty.io.readkBps, Some(100));
+        assert_eq!(twenty.io.writekBps, Some(200));
+        assert_eq!(twenty.net.recvkBps, Some(300));
+        assert_eq!(twenty.net.sendkBps, Some(400));
+
+        assert_eq!(usages.usages["uneven"].io.readkBps, Some(160));
+
+        // 積算値（kB）は経過時間に関係しない
+        assert_eq!(twenty.io.readkB, Some(2001));
+        assert_eq!(twenty.net.sendkB, Some(8000));
+        // millis は tick の間隔のまま（実測値を書かない）
+        assert_eq!(usages.millis, 10_000);
+    }
+
+    #[test]
+    fn cpu_and_memory_do_not_depend_on_elapsed_time() {
+        // CPU は差分同士の比: 1000ms / 10000ms × 2 cores × 100 = 20%
+        let before = || stats_at(
+            "2026-01-01T00:00:00Z", 1_000_000_000, 50_000_000_000, (0, 0), (0, 0),
+        );
+        let after = |read: &str| stats_at(
+            read, 2_000_000_000, 60_000_000_000, (0, 0), (0, 0),
+        );
+        let prev = stats_map(vec![("ten", before()), ("twenty", before())]);
+        let now = stats_map(vec![
+            ("ten", after("2026-01-01T00:00:10Z")),
+            ("twenty", after("2026-01-01T00:00:20Z")),
+        ]);
+        let usages = calc_usages(TICK_MILLIS, &now, &prev).unwrap();
+        for name in ["ten", "twenty"] {
+            let usage = &usages.usages[name];
+            assert_eq!(usage.cpu.percentage, Some(20.0));
+            assert_eq!(usage.cpu.total, Some(1000));
+            assert_eq!(usage.cpu.system, Some(10_000));
+            // (300000 - 100000) / 1000000 × 100
+            assert_eq!(usage.memory.percentage, Some(20.0));
+        }
+    }
+
+    #[test]
+    fn zero_denominator_becomes_null_not_nan() {
+        // system の差分が0（時刻は進んでいる）
+        let prev = stats_map(vec![
+            ("web", stats_at("2026-01-01T00:00:00Z", 1_000_000_000, 50_000_000_000, (0, 0), (0, 0))),
+        ]);
+        let now = stats_map(vec![
+            ("web", stats_at("2026-01-01T00:00:10Z", 2_000_000_000, 50_000_000_000, (0, 0), (0, 0))),
+        ]);
+        let usages = calc_usages(TICK_MILLIS, &now, &prev).unwrap();
+        assert_eq!(usages.usages["web"].cpu.percentage, None);
+        // ログの1行が json として読める
+        let line = usages.to_string();
+        assert!(json::parse(&line).is_ok(), "{}", line);
+        assert!(line.contains(r#""cpu":{"percentage":null,"#), "{}", line);
+    }
+
+    #[test]
+    fn container_whose_time_did_not_advance_is_skipped() {
+        let prev = stats_map(vec![
+            ("web", idle_stats("2026-01-01T00:00:10Z")),
+            ("same", idle_stats("2026-01-01T00:00:10.123456789Z")),
+            ("back", idle_stats("2026-01-01T00:00:10Z")),
+            ("broken", idle_stats("2026-01-01T00:00:10Z")),
+            ("broken-before", idle_stats("not a time")),
+            ("zero", idle_stats("2026-01-01T00:00:10Z")),
+            ("zero-before", idle_stats(ZERO_TIME)),
+        ]);
+        let now = stats_map(vec![
+            ("web", idle_stats("2026-01-01T00:00:20Z")),
+            // 同じ時刻（ミリ秒未満だけが違う場合も含む）
+            ("same", idle_stats("2026-01-01T00:00:10.123999999Z")),
+            ("back", idle_stats("2026-01-01T00:00:09Z")),
+            ("broken", idle_stats("not a time")),
+            ("broken-before", idle_stats("2026-01-01T00:00:20Z")),
+            ("zero", idle_stats(ZERO_TIME)),
+            ("zero-before", idle_stats("2026-01-01T00:00:20Z")),
+        ]);
+        let usages = calc_usages(TICK_MILLIS, &now, &prev).unwrap();
+        assert_eq!(usages.usages.keys().collect::<Vec<_>>(), vec!["web"]);
+        assert_eq!(usages.time, "2026-01-01T00:00:20Z");
+
+        // 時刻の無い統計（存在しないコンテナへの応答など）でも panic しない
+        let no_time = stats_map(vec![("web", Stats::default())]);
+        assert!(calc_usages(TICK_MILLIS, &no_time, &prev).is_none());
+        assert!(calc_usages(TICK_MILLIS, &now, &no_time).is_none());
+    }
+
+    #[test]
+    fn tick_time_comes_from_a_recorded_container() {
+        let prev = stats_map(vec![
+            ("a-stuck", idle_stats("2026-01-01T00:00:19Z")),
+            ("b", idle_stats("2026-01-01T00:00:10.200Z")),
+            ("c", idle_stats("2026-01-01T00:00:10.100Z")),
+            ("d", idle_stats("2026-01-01T00:00:10.300Z")),
+        ]);
+        let now = stats_map(vec![
+            // 飛ばされるコンテナ。時刻は最も早いが、tick の時刻には使わない
+            ("a-stuck", idle_stats("2026-01-01T00:00:19Z")),
+            ("a-new", idle_stats("2026-01-01T00:00:19.5Z")),
+            ("b", idle_stats("2026-01-01T00:00:20.200000001Z")),
+            ("c", idle_stats("2026-01-01T00:00:20.100000002Z")),
+            ("d", idle_stats("2026-01-01T00:00:20.300Z")),
+        ]);
+        // HashMap の順序に左右されず、記録するコンテナのうち最も早い時刻になる
+        for _ in 0..20 {
+            let usages = calc_usages(TICK_MILLIS, &now, &prev).unwrap();
+            // Docker が返した文字列をそのまま使う
+            assert_eq!(usages.time, "2026-01-01T00:00:20.100000002Z");
+            assert_eq!(usages.usages.len(), 3);
+        }
+
+        // 記録できるコンテナが無ければ、tick ごと記録しない（panic しない）
+        let stuck = stats_map(vec![
+            ("a-stuck", idle_stats("2026-01-01T00:00:19Z")),
+        ]);
+        assert!(calc_usages(TICK_MILLIS, &stuck, &prev).is_none());
+    }
+
+    #[test]
+    fn log_line_format_is_unchanged() {
+        let prev = stats_map(vec![
+            ("web", stats_at(
+                "2026-01-01T00:00:00.023034093Z",
+                1_000_000_000, 50_000_000_000, (1000, 2000), (3000, 4000),
+            )),
+        ]);
+        let now = stats_map(vec![
+            ("web", stats_at(
+                "2026-01-01T00:00:10.023034093Z",
+                1_003_000_000, 69_860_000_000,
+                (4_161_000, 48_689_000), (40_004_000, 14_000),
+            )),
+        ]);
+        let usages = calc_usages(TICK_MILLIS, &now, &prev).unwrap();
+        assert_eq!(
+            usages.to_string(),
+            concat!(
+                r#"{"time":"2026-01-01T00:00:10.023034093Z","millis":10000,"stats":{"#,
+                r#""web":{"cpu":{"percentage":0.03,"total":3,"system":19860,"ncpu":2},"#,
+                r#""memory":{"percentage":20.00,"used":200000,"available":1000000},"#,
+                r#""io":{"readkB":4161,"writekB":48689,"readkBps":416,"writekBps":4868},"#,
+                r#""net":{"recvkB":40004,"sendkB":14,"recvkBps":4000,"sendkBps":1}}}}"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn written_line_is_restored_with_io_write() {
+        let line = concat!(
+            r#"{"time":"2026-01-01T00:00:10.023034093Z","millis":10000,"stats":{"#,
+            r#""web":{"cpu":{"percentage":0.03,"total":3,"system":19860,"ncpu":2},"#,
+            r#""memory":{"percentage":3.64,"used":36696064,"available":1007222784},"#,
+            r#""io":{"readkB":4161,"writekB":48689,"readkBps":11,"writekBps":22},"#,
+            r#""net":{"recvkB":4,"sendkB":9,"recvkBps":33,"sendkBps":44}}}}"#,
+        );
+        let usages = json_to_usage(&json::parse(line).unwrap()).unwrap();
+        let web = &usages.usages["web"];
+        assert_eq!(web.io.readkB, Some(4161));
+        assert_eq!(web.io.writekB, Some(48689));
+        assert_eq!(web.io.readkBps, Some(11));
+        assert_eq!(web.io.writekBps, Some(22));
+        assert_eq!(web.net.recvkBps, Some(33));
+        assert_eq!(web.net.sendkBps, Some(44));
+        // 読んだものを書き出すと元の行に戻る
+        assert_eq!(usages.to_string(), line);
+    }
+
+    /// ログの1行（行末の \r\n 込み）。値は cpu と io write だけ変える
+    fn log_line(time: &str, containers: &[(&str, f32, u32)]) -> String {
+        let stats = containers.iter()
+            .map(|(name, cpu, write)| format!(
+                concat!(
+                    r#""{name}":{{"cpu":{{"percentage":{cpu:.2},"total":3,"system":19860,"ncpu":2}},"#,
+                    r#""memory":{{"percentage":3.64,"used":36696064,"available":1007222784}},"#,
+                    r#""io":{{"readkB":4161,"writekB":48689,"readkBps":5,"writekBps":{write}}},"#,
+                    r#""net":{{"recvkB":4,"sendkB":0,"recvkBps":6,"sendkBps":7}}}}"#,
+                ),
+                name = name, cpu = cpu, write = write,
+            ))
+            .collect::<Vec<String>>()
+            .join(",");
+        format!(
+            "{{\"time\":\"{}\",\"millis\":10000,\"stats\":{{{}}}}}\r\n",
+            time, stats,
+        )
+    }
+
+    fn restore(
+        log: &[u8],
+        lines_to_skip: u64,
+    ) -> (RestoreSummary, log_cache::SharedUsageCache) {
+        let cache = create_shared_cache();
+        let summary = restore_from_reader(
+            std::io::Cursor::new(log.to_vec()),
+            lines_to_skip,
+            &mut cache.write().unwrap(),
+        ).unwrap();
+        (summary, cache)
+    }
+
+    fn restored_times(
+        cache: &log_cache::SharedUsageCache,
+        name: &str,
+    ) -> Vec<String> {
+        cache.read().unwrap().get(name).unwrap().iter()
+            .map(|p| time::millis_to_iso8601(p.time_ms))
+            .collect()
+    }
+
+    #[test]
+    fn restore_skips_bad_lines_and_keeps_reading() {
+        let mut log: Vec<u8> = Vec::new();
+        log.extend(log_line("2026-01-01T00:00:10.023034093Z", &[("web", 1.0, 11)]).bytes());
+        // Docker が返した ZERO_TIME がそのまま書かれた行
+        log.extend(log_line(ZERO_TIME, &[("web", 2.0, 12)]).bytes());
+        log.extend(log_line("2026-01-01T00:00:20.5Z", &[("web", 3.0, 13)]).bytes());
+        // json として壊れた行、途中で切れた行、空行、jsonだが形が違う行
+        log.extend(b"this is not json\r\n");
+        log.extend(b"{\"time\":\"2026-01-01T00:00:25Z\",\"millis\":10000,\"stats\":{\"web\":{\"cpu\r\n");
+        log.extend(b"\r\n");
+        log.extend(b"[1,2,3]\r\n");
+        log.extend(b"{\"millis\":10000,\"stats\":{}}\r\n");
+        // 文字コードとして壊れた行
+        log.extend(b"\xff\xfe\x00garbage\r\n");
+        // time を解釈できない行
+        log.extend(log_line("2026-01-01Txx:yy:zzZ", &[("web", 4.0, 14)]).bytes());
+        log.extend(log_line("2026-01-01T00:00:30Z", &[("web", 5.0, 15), ("db", 6.0, 16)]).bytes());
+        // 最後の行は書きかけ（改行が無く、途中で切れている）
+        log.extend(b"{\"time\":\"2026-01-01T00:00:40Z\",\"mil");
+
+        let (summary, cache) = restore(&log, 0);
+        assert_eq!(summary, RestoreSummary { lines: 12, restored: 3 });
+        assert_eq!(
+            restored_times(&cache, "web"),
+            vec![
+                "2026-01-01T00:00:10.023Z",
+                "2026-01-01T00:00:20.500Z",
+                "2026-01-01T00:00:30.000Z",
+            ],
+        );
+        assert_eq!(restored_times(&cache, "db"), vec!["2026-01-01T00:00:30.000Z"]);
+
+        // IO の write と、ほかの値も復元されている
+        let lock = cache.read().unwrap();
+        let web: Vec<_> = lock.get("web").unwrap().iter().collect();
+        assert_eq!(
+            web.iter().map(|p| p.write_kbps).collect::<Vec<_>>(),
+            vec![Some(11), Some(13), Some(15)],
+        );
+        assert_eq!(web[2].cpu, Some(5.0));
+        assert_eq!(web[2].memory, Some(3.64));
+        assert_eq!(web[2].read_kbps, Some(5));
+        assert_eq!(web[2].recv_kbps, Some(6));
+        assert_eq!(web[2].send_kbps, Some(7));
+        assert_eq!(lock.get("db").unwrap()[0].write_kbps, Some(16));
+    }
+
+    #[test]
+    fn restore_drops_lines_older_than_24_hours() {
+        let mut log = String::new();
+        // 3日前に止まった old と、25時間前・24時間前・現在の web
+        log += &log_line("2025-12-29T00:00:00Z", &[("web", 1.0, 1), ("old", 1.0, 1)]);
+        log += &log_line("2025-12-31T23:00:00Z", &[("web", 2.0, 2)]);
+        log += &log_line("2026-01-01T00:00:00Z", &[("web", 3.0, 3)]);
+        log += &log_line("2026-01-01T12:00:00Z", &[("web", 4.0, 4), ("db", 4.0, 4)]);
+        log += &log_line("2026-01-02T00:00:00Z", &[("web", 5.0, 5)]);
+
+        let (summary, cache) = restore(log.as_bytes(), 0);
+        assert_eq!(summary, RestoreSummary { lines: 5, restored: 5 });
+        assert_eq!(
+            restored_times(&cache, "web"),
+            vec![
+                "2026-01-01T00:00:00.000Z",
+                "2026-01-01T12:00:00.000Z",
+                "2026-01-02T00:00:00.000Z",
+            ],
+        );
+        // 最新の点が24時間以内にあるコンテナは残り、無いコンテナは一覧から消える
+        let lock = cache.read().unwrap();
+        assert_eq!(lock.container_names(), vec!["db", "web"]);
+        assert!(lock.get("old").is_none());
+    }
+
+    #[test]
+    fn restore_skips_leading_lines_without_parsing() {
+        let mut log = String::from("broken line that must not be parsed\r\n");
+        for i in 0..5 {
+            log += &log_line(
+                &format!("2026-01-01T00:00:{:02}Z", i * 10),
+                &[("web", i as f32, i)],
+            );
+        }
+        let (summary, cache) = restore(log.as_bytes(), 3);
+        assert_eq!(summary, RestoreSummary { lines: 3, restored: 3 });
+        assert_eq!(
+            restored_times(&cache, "web"),
+            vec![
+                "2026-01-01T00:00:20.000Z",
+                "2026-01-01T00:00:30.000Z",
+                "2026-01-01T00:00:40.000Z",
+            ],
+        );
+        // 行数より多く飛ばしても、空のまま正常に終わる
+        let (summary, cache) = restore(log.as_bytes(), 100);
+        assert_eq!(summary, RestoreSummary { lines: 0, restored: 0 });
+        assert!(cache.read().unwrap().container_names().is_empty());
+        // 空のログ
+        let (summary, _) = restore(b"", 0);
+        assert_eq!(summary, RestoreSummary { lines: 0, restored: 0 });
+    }
+
+    #[test]
+    fn restore_of_more_than_a_day_keeps_the_latest_window() {
+        // 10秒間隔で 9000 行（25時間分）
+        let mut log = String::new();
+        for i in 0..9000_u32 {
+            let seconds = i * 10;
+            log += &log_line(
+                &format!(
+                    "2026-01-{:02}T{:02}:{:02}:{:02}.000000001Z",
+                    1 + seconds / 86_400,
+                    (seconds / 3600) % 24, (seconds / 60) % 60, seconds % 60,
+                ),
+                &[("web", (i % 50) as f32, i)],
+            );
+        }
+        let (summary, cache) = restore(log.as_bytes(), 0);
+        assert_eq!(summary, RestoreSummary { lines: 9000, restored: 9000 });
+        let lock = cache.read().unwrap();
+        let web = lock.get("web").unwrap();
+        assert_eq!(web.len(), log_cache::MAX_LOG_LENGTH);
+        assert_eq!(web.back().unwrap().write_kbps, Some(8999));
+        assert_eq!(web.front().unwrap().write_kbps, Some(360));
+        // 復元した系列は、write を基準にしたダウンサンプリングでも末尾まで返る
+        let sampled = lock
+            .downsample("web", &DownsampleOption::default(), Series::IoWrite)
+            .unwrap();
+        assert_eq!(sampled.len(), 512);
+        assert_eq!(sampled[511].write_kbps, Some(8999));
+    }
+
+    #[test]
+    fn collected_ticks_reach_the_cache() {
+        // 算出 → ログの1行 → 復元、と通しても同じ値になる
+        let tick = |second: u32, bytes: u64| stats_map(vec![
+            ("web", stats_at(
+                &format!("2026-01-01T00:00:{:02}.5Z", second),
+                0, 0, (0, bytes), (0, 0),
+            )),
+        ]);
+        let first = tick(0, 0);
+        let second = tick(10, 1_000_000);
+        let third = tick(30, 3_000_000); // 1回飛んで20秒後
+
+        let cache = create_shared_cache();
+        let mut log = String::new();
+        for (now, prev) in [(&second, &first), (&third, &second)] {
+            let usages = calc_usages(TICK_MILLIS, now, prev).unwrap();
+            assert!(store_usages(&usages, &mut cache.write().unwrap()));
+            log += &(usages.to_string() + "\r\n");
+        }
+        let (summary, restored) = restore(log.as_bytes(), 0);
+        assert_eq!(summary, RestoreSummary { lines: 2, restored: 2 });
+
+        for cache in [&cache, &restored] {
+            let lock = cache.read().unwrap();
+            let web: Vec<_> = lock.get("web").unwrap().iter().collect();
+            assert_eq!(web.len(), 2);
+            assert_eq!(
+                time::millis_to_iso8601(web[1].time_ms),
+                "2026-01-01T00:00:30.500Z",
+            );
+            // どちらの tick も 100 kB/s（飛んだ tick で2倍にならない）
+            assert_eq!(web[0].write_kbps, Some(100));
+            assert_eq!(web[1].write_kbps, Some(100));
+        }
+    }
 }
