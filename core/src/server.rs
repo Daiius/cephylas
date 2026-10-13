@@ -1,7 +1,6 @@
 
 use std::io::{ Read, Write };
-use std::sync::Arc;
-use std::sync::atomic::{ AtomicUsize, Ordering };
+use std::sync::{ Arc, Condvar, Mutex };
 use std::time::{ Duration, Instant };
 
 use super::error;
@@ -9,7 +8,7 @@ use super::log_cache;
 
 /// 待ち受けるアドレス
 const LISTEN_ADDR: &str = "0.0.0.0:7878";
-/// 同時に処理する接続数の上限。超えた接続には503を返す
+/// 同時に処理する接続数の上限。超えた接続は枠が空くまで待たせる
 const MAX_CONNECTIONS: usize = 16;
 /// 1回の読み書きの待ち時間の上限。リクエスト行を読み切るまでの上限も兼ねる
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -56,7 +55,6 @@ enum StatusCode {
     NotFound,
     MethodNotAllowed,
     InternalServerError,
-    ServiceUnavailable,
 }
 
 impl StatusCode {
@@ -67,7 +65,6 @@ impl StatusCode {
             StatusCode::NotFound => "404 Not Found",
             StatusCode::MethodNotAllowed => "405 Method Not Allowed",
             StatusCode::InternalServerError => "500 Internal Server Error",
-            StatusCode::ServiceUnavailable => "503 Service Unavailable",
         }
     }
 }
@@ -266,7 +263,8 @@ fn respond(
 
 /// リクエスト行の読み取り結果
 enum RequestLine {
-    /// 1バイトも送られずに閉じられた
+    /// 1バイトも受け取らずに終わった
+    /// (相手が閉じた、無言のままタイムアウトした、など)
     Closed,
     /// MAX_REQUEST_LINE_BYTES を超えた
     TooLong,
@@ -290,6 +288,9 @@ fn read_request_line<R: Read>(
         let n = match stream.read(&mut chunk) {
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // プリコネクトや死活監視でログが増えないよう、
+            // 1バイトも受け取っていない接続の失敗はエラーとして扱わない
+            Err(_) if received.is_empty() => return Ok(RequestLine::Closed),
             Err(e) => return Err(e.into()),
         };
         if n == 0 {
@@ -328,7 +329,7 @@ fn handle_connection<S: Read + Write>(
     timeout: Duration,
 ) -> Result<(), error::Error> {
     let response = match read_request_line(stream, timeout)? {
-        // 何も送らずに閉じた相手には何も返さない
+        // 何も送らなかった相手には何も返さない
         RequestLine::Closed => return Ok(()),
         RequestLine::TooLong => Response::empty(StatusCode::BadRequest),
         RequestLine::Line(line) => respond(&line, log_cache),
@@ -337,35 +338,56 @@ fn handle_connection<S: Read + Write>(
     write_response(stream, &response)
 }
 
-/// 同時接続数の1枠。Dropで必ず返すので、ハンドラがpanicしても枠は戻る
-struct ConnectionSlot {
-    active: Arc<AtomicUsize>,
+/// 同時に処理する接続数を数えるセマフォ
+struct ConnectionLimiter {
+    active: Mutex<usize>,
+    released: Condvar,
+    max: usize,
 }
 
-impl ConnectionSlot {
-    /// 上限に達していればNoneを返します
-    fn try_acquire(active: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
-        active
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                if n < max { Some(n + 1) } else { None }
-            })
-            .ok()
-            .map(|_| ConnectionSlot { active: Arc::clone(active) })
+impl ConnectionLimiter {
+    fn new(max: usize) -> Arc<Self> {
+        Arc::new(ConnectionLimiter {
+            active: Mutex::new(0),
+            released: Condvar::new(),
+            max,
+        })
     }
+
+    /// 枠を1つ取ります。上限に達していれば、空くまで待ちます
+    fn acquire(self: &Arc<Self>) -> ConnectionSlot {
+        // lockを持ったままpanicする箇所は無いが、poisonされていても止まらない
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        while *active >= self.max {
+            active = self.released.wait(active)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        *active += 1;
+
+        ConnectionSlot { limiter: Arc::clone(self) }
+    }
+}
+
+/// 同時接続数の1枠。Dropで必ず返すので、ハンドラがpanicしても枠は戻る
+struct ConnectionSlot {
+    limiter: Arc<ConnectionLimiter>,
 }
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::SeqCst);
+        let mut active = self.limiter.active.lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *active -= 1;
+        self.limiter.released.notify_one();
     }
 }
 
-/// acceptした1本の接続を、枠が空いていれば専用のスレッドに渡します
+/// acceptした1本の接続を専用のスレッドに渡します
 /// ここで起きたエラーは呼び出し元（acceptのループ）に伝えません
 fn dispatch(
     mut stream: std::net::TcpStream,
+    slot: ConnectionSlot,
     log_cache: &log_cache::SharedUsageCache,
-    active: &Arc<AtomicUsize>,
     timeout: Duration,
 ) {
     if let Err(e) = stream.set_read_timeout(Some(timeout))
@@ -374,17 +396,6 @@ fn dispatch(
         eprintln!("server: failed to set timeouts: {}", e);
         return;
     }
-
-    let slot = match ConnectionSlot::try_acquire(active, MAX_CONNECTIONS) {
-        Some(slot) => slot,
-        None => {
-            let busy = Response::empty(StatusCode::ServiceUnavailable);
-            if let Err(e) = write_response(&mut stream, &busy) {
-                eprintln!("server: failed to send 503: {}", e);
-            }
-            return;
-        }
-    };
 
     let log_cache = Arc::clone(log_cache);
     // thread::spawn はスレッドを作れないとpanicするので Builder を使う
@@ -404,24 +415,27 @@ fn dispatch(
 
 /// 接続を受け付け続けます
 /// 1本の接続の失敗でも、accept自体の失敗でもループを抜けません
+///
+/// 枠を取ってからacceptするので、上限に達している間に来た接続は
+/// 断られずにOSのbacklogで待ちます
 fn serve(
     listener: std::net::TcpListener,
     log_cache: &log_cache::SharedUsageCache,
     timeout: Duration,
 ) -> Result<(), error::Error> {
-    let active = Arc::new(AtomicUsize::new(0));
+    let limiter = ConnectionLimiter::new(MAX_CONNECTIONS);
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => dispatch(stream, log_cache, &active, timeout),
+    loop {
+        let slot = limiter.acquire();
+        match listener.accept() {
+            Ok((stream, _)) => dispatch(stream, slot, log_cache, timeout),
             Err(e) => {
                 eprintln!("server: failed to accept a connection: {}", e);
+                drop(slot);
                 std::thread::sleep(ACCEPT_RETRY_INTERVAL);
             }
         }
     }
-
-    Ok(())
 }
 
 pub fn start_server(
@@ -627,6 +641,46 @@ mod tests {
         assert_eq!(exchange(&small_cache(), b""), "");
     }
 
+    /// 先に prefix を返し、その後のreadはタイムアウトとして失敗するストリーム
+    struct StallingStream {
+        prefix: std::io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+    impl Read for StallingStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.prefix.read(buf)? {
+                0 => Err(std::io::ErrorKind::WouldBlock.into()),
+                n => Ok(n),
+            }
+        }
+    }
+    impl Write for StallingStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn silent_connection_is_not_reported_as_an_error() {
+        let cache = small_cache();
+        // 1バイトも受け取らずに失敗した接続は、エラーにせず何も返さない
+        let mut silent = StallingStream {
+            prefix: std::io::Cursor::new(Vec::new()),
+            output: Vec::new(),
+        };
+        assert!(handle_connection(&mut silent, &cache, IO_TIMEOUT).is_ok());
+        assert!(silent.output.is_empty());
+
+        // 途中まで受け取ってから失敗した接続は、エラーとして報告する
+        let mut partial = StallingStream {
+            prefix: std::io::Cursor::new(b"GET /cont".to_vec()),
+            output: Vec::new(),
+        };
+        assert!(handle_connection(&mut partial, &cache, IO_TIMEOUT).is_err());
+        assert!(partial.output.is_empty());
+    }
+
     #[test]
     fn malformed_request_line_is_400() {
         let cache = small_cache();
@@ -733,25 +787,54 @@ mod tests {
         }
     }
 
+    fn active_count(limiter: &Arc<ConnectionLimiter>) -> usize {
+        *limiter.active.lock().unwrap()
+    }
+
     #[test]
     fn slot_is_returned_on_drop_and_on_panic() {
-        let active = Arc::new(AtomicUsize::new(0));
-        let slots: Vec<ConnectionSlot> = (0..3)
-            .map(|_| ConnectionSlot::try_acquire(&active, 3).unwrap())
-            .collect();
-        assert!(ConnectionSlot::try_acquire(&active, 3).is_none());
-        assert_eq!(active.load(Ordering::SeqCst), 3);
+        let limiter = ConnectionLimiter::new(3);
+        let mut slots: Vec<ConnectionSlot> =
+            (0..3).map(|_| limiter.acquire()).collect();
+        assert_eq!(active_count(&limiter), 3);
 
-        let mut slots = slots.into_iter();
-        let slot = slots.next().unwrap();
+        let slot = slots.pop().unwrap();
         let _ = std::thread::spawn(move || {
             let _slot = slot;
             panic!("panicking while holding a slot (expected in this test)");
         }).join();
-        assert_eq!(active.load(Ordering::SeqCst), 2);
+        assert_eq!(active_count(&limiter), 2);
 
         drop(slots);
-        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(active_count(&limiter), 0);
+    }
+
+    #[test]
+    fn limiter_never_exceeds_max_and_wakes_waiters() {
+        use std::sync::atomic::{ AtomicUsize, Ordering };
+
+        const MAX: usize = 4;
+        let limiter = ConnectionLimiter::new(MAX);
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let workers: Vec<_> = (0..40).map(|_| {
+            let limiter = Arc::clone(&limiter);
+            let running = Arc::clone(&running);
+            let peak = Arc::clone(&peak);
+            std::thread::spawn(move || {
+                let _slot = limiter.acquire();
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(5));
+                running.fetch_sub(1, Ordering::SeqCst);
+            })
+        }).collect();
+        // 待たされた側も全員起こされて終わる（起こし損ねがあればここで止まる）
+        for worker in workers { worker.join().unwrap(); }
+
+        assert_eq!(peak.load(Ordering::SeqCst), MAX);
+        assert_eq!(active_count(&limiter), 0);
     }
 
     // ---- ここから実際のTCPを使う試験 ----
@@ -762,9 +845,15 @@ mod tests {
     /// serve を別スレッドで動かし、接続先を返す
     /// スレッドは止める手段が無いので、試験プロセスの終了まで残る
     fn spawn_server(timeout: Duration) -> std::net::SocketAddr {
+        spawn_server_with(small_cache(), timeout)
+    }
+
+    fn spawn_server_with(
+        cache: SharedUsageCache,
+        timeout: Duration,
+    ) -> std::net::SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let cache = small_cache();
         std::thread::spawn(move || serve(listener, &cache, timeout));
         addr
     }
@@ -833,36 +922,66 @@ mod tests {
     }
 
     #[test]
-    fn connections_over_the_limit_get_503() {
-        let addr = spawn_server(IO_TIMEOUT);
+    fn burst_over_the_limit_is_all_served() {
+        // webは1回の表示で 6N 本を同時に発射する（Nはコンテナ数）
+        // 上限を超えた分も断られず、全部200になること
+        const NCONTAINERS: usize = 10;
+        let cache = create_shared_cache();
+        {
+            let mut lock = cache.write().unwrap();
+            for c in 0..NCONTAINERS {
+                for i in 0..crate::log_cache::MAX_LOG_LENGTH {
+                    let name = format!("c{}", c);
+                    let v = (i % 13) as u32;
+                    lock.cpu.insert(name.clone(), TimedCpuUsage {
+                        time: time_at(i), percentage: Some(v as f32),
+                    });
+                    lock.memory.insert(name.clone(), TimedMemoryUsage {
+                        time: time_at(i), percentage: Some(v as f32),
+                    });
+                    lock.io.insert(name.clone(), TimedIoUsage {
+                        time: time_at(i), readkBps: Some(v), writekBps: Some(1),
+                    });
+                    lock.net.insert(name, TimedNetUsage {
+                        time: time_at(i), recvkBps: Some(v), sendkBps: Some(1),
+                    });
+                }
+            }
+        }
+        let addr = spawn_server_with(cache, IO_TIMEOUT);
+
+        let mut clients = Vec::new();
+        for c in 0..NCONTAINERS {
+            for kind in ["cpu", "memory", "io/read", "io/write", "net/recv", "net/send"] {
+                let request = format!("GET /containers/c{}/{} HTTP/1.1\r\n\r\n", c, kind);
+                clients.push(std::thread::spawn(move || {
+                    try_tcp_exchange(addr, request.as_bytes())
+                }));
+            }
+        }
+        assert!(clients.len() > MAX_CONNECTIONS * 3);
+
+        for client in clients {
+            let response = client.join().unwrap()
+                .expect("no connection should be refused or reset");
+            let parsed = assert_json_ok(&response);
+            assert_eq!(parsed.len(), 512);
+        }
+    }
+
+    #[test]
+    fn connection_over_the_limit_waits_for_a_slot() {
+        let addr = spawn_server(TEST_TIMEOUT);
 
         // 上限まで、何も送らない接続で埋める
-        // acceptは接続した順に1本ずつ処理されるので、次の1本は必ず上限超過になる
-        let idles: Vec<std::net::TcpStream> =
+        // acceptは接続した順なので、次の1本は必ず枠待ちになる
+        let _idles: Vec<std::net::TcpStream> =
             (0..MAX_CONNECTIONS).map(|_| connect(addr)).collect();
+        let started = Instant::now();
 
-        let mut over = connect(addr);
-        let mut response = String::new();
-        over.read_to_string(&mut response).unwrap();
-        assert_status(&response, "HTTP/1.1 503 Service Unavailable");
-
-        // 枠が空けば元どおり応答する（枠が戻るのは各スレッドが切断に気づいた後）
-        drop(idles);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            // 503はリクエストを読まずに返して閉じるので、送信済みのリクエストが
-            // 未読のまま残り、クライアント側ではresetに見えることがある
-            match try_tcp_exchange(addr, b"GET /containers HTTP/1.1\r\n\r\n") {
-                Ok(response) if response.starts_with("HTTP/1.1 200 OK") => {
-                    assert_json_ok(&response);
-                    break;
-                }
-                Ok(response) =>
-                    assert_status(&response, "HTTP/1.1 503 Service Unavailable"),
-                Err(_) => {}
-            }
-            assert!(Instant::now() < deadline, "slots were not released");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        // 断られず、無言の接続がタイムアウトして枠が空いてから応答が来る
+        // (16本を超えて同時に処理していれば、待たずに返ってきてしまう)
+        assert_json_ok(&tcp_get_containers(addr));
+        assert!(started.elapsed() >= TEST_TIMEOUT / 2, "{:?}", started.elapsed());
     }
 }
