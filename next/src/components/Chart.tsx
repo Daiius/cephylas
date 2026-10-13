@@ -9,9 +9,10 @@ import 'chartjs-adapter-luxon';
 import { useFilter } from './FilterContext';
 import { MiniLegend } from './MiniLegend';
 
-// 時間軸チャートの 1 点。Chart.js の Point は { x: number; y: number } だが
-// time scale だと文字列を runtime で受け付けるので独自に定義する。
-export type TimedPoint = { x?: string; y?: number | null };
+// 時間軸チャートの 1 点。x はエポックからのミリ秒 (time scale は数値を受け取れる)。
+// Chart.js の Point は { x: number; y: number } だが、欠損を null で持つので
+// 独自に定義する。
+export type TimedPoint = { x: number; y: number | null };
 type TimedSeries = TimedPoint[];
 
 // containerName は src/types/chartjs.d.ts の declaration merging で

@@ -4,8 +4,9 @@ import { Chart, type AppDataset } from '@/components/Chart';
 import { borderColorFor, backgroundColorFor } from '@/lib/colors';
 
 import {
-  fetchContainers,
-  fetchIoStatus,
+  fetchUsages,
+  sortedContainerNames,
+  toPoints,
 } from '@/lib/fetchers';
 
 export const IoChart = async ({
@@ -17,42 +18,29 @@ export const IoChart = async ({
   cacheLife({ revalidate: 10, expire: 60, stale: 10 });
   cacheTag('chart:io');
 
-  const containersResponse = await fetchContainers();
-  if (!containersResponse.ok) {
-    return (<div>コンテナ名取得中...</div>);
-  }
-  const containerNames = containersResponse.data;
-
-  // 並列フェッチ。read + write × N コンテナを全部同時に発射する。
-  // core は接続ごとにスレッドを起こして並列に処理する
-  // (同時 16 本まで。超えた分は断られず、枠が空くまで core 側で待つ)。
-  const [reads, writes] = await Promise.all([
-    Promise.all(containerNames.map((name) => fetchIoStatus(name, 'read'))),
-    Promise.all(containerNames.map((name) => fetchIoStatus(name, 'write'))),
-  ]);
+  // 全コンテナ分の read と write を 1 リクエストで取る
+  const response = await fetchUsages('io');
+  if (!response.ok) return (<div>IO 取得中...</div>);
+  const usages = response.data;
 
   const datasets: AppDataset[] = [];
-  for (const [i, containerName] of containerNames.entries()) {
+  for (const [i, containerName] of sortedContainerNames(usages).entries()) {
     const border = borderColorFor(i);
     const bg = backgroundColorFor(i);
+    const { read, write } = usages[containerName];
 
-    const responseRead = reads[i];
-    if (!responseRead.ok) return (<div>IO read 取得中...</div>);
     datasets.push({
       containerName,
       label: `${containerName} read`,
-      data: responseRead.data,
+      data: toPoints(read),
       borderColor: border,
       backgroundColor: bg,
       borderDash: [1, 0],
     });
-
-    const responseWrite = writes[i];
-    if (!responseWrite.ok) return (<div>IO write 取得中...</div>);
     datasets.push({
       containerName,
       label: `${containerName} write`,
-      data: responseWrite.data,
+      data: toPoints(write),
       borderColor: border,
       backgroundColor: bg,
       borderDash: [5, 5],

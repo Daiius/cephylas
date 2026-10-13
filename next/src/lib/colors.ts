@@ -21,8 +21,8 @@ const hexToRgba = (hex: string, alpha: number): string => {
   return `rgba(${r},${g},${b},${alpha})`;
 };
 
-// core はアルファベット順でコンテナ名を返すので、その順序の index を渡せば
-// 先頭コンテナ = palette[0] = blue になり、N <= palette.length なら衝突しない。
+// コンテナ名を並べ替えた順序 (lib/fetchers.ts の sortedContainerNames) の index を
+// 渡せば、先頭コンテナ = palette[0] = blue になり、N <= palette.length なら衝突しない。
 // 新規コンテナの追加で alphabetical 位置が変わると色がシフトする点は妥協。
 export const borderColorFor = (index: number): string =>
   palette[index % palette.length];
