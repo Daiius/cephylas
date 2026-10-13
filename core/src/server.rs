@@ -69,12 +69,89 @@ impl StatusCode {
     }
 }
 
+/// /usages/{kind} の本文として、同時に保持してよいバイト数の合計
+///
+/// 全コンテナ分の本文は1本で数百kB〜数MBになり、送り終えるまで接続ごとに持ち続ける
+/// 同時接続の上限（16本）まで並ぶとメモリの上限を超えうるので、合計で抑える
+/// 超える分は断らず、先の応答が送り終わるまで待たせる
+const MAX_BULK_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// プロセス全体で1つの、/usages/{kind} の本文の枠
+static BULK_BODY_BUDGET: BodyBudget = BodyBudget::new(MAX_BULK_BODY_BYTES);
+
+/// 同時に保持する本文のバイト数を数えるセマフォ
+struct BodyBudget {
+    used: Mutex<usize>,
+    released: Condvar,
+    max: usize,
+}
+
+impl BodyBudget {
+    const fn new(max: usize) -> Self {
+        BodyBudget {
+            used: Mutex::new(0),
+            released: Condvar::new(),
+            max,
+        }
+    }
+
+    /// bytes 分の枠を取ります。合計が上限を超えるなら、空くまで待ちます
+    ///
+    /// ほかに誰も枠を持っていなければ、上限より大きくても通します
+    /// (1本で上限を超える本文を、永久に返せなくならないようにするため)
+    /// 待つことがあるので、キャッシュのlockを持ったまま呼ばないこと
+    fn reserve(&'static self, bytes: usize) -> BodyReservation {
+        // lockを持ったままpanicする箇所は無いが、poisonされていても止まらない
+        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        while *used > 0 && used.saturating_add(bytes) > self.max {
+            used = self.released.wait(used)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        *used = used.saturating_add(bytes);
+
+        BodyReservation { budget: self, bytes }
+    }
+}
+
+/// 本文の枠。Dropで必ず返すので、ハンドラがpanicしても枠は戻る
+struct BodyReservation {
+    budget: &'static BodyBudget,
+    bytes: usize,
+}
+
+impl BodyReservation {
+    /// 取った枠を、実際に確保した大きさに合わせ直します。待ちません
+    /// (見積もりと実際の本文の大きさがずれても、数えている量を実態に揃えるため)
+    fn resize(&mut self, bytes: usize) {
+        let mut used = self.budget.used.lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *used = used.saturating_sub(self.bytes).saturating_add(bytes);
+        let shrunk = bytes < self.bytes;
+        self.bytes = bytes;
+        if shrunk {
+            self.budget.released.notify_all();
+        }
+    }
+}
+
+impl Drop for BodyReservation {
+    fn drop(&mut self) {
+        let mut used = self.budget.used.lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *used = used.saturating_sub(self.bytes);
+        // 待っている側の大きさはまちまちなので、全員を起こして判定し直させる
+        self.budget.released.notify_all();
+    }
+}
+
 /// 書き出す前の応答。経路の判定はこれを返すだけにして、
 /// ストリームへの書き込みは write_response の1箇所に集める
 struct Response {
     status: StatusCode,
     content_type: &'static str,
     body: String,
+    /// 本文の枠。応答を送り終えて破棄するまで持ち続ける
+    _reservation: Option<BodyReservation>,
 }
 
 impl Response {
@@ -83,6 +160,14 @@ impl Response {
             status: StatusCode::Ok,
             content_type: "application/json",
             body,
+            _reservation: None,
+        }
+    }
+    /// 本文の枠を持ったままのjson応答
+    fn reserved_json(body: String, reservation: BodyReservation) -> Self {
+        Response {
+            _reservation: Some(reservation),
+            ..Response::json(body)
         }
     }
     /// 本文を持たないエラー応答
@@ -91,6 +176,7 @@ impl Response {
             status,
             content_type: "text/plain; charset=utf-8",
             body: String::new(),
+            _reservation: None,
         }
     }
     /// 500応答。本文は固定の文言で、内部の情報を載せない
@@ -107,14 +193,16 @@ fn write_response<W: Write>(
     response: &Response,
 ) -> Result<(), error::Error> {
     let body_bytes = response.body.as_bytes();
-    let mut bytes = format!(
+    let head = format!(
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         response.status.status_line(),
         response.content_type,
         body_bytes.len(),
-    ).into_bytes();
-    bytes.extend_from_slice(body_bytes);
-    stream.write_all(&bytes)?;
+    );
+    // ヘッダと本文を1つのバッファにまとめない
+    // (本文が数MBになる応答で、送る間だけ本文の複製を持つことになるため)
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body_bytes)?;
     stream.flush()?;
 
     Ok(())
@@ -245,6 +333,29 @@ fn usages_json(cache: &log_cache::UsageCache, kind: log_cache::UsageKind) -> Str
     out
 }
 
+/// /usages/{kind} の応答を、本文の枠を取ってから組み立てます
+///
+/// estimate は呼び出し側がlockを持っている間に求めた、本文の大きさの見積もりです
+/// 枠を待つ間はキャッシュのlockを持ちません（loggerのwrite lockを待たせないため）
+/// 枠は応答に持たせ、送り終えて破棄されるまで返しません
+fn usages_response(
+    log_cache: &log_cache::SharedUsageCache,
+    kind: log_cache::UsageKind,
+    estimate: usize,
+    budget: &'static BodyBudget,
+) -> Result<Response, error::Error> {
+    let mut reservation = budget.reserve(estimate);
+    let body = {
+        let cache = log_cache.read().map_err(|e| e.to_string())?;
+        usages_json(&cache, kind)
+    };
+    // 待っている間にキャッシュが伸びた場合や、見積もりより桁の多い値があった場合は、
+    // 実際に確保した大きさで数え直す
+    reservation.resize(body.capacity());
+
+    Ok(Response::reserved_json(body, reservation))
+}
+
 /// パスから応答を決めます。ストリームには触りません
 /// 経路・コンテナ名・種別のどれかに一致しなければ404、
 /// 処理に失敗すればError型を返します（呼び出し側で500にします）
@@ -273,9 +384,20 @@ fn route(
             series_json(&cache, name, log_cache::Series::NetRecv),
         ["containers", name, "net", "send"] =>
             series_json(&cache, name, log_cache::Series::NetSend),
-        ["usages", kind] =>
-            log_cache::UsageKind::from_path(kind)
-                .map(|kind| usages_json(&cache, kind)),
+        ["usages", kind] => match log_cache::UsageKind::from_path(kind) {
+            Some(kind) => {
+                let estimate = usages_json_capacity(
+                    &cache,
+                    &cache.container_names(),
+                    kind.series().len(),
+                    &log_cache::DownsampleOption::default(),
+                );
+                // 本文の枠を待つことがあるので、lockを手放してから取りにいく
+                drop(cache);
+                return usages_response(log_cache, kind, estimate, &BULK_BODY_BUDGET);
+            }
+            None => None,
+        },
         _ => None,
     };
 
@@ -958,6 +1080,251 @@ mod tests {
             assert_eq!(body.capacity(), estimated);
             json::parse(&body).unwrap();
         }
+    }
+
+    // ---- /usages/{kind} の本文の枠 ----
+
+    /// 試験ごとに独立した枠（プロセス全体の枠は他の試験と共有されるので使わない）
+    fn leaked_budget(max: usize) -> &'static BodyBudget {
+        Box::leak(Box::new(BodyBudget::new(max)))
+    }
+
+    fn used_bytes(budget: &BodyBudget) -> usize {
+        *budget.used.lock().unwrap()
+    }
+
+    /// 24時間分のコンテナを ncontainers 個入れたキャッシュ
+    fn full_cache(ncontainers: usize) -> SharedUsageCache {
+        let cache = create_shared_cache();
+        {
+            let mut lock = cache.write().unwrap();
+            for c in 0..ncontainers {
+                let name = format!("container-{:02}", c);
+                for i in 0..crate::log_cache::MAX_LOG_LENGTH {
+                    let v = (i % 13) as f32 * 123.45;
+                    assert!(lock.insert(&name, UsagePoint {
+                        time_ms: time_ms_at(i),
+                        cpu: Some(v),
+                        memory: Some(v),
+                        read_kbps: Some(v),
+                        write_kbps: Some(v),
+                        recv_kbps: Some(v),
+                        send_kbps: Some(v),
+                    }));
+                }
+            }
+        }
+        cache
+    }
+
+    fn io_estimate(cache: &SharedUsageCache) -> usize {
+        let lock = cache.read().unwrap();
+        usages_json_capacity(
+            &lock,
+            &lock.container_names(),
+            2,
+            &crate::log_cache::DownsampleOption::default(),
+        )
+    }
+
+    #[test]
+    fn body_budget_is_returned_on_drop_and_on_panic() {
+        let budget = leaked_budget(100);
+        let first = budget.reserve(40);
+        let second = budget.reserve(60);
+        assert_eq!(used_bytes(budget), 100);
+
+        let _ = std::thread::spawn(move || {
+            let _held = second;
+            panic!("panicking while holding a reservation (expected in this test)");
+        }).join();
+        assert_eq!(used_bytes(budget), 40);
+
+        drop(first);
+        assert_eq!(used_bytes(budget), 0);
+    }
+
+    #[test]
+    fn body_budget_resize_tracks_the_real_size() {
+        let budget = leaked_budget(100);
+        let mut reservation = budget.reserve(40);
+        reservation.resize(70);
+        assert_eq!(used_bytes(budget), 70);
+        reservation.resize(10);
+        assert_eq!(used_bytes(budget), 10);
+        drop(reservation);
+        assert_eq!(used_bytes(budget), 0);
+    }
+
+    #[test]
+    fn body_budget_admits_one_oversized_body_alone() {
+        let budget = leaked_budget(100);
+        // 誰も持っていなければ、上限より大きくても待たずに通る
+        let oversized = budget.reserve(1000);
+        assert_eq!(used_bytes(budget), 1000);
+
+        // その間は、小さな本文も待たされる
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _held = budget.reserve(1);
+            sender.send(()).unwrap();
+        });
+        assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(oversized);
+        receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        waiter.join().unwrap();
+        assert_eq!(used_bytes(budget), 0);
+    }
+
+    #[test]
+    fn body_budget_never_exceeds_max_and_wakes_waiters() {
+        use std::sync::atomic::{ AtomicUsize, Ordering };
+
+        // 大きさの違う要求が混ざっても、合計は上限を超えず、全員が通る
+        const MAX: usize = 100;
+        let budget = leaked_budget(MAX);
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let workers: Vec<_> = (0..40).map(|i| {
+            let peak = Arc::clone(&peak);
+            std::thread::spawn(move || {
+                let _held = budget.reserve(10 + (i % 4) * 20);
+                peak.fetch_max(used_bytes(budget), Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(5));
+            })
+        }).collect();
+        // 起こし損ねがあればここで止まる
+        for worker in workers { worker.join().unwrap(); }
+
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak <= MAX, "{}", peak);
+        assert!(peak > 70, "{}", peak);
+        assert_eq!(used_bytes(budget), 0);
+    }
+
+    #[test]
+    fn usages_response_holds_its_body_size_until_dropped() {
+        let cache = cache_with(2000, time_ms_at);
+        let budget = leaked_budget(MAX_BULK_BODY_BYTES);
+        let kind = crate::log_cache::UsageKind::Io;
+
+        let response = usages_response(&cache, kind, io_estimate(&cache), budget).unwrap();
+        assert_eq!(response.status, StatusCode::Ok);
+        // 数えているのは、実際に確保した本文の大きさ
+        assert_eq!(used_bytes(budget), response.body.capacity());
+        assert!(response.body.len() <= used_bytes(budget));
+
+        // 応答を書き出しても、破棄するまでは枠を持ち続ける
+        let mut output = Vec::new();
+        write_response(&mut output, &response).unwrap();
+        assert!(used_bytes(budget) > 0);
+        drop(response);
+        assert_eq!(used_bytes(budget), 0);
+
+        // 見積もりが外れていても、実際の大きさで数え直す
+        let response = usages_response(&cache, kind, 1, budget).unwrap();
+        assert_eq!(used_bytes(budget), response.body.capacity());
+        assert!(used_bytes(budget) >= response.body.len());
+        drop(response);
+
+        // 失敗したときは枠を残さない
+        poison(&cache);
+        assert!(usages_response(&cache, kind, 1000, budget).is_err());
+        assert_eq!(used_bytes(budget), 0);
+    }
+
+    #[test]
+    fn concurrent_bulk_bodies_stay_within_the_budget() {
+        use std::sync::atomic::{ AtomicUsize, Ordering };
+
+        // 24時間分 × 40コンテナ。io の本文は1本で約1MBになる
+        let cache = full_cache(40);
+        let estimate = io_estimate(&cache);
+        assert!(estimate > 1024 * 1024, "{}", estimate);
+        // 同時接続の上限まで並ぶと、枠が無ければ上限を大きく超える
+        assert!(estimate * MAX_CONNECTIONS > MAX_BULK_BODY_BYTES * 2);
+
+        let budget = leaked_budget(MAX_BULK_BODY_BYTES);
+        let peak_used = Arc::new(AtomicUsize::new(0));
+        let held_bytes = Arc::new(AtomicUsize::new(0));
+        let peak_held = Arc::new(AtomicUsize::new(0));
+
+        let workers: Vec<_> = (0..MAX_CONNECTIONS * 2).map(|_| {
+            let cache = Arc::clone(&cache);
+            let peak_used = Arc::clone(&peak_used);
+            let held_bytes = Arc::clone(&held_bytes);
+            let peak_held = Arc::clone(&peak_held);
+            std::thread::spawn(move || {
+                let kind = crate::log_cache::UsageKind::Io;
+                let response = usages_response(&cache, kind, estimate, budget).unwrap();
+                // 実際に保持している本文の合計を、枠とは別に数える
+                let capacity = response.body.capacity();
+                let now = held_bytes.fetch_add(capacity, Ordering::SeqCst) + capacity;
+                peak_held.fetch_max(now, Ordering::SeqCst);
+                peak_used.fetch_max(used_bytes(budget), Ordering::SeqCst);
+                // 送っている間にあたる時間
+                std::thread::sleep(Duration::from_millis(5));
+                held_bytes.fetch_sub(capacity, Ordering::SeqCst);
+                drop(response);
+            })
+        }).collect();
+        for worker in workers { worker.join().unwrap(); }
+
+        assert!(peak_used.load(Ordering::SeqCst) <= MAX_BULK_BODY_BYTES);
+        assert!(peak_held.load(Ordering::SeqCst) <= MAX_BULK_BODY_BYTES);
+        // 1本ずつに絞っているわけではない（収まる範囲では並行に処理する）
+        assert!(peak_held.load(Ordering::SeqCst) >= estimate * 2);
+        assert_eq!(used_bytes(budget), 0);
+    }
+
+    #[test]
+    fn waiting_for_the_budget_does_not_hold_the_cache_lock() {
+        // 枠が空くのを待っている間も、loggerはwrite lockを取れる
+        let cache = small_cache();
+        let budget = leaked_budget(100);
+        let blocker = budget.reserve(100);
+
+        let waiting_cache = Arc::clone(&cache);
+        let waiter = std::thread::spawn(move || {
+            let kind = crate::log_cache::UsageKind::Cpu;
+            usages_response(&waiting_cache, kind, 50, budget).unwrap().body
+        });
+        // 待ちに入るまで待つ（待っている間、使用量は変わらない）
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(used_bytes(budget), 100);
+        assert!(!waiter.is_finished());
+
+        // 待たされている間に追加した点も、応答に入る
+        assert!(cache.try_write().is_ok());
+        assert!(cache.write().unwrap().insert("web", UsagePoint {
+            time_ms: time_ms_at(100),
+            cpu: Some(42.0),
+            memory: None,
+            read_kbps: None,
+            write_kbps: None,
+            recv_kbps: None,
+            send_kbps: None,
+        }));
+        drop(blocker);
+        let body = waiter.join().unwrap();
+        assert!(body.contains("42.00"), "{}", body);
+        assert_eq!(used_bytes(budget), 0);
+    }
+
+    #[test]
+    fn response_is_written_without_changing_its_bytes() {
+        // ヘッダと本文を分けて書いても、届くバイト列は同じ
+        let response = Response::json(r#"{"a":1}"#.to_string());
+        let mut output = Vec::new();
+        write_response(&mut output, &response).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            concat!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+                "Content-Length: 7\r\nConnection: close\r\n\r\n",
+                r#"{"a":1}"#,
+            ),
+        );
     }
 
     #[test]
