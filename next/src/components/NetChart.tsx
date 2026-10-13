@@ -4,8 +4,9 @@ import { Chart, type AppDataset } from '@/components/Chart';
 import { borderColorFor, backgroundColorFor } from '@/lib/colors';
 
 import {
-  fetchContainers,
-  fetchNetStatus,
+  fetchUsages,
+  sortedContainerNames,
+  toPoints,
 } from '@/lib/fetchers';
 
 export const NetChart = async ({
@@ -17,42 +18,29 @@ export const NetChart = async ({
   cacheLife({ revalidate: 10, expire: 60, stale: 10 });
   cacheTag('chart:net');
 
-  const containersResponse = await fetchContainers();
-  if (!containersResponse.ok) {
-    return (<div>コンテナ名取得中...</div>);
-  }
-  const containerNames = containersResponse.data;
-
-  // 並列フェッチ。recv + send × N コンテナを全部同時に発射する。
-  // core は接続ごとにスレッドを起こして並列に処理する
-  // (同時 16 本まで。超えた分は断られず、枠が空くまで core 側で待つ)。
-  const [recvs, sends] = await Promise.all([
-    Promise.all(containerNames.map((name) => fetchNetStatus(name, 'recv'))),
-    Promise.all(containerNames.map((name) => fetchNetStatus(name, 'send'))),
-  ]);
+  // 全コンテナ分の recv と send を 1 リクエストで取る
+  const response = await fetchUsages('net');
+  if (!response.ok) return (<div>Net 取得中...</div>);
+  const usages = response.data;
 
   const datasets: AppDataset[] = [];
-  for (const [i, containerName] of containerNames.entries()) {
+  for (const [i, containerName] of sortedContainerNames(usages).entries()) {
     const border = borderColorFor(i);
     const bg = backgroundColorFor(i);
+    const { recv, send } = usages[containerName];
 
-    const responseRecv = recvs[i];
-    if (!responseRecv.ok) return (<div>Net recv 取得中...</div>);
     datasets.push({
       containerName,
       label: `${containerName} recv`,
-      data: responseRecv.data,
+      data: toPoints(recv),
       borderColor: border,
       backgroundColor: bg,
       borderDash: [1, 0],
     });
-
-    const responseSend = sends[i];
-    if (!responseSend.ok) return (<div>Net send 取得中...</div>);
     datasets.push({
       containerName,
       label: `${containerName} send`,
-      data: responseSend.data,
+      data: toPoints(send),
       borderColor: border,
       backgroundColor: bg,
       borderDash: [5, 5],
