@@ -62,7 +62,8 @@ pnpm audit       # 既知の脆弱性の確認
 `API_URL` が無い場合は `http://localhost:7878` にフォールバックする（`next/src/lib/fetchers.ts`）。
 
 core 単体は `core/` で `cargo build` / `cargo run` できる。カレントディレクトリの `./log/log_daily` を
-読み書きし、`/var/run/docker.sock` を読む。⚠ 自動テストは無い（`cargo test` は 0 件）。
+読み書きし、`/var/run/docker.sock` を読む。自動テストは `cargo test` で、現状は server
+（`core/src/server.rs`）の分だけがある。🔒 テストで `7878` 番を bind しない（`127.0.0.1:0` を使う）。
 
 ### 個人 override
 
