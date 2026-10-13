@@ -291,17 +291,6 @@ impl UsageCache {
         self.map.get(container_name)
     }
 
-    /// downsample が1系列につき返す点数。知らないコンテナ名なら 0 を返します
-    pub fn downsampled_len(
-        &self,
-        container_name: &str,
-        downsample_option: &DownsampleOption,
-    ) -> usize {
-        let n = self.map.get(container_name).map_or(0, |points| points.len());
-        let nsample = downsample_option.nsample;
-        if nsample >= n || nsample < 3 { n } else { nsample }
-    }
-
     /// 1コンテナ・1系列を、最大 nsample 点に間引いて返します
     /// 知らないコンテナ名なら None を返します
     ///

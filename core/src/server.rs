@@ -119,20 +119,8 @@ struct BodyReservation {
     bytes: usize,
 }
 
-impl BodyReservation {
-    /// 取った枠を、実際に確保した大きさに合わせ直します。待ちません
-    /// (見積もりと実際の本文の大きさがずれても、数えている量を実態に揃えるため)
-    fn resize(&mut self, bytes: usize) {
-        let mut used = self.budget.used.lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *used = used.saturating_sub(self.bytes).saturating_add(bytes);
-        let shrunk = bytes < self.bytes;
-        self.bytes = bytes;
-        if shrunk {
-            self.budget.released.notify_all();
-        }
-    }
-}
+// 取った枠の大きさは変えられない（増やす操作を持たせない）
+// 枠を使う側は、取った大きさを超えない本文しか作らないこと
 
 impl Drop for BodyReservation {
     fn drop(&mut self) {
@@ -241,119 +229,159 @@ fn container_names_json(cache: &log_cache::UsageCache) -> String {
     format!("[{}]", data)
 }
 
-/// /usages/{kind} の1点が本文に占めるバイト数の見積もり
-/// 時刻（13桁）と値（小数2桁。大きめに見て12文字）と、それぞれの区切り
-const USAGES_BYTES_PER_POINT: usize = 28;
+/// 枠を取り直して本文を組み立てる回数の上限
+/// (枠を待つ間にキャッシュが伸びると取り直す。それが続いたら500にして終わる)
+const MAX_BULK_BUILD_ATTEMPTS: usize = 8;
+
+/// 書き込まれたバイト数だけを数える書き出し先
+struct ByteCounter(usize);
+
+impl std::fmt::Write for ByteCounter {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0 += s.len();
+        Ok(())
+    }
+}
+
+/// 決めた長さを超える書き込みを受け付けない String
+///
+/// 最初に limit バイトを確保し、それを超える書き込みは失敗させます
+/// 確保した領域が伸びることはありません
+struct CappedString {
+    out: String,
+    limit: usize,
+}
+
+impl CappedString {
+    fn new(limit: usize) -> Self {
+        CappedString { out: String::with_capacity(limit), limit }
+    }
+}
+
+impl std::fmt::Write for CappedString {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        if s.len() > self.limit - self.out.len() {
+            return Err(std::fmt::Error);
+        }
+        self.out.push_str(s);
+        Ok(())
+    }
+}
 
 /// jsonの文字列として書き出します（引用符つき）
 /// Dockerのコンテナ名は英数字と _ . - だけだが、ログから復元した名前も通るので
 /// 本文全体が壊れないようエスケープする
-fn push_json_string(out: &mut String, value: &str) {
-    use std::fmt::Write as _;
-
-    out.push('"');
+fn write_json_string<W: std::fmt::Write>(
+    out: &mut W,
+    value: &str,
+) -> std::fmt::Result {
+    out.write_char('"')?;
     for c in value.chars() {
         match c {
-            '"' => out.push_str(r#"\""#),
-            '\\' => out.push_str(r"\\"),
-            c if (c as u32) < 0x20 => {
-                // String への書き込みは失敗しない
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
+            '"' => out.write_str(r#"\""#)?,
+            '\\' => out.write_str(r"\\")?,
+            c if (c as u32) < 0x20 => write!(out, "\\u{:04x}", c as u32)?,
+            c => out.write_char(c)?,
         }
     }
-    out.push('"');
+    out.write_char('"')
 }
 
-/// usages_json の本文の長さの見積もり（最初に確保する大きさ）
-fn usages_json_capacity(
-    cache: &log_cache::UsageCache,
-    names: &[&String],
-    nseries: usize,
-    option: &log_cache::DownsampleOption,
-) -> usize {
-    2 + names.iter()
-        .map(|name| {
-            let per_series = 32
-                + cache.downsampled_len(name, option) * USAGES_BYTES_PER_POINT;
-            name.len() + 8 + nseries * per_series
-        })
-        .sum::<usize>()
-}
-
-/// 全コンテナ分の系列を、種別ごとに1つのjsonオブジェクトにします
+/// 全コンテナ分の系列を、種別ごとに1つのjsonオブジェクトとして書き出します
 ///
 /// 形は コンテナ名 → 系列名 → { "t": [ミリ秒, ...], "v": [値, ...] } です
 /// コンテナ名はアルファベット順に並べます
 /// 間引きは系列ごとに独立して行うので、同じコンテナでも系列によって t が変わります
-/// 本文は1つの String に直接書き出します（確保が最初の1回で済むように見積もる）
-fn usages_json(cache: &log_cache::UsageCache, kind: log_cache::UsageKind) -> String {
-    use std::fmt::Write as _;
-
+/// 書き出し先を差し替えられるので、長さだけを数えることも、本文を作ることもできます
+/// (同じキャッシュに対しては、どちらも同じバイト列になる)
+fn write_usages_json<W: std::fmt::Write>(
+    out: &mut W,
+    cache: &log_cache::UsageCache,
+    kind: log_cache::UsageKind,
+) -> std::fmt::Result {
     let option = log_cache::DownsampleOption::default();
-    let names = cache.container_names();
-    let series_list = kind.series();
 
-    let mut out = String::with_capacity(
-        usages_json_capacity(cache, &names, series_list.len(), &option)
-    );
-
-    out.push('{');
-    for (i, name) in names.iter().enumerate() {
-        if i > 0 { out.push(','); }
-        push_json_string(&mut out, name);
-        out.push_str(":{");
-        for (j, (key, series)) in series_list.iter().enumerate() {
+    out.write_char('{')?;
+    for (i, name) in cache.container_names().iter().enumerate() {
+        if i > 0 { out.write_char(',')?; }
+        write_json_string(out, name)?;
+        out.write_str(":{")?;
+        for (j, (key, series)) in kind.series().iter().enumerate() {
             // 名前は直前に一覧から取ったものなので、必ず見つかる
             let points = cache.downsample(name, &option, *series)
                 .unwrap_or_default();
-            if j > 0 { out.push(','); }
-            // String への書き込みは失敗しない
-            let _ = write!(out, "\"{}\":{{\"t\":[", key);
+            if j > 0 { out.write_char(',')?; }
+            write!(out, "\"{}\":{{\"t\":[", key)?;
             for (k, point) in points.iter().enumerate() {
-                if k > 0 { out.push(','); }
-                let _ = write!(out, "{}", point.time_ms);
+                if k > 0 { out.write_char(',')?; }
+                write!(out, "{}", point.time_ms)?;
             }
-            out.push_str("],\"v\":[");
+            out.write_str("],\"v\":[")?;
             for (k, point) in points.iter().enumerate() {
-                if k > 0 { out.push(','); }
+                if k > 0 { out.write_char(',')?; }
                 match series.raw_value(point) {
                     // NaN や無限大はjsonに書けない。1つで本文全体が壊れるので欠損にする
-                    Some(v) if v.is_finite() => { let _ = write!(out, "{:.2}", v); }
-                    _ => out.push_str("null"),
+                    Some(v) if v.is_finite() => write!(out, "{:.2}", v)?,
+                    _ => out.write_str("null")?,
                 }
             }
-            out.push_str("]}");
+            out.write_str("]}")?;
         }
-        out.push('}');
+        out.write_char('}')?;
     }
-    out.push('}');
+    out.write_char('}')
+}
 
-    out
+/// /usages/{kind} の本文の正確な長さ（バイト数）。本文は作りません
+fn usages_json_len(
+    cache: &log_cache::UsageCache,
+    kind: log_cache::UsageKind,
+) -> usize {
+    let mut counter = ByteCounter(0);
+    // ByteCounter への書き込みは失敗しない
+    let _ = write_usages_json(&mut counter, cache, kind);
+
+    counter.0
+}
+
+/// /usages/{kind} の本文を、limit バイトちょうどの領域に組み立てます
+/// limit に収まらなければ None を返します（領域は伸ばさずに破棄する）
+fn usages_json_within(
+    cache: &log_cache::UsageCache,
+    kind: log_cache::UsageKind,
+    limit: usize,
+) -> Option<String> {
+    let mut capped = CappedString::new(limit);
+    write_usages_json(&mut capped, cache, kind).ok()?;
+
+    Some(capped.out)
 }
 
 /// /usages/{kind} の応答を、本文の枠を取ってから組み立てます
 ///
-/// estimate は呼び出し側がlockを持っている間に求めた、本文の大きさの見積もりです
+/// needed は呼び出し側がlockを持っている間に数えた、本文の正確な長さです
+/// その長さの枠を取り、その長さを超えない領域にだけ本文を書きます
 /// 枠を待つ間はキャッシュのlockを持ちません（loggerのwrite lockを待たせないため）
+/// 待つ間にキャッシュが変わって本文が長くなっていたら、領域は伸ばさず、
+/// 枠を返してから、数え直した長さで取り直します
 /// 枠は応答に持たせ、送り終えて破棄されるまで返しません
 fn usages_response(
     log_cache: &log_cache::SharedUsageCache,
     kind: log_cache::UsageKind,
-    estimate: usize,
+    mut needed: usize,
     budget: &'static BodyBudget,
 ) -> Result<Response, error::Error> {
-    let mut reservation = budget.reserve(estimate);
-    let body = {
+    for _ in 0..MAX_BULK_BUILD_ATTEMPTS {
+        let reservation = budget.reserve(needed);
         let cache = log_cache.read().map_err(|e| e.to_string())?;
-        usages_json(&cache, kind)
-    };
-    // 待っている間にキャッシュが伸びた場合や、見積もりより桁の多い値があった場合は、
-    // 実際に確保した大きさで数え直す
-    reservation.resize(body.capacity());
+        if let Some(body) = usages_json_within(&cache, kind, needed) {
+            return Ok(Response::reserved_json(body, reservation));
+        }
+        needed = usages_json_len(&cache, kind);
+        // ここで cache（lock）と reservation（枠）を手放してから、取り直す
+    }
 
-    Ok(Response::reserved_json(body, reservation))
+    Err("the cache kept growing while waiting for the body budget".into())
 }
 
 /// パスから応答を決めます。ストリームには触りません
@@ -386,15 +414,10 @@ fn route(
             series_json(&cache, name, log_cache::Series::NetSend),
         ["usages", kind] => match log_cache::UsageKind::from_path(kind) {
             Some(kind) => {
-                let estimate = usages_json_capacity(
-                    &cache,
-                    &cache.container_names(),
-                    kind.series().len(),
-                    &log_cache::DownsampleOption::default(),
-                );
+                let needed = usages_json_len(&cache, kind);
                 // 本文の枠を待つことがあるので、lockを手放してから取りにいく
                 drop(cache);
-                return usages_response(log_cache, kind, estimate, &BULK_BODY_BUDGET);
+                return usages_response(log_cache, kind, needed, &BULK_BODY_BUDGET);
             }
             None => None,
         },
@@ -1047,15 +1070,53 @@ mod tests {
     }
 
     #[test]
-    fn usages_body_fits_in_the_first_allocation() {
-        // 24時間分 × 8コンテナでも、最初に確保した大きさに収まる
+    fn usages_body_is_built_in_exactly_its_counted_length() {
+        // 数えた長さは本文の長さと一致し、領域はその長さで1回だけ確保される
+        let cache = full_cache(8);
+        let lock = cache.read().unwrap();
+        for kind in ["cpu", "memory", "io", "net"] {
+            let kind = crate::log_cache::UsageKind::from_path(kind).unwrap();
+            let len = usages_json_len(&lock, kind);
+            let body = usages_json_within(&lock, kind, len).unwrap();
+            assert_eq!(body.len(), len);
+            assert_eq!(body.capacity(), len);
+            json::parse(&body).unwrap();
+            // 1バイトでも足りなければ作らない。余っていても伸ばさない
+            assert!(usages_json_within(&lock, kind, len - 1).is_none());
+            assert!(usages_json_within(&lock, kind, 0).is_none());
+            let roomy = usages_json_within(&lock, kind, len + 100).unwrap();
+            assert_eq!(roomy.len(), len);
+            assert_eq!(roomy.capacity(), len + 100);
+        }
+    }
+
+    #[test]
+    fn capped_string_never_grows() {
+        use std::fmt::Write as _;
+
+        let mut capped = CappedString::new(5);
+        assert!(capped.write_str("abc").is_ok());
+        // 収まらない書き込みは、一部も書かずに失敗する
+        assert!(capped.write_str("def").is_err());
+        assert!(write!(capped, "{:.2}", f32::MAX).is_err());
+        assert!(capped.write_char('あ').is_err());
+        assert!(capped.write_str("de").is_ok());
+        assert!(capped.write_str("f").is_err());
+        assert!(capped.write_str("").is_ok());
+        assert_eq!(capped.out, "abcde");
+        assert_eq!(capped.out.capacity(), 5);
+    }
+
+    /// 本文が長くなる値と名前を持つキャッシュ
+    /// 値は f32 の最大・最小（小数2桁で42〜43文字）、名前はエスケープで6倍になる
+    fn widest_cache(ncontainers: usize, npoints: usize) -> SharedUsageCache {
         let cache = create_shared_cache();
         {
             let mut lock = cache.write().unwrap();
-            for c in 0..8 {
-                let name = format!("container-{}", c);
-                for i in 0..crate::log_cache::MAX_LOG_LENGTH {
-                    let v = (i % 13) as f32 * 123.45;
+            for c in 0..ncontainers {
+                let name = format!("{}{}", "\u{1}\"\\".repeat(100), c);
+                for i in 0..npoints {
+                    let v = if i % 2 == 0 { f32::MAX } else { f32::MIN };
                     assert!(lock.insert(&name, UsagePoint {
                         time_ms: time_ms_at(i),
                         cpu: Some(v),
@@ -1063,22 +1124,33 @@ mod tests {
                         read_kbps: Some(v),
                         write_kbps: Some(v),
                         recv_kbps: Some(v),
-                        send_kbps: None,
+                        send_kbps: Some(v),
                     }));
                 }
             }
         }
+        cache
+    }
+
+    #[test]
+    fn widest_values_and_names_are_counted_exactly() {
+        assert_eq!(format!("{:.2}", f32::MAX).len(), 42);
+        assert_eq!(format!("{:.2}", f32::MIN).len(), 43);
+
+        let cache = widest_cache(2, 600);
         let lock = cache.read().unwrap();
-        let option = crate::log_cache::DownsampleOption::default();
-        let names = lock.container_names();
-        for kind in ["cpu", "memory", "io", "net"] {
-            let kind = crate::log_cache::UsageKind::from_path(kind).unwrap();
-            let body = usages_json(&lock, kind);
-            let estimated =
-                usages_json_capacity(&lock, &names, kind.series().len(), &option);
-            assert!(body.len() <= estimated, "{} > {}", body.len(), estimated);
-            assert_eq!(body.capacity(), estimated);
-            json::parse(&body).unwrap();
+        let kind = crate::log_cache::UsageKind::Io;
+        let len = usages_json_len(&lock, kind);
+        // 1点あたり 13桁 + 42〜43文字 + 区切り2。通常の値（約20バイト）の3倍近い
+        assert!(len > 2 * 2 * 512 * 57, "{}", len);
+        let body = usages_json_within(&lock, kind, len).unwrap();
+        assert_eq!(body.len(), len);
+        assert_eq!(body.capacity(), len);
+        // 名前は制御文字・引用符・バックスラッシュをエスケープしたうえで、元に戻せる
+        let parsed = json::parse(&body).unwrap();
+        assert_eq!(parsed.len(), 2);
+        for (name, _) in parsed.entries() {
+            assert!(name.starts_with("\u{1}\"\\\u{1}\"\\"), "{:?}", name);
         }
     }
 
@@ -1117,14 +1189,8 @@ mod tests {
         cache
     }
 
-    fn io_estimate(cache: &SharedUsageCache) -> usize {
-        let lock = cache.read().unwrap();
-        usages_json_capacity(
-            &lock,
-            &lock.container_names(),
-            2,
-            &crate::log_cache::DownsampleOption::default(),
-        )
+    fn io_len(cache: &SharedUsageCache) -> usize {
+        usages_json_len(&cache.read().unwrap(), crate::log_cache::UsageKind::Io)
     }
 
     #[test]
@@ -1141,18 +1207,6 @@ mod tests {
         assert_eq!(used_bytes(budget), 40);
 
         drop(first);
-        assert_eq!(used_bytes(budget), 0);
-    }
-
-    #[test]
-    fn body_budget_resize_tracks_the_real_size() {
-        let budget = leaked_budget(100);
-        let mut reservation = budget.reserve(40);
-        reservation.resize(70);
-        assert_eq!(used_bytes(budget), 70);
-        reservation.resize(10);
-        assert_eq!(used_bytes(budget), 10);
-        drop(reservation);
         assert_eq!(used_bytes(budget), 0);
     }
 
@@ -1203,28 +1257,40 @@ mod tests {
     }
 
     #[test]
-    fn usages_response_holds_its_body_size_until_dropped() {
+    fn usages_response_holds_exactly_its_body_size_until_dropped() {
         let cache = cache_with(2000, time_ms_at);
         let budget = leaked_budget(MAX_BULK_BODY_BYTES);
         let kind = crate::log_cache::UsageKind::Io;
+        let len = io_len(&cache);
 
-        let response = usages_response(&cache, kind, io_estimate(&cache), budget).unwrap();
+        let response = usages_response(&cache, kind, len, budget).unwrap();
         assert_eq!(response.status, StatusCode::Ok);
-        // 数えているのは、実際に確保した本文の大きさ
-        assert_eq!(used_bytes(budget), response.body.capacity());
-        assert!(response.body.len() <= used_bytes(budget));
+        // 取った枠・確保した領域・本文の長さが一致する
+        assert_eq!(response.body.len(), len);
+        assert_eq!(response.body.capacity(), len);
+        assert_eq!(used_bytes(budget), len);
 
         // 応答を書き出しても、破棄するまでは枠を持ち続ける
         let mut output = Vec::new();
         write_response(&mut output, &response).unwrap();
-        assert!(used_bytes(budget) > 0);
+        assert_eq!(used_bytes(budget), len);
         drop(response);
         assert_eq!(used_bytes(budget), 0);
 
-        // 見積もりが外れていても、実際の大きさで数え直す
-        let response = usages_response(&cache, kind, 1, budget).unwrap();
-        assert_eq!(used_bytes(budget), response.body.capacity());
-        assert!(used_bytes(budget) >= response.body.len());
+        // 数えたあとでキャッシュが伸びていた場合（渡された長さでは足りない）は、
+        // 小さい枠のまま書かずに、数え直した長さで枠を取り直す
+        for stale in [0, 1, len - 1] {
+            let response = usages_response(&cache, kind, stale, budget).unwrap();
+            assert_eq!(response.body.capacity(), len);
+            assert_eq!(used_bytes(budget), len);
+            drop(response);
+            assert_eq!(used_bytes(budget), 0);
+        }
+        // 縮んでいた場合は、取った枠の中に収める（枠は取った大きさのまま）
+        let response = usages_response(&cache, kind, len + 10, budget).unwrap();
+        assert_eq!(response.body.len(), len);
+        assert_eq!(response.body.capacity(), len + 10);
+        assert_eq!(used_bytes(budget), len + 10);
         drop(response);
 
         // 失敗したときは枠を残さない
@@ -1233,32 +1299,37 @@ mod tests {
         assert_eq!(used_bytes(budget), 0);
     }
 
-    #[test]
-    fn concurrent_bulk_bodies_stay_within_the_budget() {
+    /// 同じ本文を nthreads 本並列に要求し、
+    /// (枠の使用量の最大, 保持した領域の合計の最大) を返す
+    /// stale_needed を渡すと、半数はその長さ（数えたあとで伸びた想定）で要求する
+    fn request_bulk_bodies_in_parallel(
+        cache: &SharedUsageCache,
+        budget: &'static BodyBudget,
+        nthreads: usize,
+        stale_needed: Option<usize>,
+    ) -> (usize, usize) {
         use std::sync::atomic::{ AtomicUsize, Ordering };
 
-        // 24時間分 × 40コンテナ。io の本文は1本で約1MBになる
-        let cache = full_cache(40);
-        let estimate = io_estimate(&cache);
-        assert!(estimate > 1024 * 1024, "{}", estimate);
-        // 同時接続の上限まで並ぶと、枠が無ければ上限を大きく超える
-        assert!(estimate * MAX_CONNECTIONS > MAX_BULK_BODY_BYTES * 2);
-
-        let budget = leaked_budget(MAX_BULK_BODY_BYTES);
+        let len = io_len(cache);
         let peak_used = Arc::new(AtomicUsize::new(0));
         let held_bytes = Arc::new(AtomicUsize::new(0));
         let peak_held = Arc::new(AtomicUsize::new(0));
 
-        let workers: Vec<_> = (0..MAX_CONNECTIONS * 2).map(|_| {
-            let cache = Arc::clone(&cache);
+        let workers: Vec<_> = (0..nthreads).map(|i| {
+            let cache = Arc::clone(cache);
             let peak_used = Arc::clone(&peak_used);
             let held_bytes = Arc::clone(&held_bytes);
             let peak_held = Arc::clone(&peak_held);
+            let needed = match stale_needed {
+                Some(stale) if i % 2 == 0 => stale,
+                _ => len,
+            };
             std::thread::spawn(move || {
                 let kind = crate::log_cache::UsageKind::Io;
-                let response = usages_response(&cache, kind, estimate, budget).unwrap();
-                // 実際に保持している本文の合計を、枠とは別に数える
+                let response = usages_response(&cache, kind, needed, budget).unwrap();
+                // 実際に確保されている領域の合計を、枠とは別に数える
                 let capacity = response.body.capacity();
+                assert_eq!(capacity, len);
                 let now = held_bytes.fetch_add(capacity, Ordering::SeqCst) + capacity;
                 peak_held.fetch_max(now, Ordering::SeqCst);
                 peak_used.fetch_max(used_bytes(budget), Ordering::SeqCst);
@@ -1269,12 +1340,60 @@ mod tests {
             })
         }).collect();
         for worker in workers { worker.join().unwrap(); }
-
-        assert!(peak_used.load(Ordering::SeqCst) <= MAX_BULK_BODY_BYTES);
-        assert!(peak_held.load(Ordering::SeqCst) <= MAX_BULK_BODY_BYTES);
-        // 1本ずつに絞っているわけではない（収まる範囲では並行に処理する）
-        assert!(peak_held.load(Ordering::SeqCst) >= estimate * 2);
         assert_eq!(used_bytes(budget), 0);
+
+        (peak_used.load(Ordering::SeqCst), peak_held.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn concurrent_bulk_bodies_stay_within_the_budget() {
+        // 24時間分 × 40コンテナ。io の本文は1本で 1MB 近くになる
+        let cache = full_cache(40);
+        let len = io_len(&cache);
+        assert!(len > 800_000, "{}", len);
+        // 同時接続の上限まで並ぶと、枠が無ければ上限を超える
+        assert!(len * MAX_CONNECTIONS > MAX_BULK_BODY_BYTES);
+
+        let budget = leaked_budget(MAX_BULK_BODY_BYTES);
+        let (peak_used, peak_held) = request_bulk_bodies_in_parallel(
+            &cache, budget, MAX_CONNECTIONS * 2, None,
+        );
+        assert!(peak_used <= MAX_BULK_BODY_BYTES, "{}", peak_used);
+        assert!(peak_held <= MAX_BULK_BODY_BYTES, "{}", peak_held);
+        // 1本ずつに絞っているわけではない（収まる範囲では並行に処理する）
+        assert!(peak_held >= len * 2, "{}", peak_held);
+    }
+
+    #[test]
+    fn widest_bodies_stay_within_the_budget_even_when_the_count_is_stale() {
+        // 桁数の多い値と、エスケープで伸びる長い名前。通常の値の3倍近い本文になる
+        let cache = widest_cache(8, 2000);
+        let len = io_len(&cache);
+        assert!(len > 8 * 2 * 512 * 57, "{}", len);
+
+        // 3本と半分が入る枠。半数は、実際の約 1/3 の長さ（通常の値なら足りた長さ）で要求する
+        let max = len * 3 + len / 2;
+        let budget = leaked_budget(max);
+        let (peak_used, peak_held) = request_bulk_bodies_in_parallel(
+            &cache, budget, MAX_CONNECTIONS * 2, Some(len / 3),
+        );
+        assert!(peak_used <= max, "{} > {}", peak_used, max);
+        assert!(peak_held <= len * 3, "{} > {}", peak_held, len * 3);
+        assert!(peak_held >= len * 2, "{}", peak_held);
+    }
+
+    #[test]
+    fn oversized_body_is_served_only_while_nothing_else_is_held() {
+        // 1本で上限を超える本文は、ほかに保持中の本文が無いときに1本ずつ通る
+        let cache = widest_cache(2, 600);
+        let len = io_len(&cache);
+        let max = len / 2;
+        let budget = leaked_budget(max);
+        let (peak_used, peak_held) = request_bulk_bodies_in_parallel(
+            &cache, budget, 8, Some(len / 3),
+        );
+        assert_eq!(peak_held, len);
+        assert!(peak_used <= len, "{} > {}", peak_used, len);
     }
 
     #[test]
@@ -1330,7 +1449,7 @@ mod tests {
     #[test]
     fn usages_escape_names_and_drop_non_finite_values() {
         let mut escaped = String::new();
-        push_json_string(&mut escaped, "a\"b\\c\nd");
+        write_json_string(&mut escaped, "a\"b\\c\nd").unwrap();
         assert_eq!(escaped, r#""a\"b\\c\u000ad""#);
 
         let cache = create_shared_cache();
