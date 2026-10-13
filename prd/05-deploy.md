@@ -51,6 +51,14 @@
   `core/Dockerfile.prod`（release ビルドを distroless に載せる）にある。
   ⚠ リポジトリ内の `compose.yml` は dev 用の `core/Dockerfile` を指したままで、
   本番が実際にどの定義で動いているかはリポジトリからは分からない（要確認）。
+- **web が新しい API を必要とする変更は、core の配置を先に行う。** web は `main` への
+  マージで自動的に配置されるが、core は手で更新するまで古いままである。順序を逆にすると、
+  web が叩く経路が本番の core に無く、チャートが表示されない。
+  - web は core の `/usages/*` を必要とする（[03](./03-web.md) §データ取得）。
+    この経路を持つ core を先に配置してから、web を配置する。
+  - core は以前の経路（コンテナ別の API）を残しているので、core を先に更新しても
+    以前の web は動き続ける（[02](./02-core.md) §REST API（現行））。
+  - このため、core の変更と、それを必要とする web の変更は、別々にマージできる単位に分ける。
 - **nginx は core への中継だけを行う**（`nginx.conf`）。web は Vercel にあるので、
   nginx から Next.js へは中継しない。`nginx.conf` は 80 番で待ち受けるだけで TLS を扱わない。
   TLS の終端は前段で行う想定である（要確認）。

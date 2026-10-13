@@ -36,8 +36,7 @@ Docker Engine API を Unix ソケット越しに自前の HTTP で叩き、REST 
 - **実装済み**: 10 秒間隔の収集 / JSONL ログ / メモリ上の 24 時間キャッシュ / ダウンサンプリング /
   全コンテナ分を 1 回で返す **bulk endpoint** とコンテナ別の REST API（[02](./02-core.md)） /
   4 種のチャート / 凡例兼フィルタ。
-- **計画中**: **web の取得を bulk endpoint に切り替える**こと（[03](./03-web.md)）、
-  **Cloudflare Access による閲覧と API の制限**（[04](./04-access-and-privacy.md)）。
+- **計画中**: **Cloudflare Access による閲覧と API の制限**（[04](./04-access-and-privacy.md)）。
 - **検討中**: 週・月単位へのログ要約。約束はしない。
 
 ## アーキ概観
