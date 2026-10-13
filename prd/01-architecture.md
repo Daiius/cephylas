@@ -52,11 +52,12 @@ Cloudflare Access の導入で実現する**計画中**の項目である（[04]
 cephylas/
 ├── core/                 # Rust（pnpm workspace の外）
 ├── next/                 # Next.js（workspace 唯一の TS package、name は "web"）
-├── log/                  # log_daily の置き場。dev のサンプルもここ
+├── log/                  # log_daily の置き場
 ├── benchmark/            # core の HTTP 実装を比べる負荷試験（workspace の外）
 ├── prd/                  # この PRD
 ├── nginx.conf            # 本番 VPS の nginx 設定（dev では使わない）
-├── compose.yml           # dev（core のみ）
+├── compose.yml           # core の定義（dev と本番の両方が読む）
+├── compose.dev.yml       # dev 用の上書き（メモリ制限の緩和、Docker ソケット）
 ├── compose.prod.yml      # 本番用の上書き（nginx を追加）
 ├── AGENTS.md             # 開発ガイド（コーディングエージェント共通）
 └── CLAUDE.md             # AGENTS.md を読むだけの入口

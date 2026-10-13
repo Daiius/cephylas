@@ -51,7 +51,7 @@ Docker container のリソース使用率を記録・可視化する Web アプ�
 pnpm dev         # core を docker 起動 + Next.js を host で起動
 pnpm dev:core    # core だけ起動
 pnpm dev:web     # Next.js だけ起動 (host)
-pnpm down        # docker compose down
+pnpm down        # dev の core を止める
 
 pnpm typecheck   # 全 workspace の tsc --noEmit
 pnpm build       # 全 workspace の build
@@ -67,20 +67,20 @@ core 単体は `core/` で `cargo build` / `cargo run` できる。カレント�
 🔒 テストで `./log/` に書き込まない。`/var/run/docker.sock` に依存するテストを書かない
 （ソケットやファイルを使う処理は、文字列や `BufRead` を受け取る関数に切り出して試す）。
 
-### 個人 override
+### dev 用の compose
 
-`compose.override.yml`（gitignore 対象）で開発機ごとの調整を入れる。**新しい開発機では作り直す必要がある。**
+`pnpm dev` / `pnpm dev:core` / `pnpm down` は、`compose.yml` に `compose.dev.yml` を重ねて読む。
+`compose.dev.yml` が、メモリ制限の緩和（2GB）と Docker ソケットのマウントを持つ。
 
-```yaml
-services:
-  cephylas:
-    deploy:
-      resources:
-        limits:
-          memory: 2G   # 本番 50M だと cargo build が SIGKILL されるので緩和
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro   # rootless Docker ではソケットのパスを合わせる
-```
+- rootless Docker など、ソケットの場所が違う環境では `DOCKER_SOCK` を指定する。
+
+  ```bash
+  DOCKER_SOCK=/run/user/$(id -u)/docker.sock pnpm dev
+  ```
+
+- 🔒 **dev の都合を `compose.yml` に入れない**（本番も読む）。dev だけに要る設定は `compose.dev.yml` に置く。
+- ⚠ dev の core は追跡対象の `log/log_daily` に追記する。作業ツリーに差分が出るが、**コミットしない**
+  （`git checkout -- log/log_daily` で戻せる）。
 
 ## 文書の置き場
 
