@@ -360,12 +360,17 @@ fn reshape_json(
     }
 }
 
+/// 1 tick 分の収集結果
+struct Collected {
+    /// その tick のコンテナ一覧に載っていた名前（統計を採れなかったものも含む）
+    listed: Vec<String>,
+    /// 統計を採れたコンテナ
+    stats: HashMap<String, Stats>,
+}
+
 fn get_containers_stats<T: AsRef<std::path::Path>>(
     socket_path: T,
-) -> Result<
-    HashMap<String, Stats>,
-    error::Error
-> {
+) -> Result<Collected, error::Error> {
     // 一覧を取れなければ、その tick は失敗として扱う
     let container_names = get_container_names(&socket_path)?;
 
@@ -377,24 +382,27 @@ fn get_containers_stats<T: AsRef<std::path::Path>>(
     ))
 }
 
-/// コンテナごとに統計を取り、取れたものだけを集めます
+/// コンテナごとに統計を取り、採れたものだけを集めます
 ///
-/// 統計の取得に失敗したコンテナと、時刻が ZERO_TIME のコンテナは、
-/// そのコンテナだけを飛ばします（他のコンテナの収集は続ける）
+/// 次のコンテナは、そのコンテナだけを飛ばします（他のコンテナの収集は続ける）
+/// - 統計の取得に失敗した
+/// - 時刻が ZERO_TIME である、または時刻を解釈できない
 fn collect_stats<F: FnMut(&str) -> Result<Stats, error::Error>>(
     container_names: Vec<String>,
     mut fetch: F,
-) -> HashMap<String, Stats> {
+) -> Collected {
     let mut stats_map: HashMap<String, Stats>
          = HashMap::new();
-    for container_name in container_names {
-        match fetch(&container_name) {
+    for container_name in &container_names {
+        match fetch(container_name) {
             Ok(stats) => {
-                if stats.time.as_deref() == Some(ZERO_TIME) {
-                    // it's terrible, docker api sometimes returns unix epoc ZERO.
-                    continue;
+                // it's terrible, docker api sometimes returns unix epoc ZERO.
+                let usable = stats.time.as_deref()
+                    .and_then(valid_time_millis)
+                    .is_some();
+                if usable {
+                    stats_map.insert(container_name.clone(), stats);
                 }
-                stats_map.insert(container_name, stats);
             },
             Err(e) => {
                 eprintln!(
@@ -404,7 +412,50 @@ fn collect_stats<F: FnMut(&str) -> Result<Stats, error::Error>>(
         }
     }
 
-    stats_map
+    Collected { listed: container_names, stats: stats_map }
+}
+
+/// 次の tick に向けて、前回の統計を更新します
+///
+/// - 統計を採れたコンテナは、今回の値に置き換える
+/// - 一覧に載っているが採れなかったコンテナは、前回の値をそのまま残す
+///   (次に採れた tick で、実際の経過時間を使って1点を記録できる)
+/// - 一覧に載っていないコンテナは消す（止まったコンテナの値を持ち続けない）
+fn carry_over_stats(
+    prev_stats: &mut HashMap<String, Stats>,
+    collected: Collected,
+) {
+    prev_stats.retain(|name, _| collected.listed.contains(name));
+    prev_stats.extend(collected.stats);
+}
+
+/// 1 tick 分の処理: 算出 → ログへ追記 → キャッシュへ追加
+///
+/// 記録したら true、記録するものが無ければ false を返します
+/// 失敗した tick は何も記録せずにエラーを返します。呼び出し側は次の tick へ進みます
+/// - 収集（コンテナ一覧の取得）に失敗した場合、前回の統計は変えません
+/// - ログへの追記に失敗した場合、キャッシュにも入れません
+///   （ログとキャッシュの内容を揃えるため）。前回の統計は更新します
+fn run_tick<W: FnOnce(&str) -> Result<(), error::Error>>(
+    millis: u16,
+    collected: Result<Collected, error::Error>,
+    prev_stats: &mut HashMap<String, Stats>,
+    write_log: W,
+    log_cache: &log_cache::SharedUsageCache,
+) -> Result<bool, error::Error> {
+    let collected = collected?;
+
+    // 起動後の最初の tick は前回の統計が無いので、何も記録されない
+    let usages = calc_usages(millis, &collected.stats, prev_stats);
+    carry_over_stats(prev_stats, collected);
+    let Some(usages) = usages else { return Ok(false); };
+
+    write_log(&usages.to_string())?;
+    let mut lock = log_cache.write()
+        .expect("failed to get write lock for log_cache");
+    store_usages(&usages, &mut lock);
+
+    Ok(true)
 }
 
 fn get_now_as_millis() -> Result<u128, std::time::SystemTimeError> {
@@ -416,6 +467,9 @@ fn get_now_as_millis() -> Result<u128, std::time::SystemTimeError> {
 /// 記録に使える時刻なら、エポックからのミリ秒にして返します
 /// 解釈できない時刻と ZERO_TIME（エポックより前）は None にします
 fn valid_time_millis(time_str: &str) -> Option<i64> {
+    if time_str == ZERO_TIME {
+        return None;
+    }
     time::iso8601_to_millis(time_str).ok().filter(|millis| *millis > 0)
 }
 
@@ -640,30 +694,33 @@ pub fn log_json(
 
     let mut prev_stats: HashMap<String, Stats>
         = HashMap::new();
+    // ここから先の失敗では止まらない。その tick を飛ばして次へ進む
     loop {
-        let millis_to_wait = timing.saturating_sub(get_now_as_millis()?) as u64;
-        println!("waiting {} millis...", millis_to_wait);
+        let wait = match get_now_as_millis() {
+            Ok(now) => std::time::Duration::from_millis(
+                timing.saturating_sub(now) as u64
+            ),
+            Err(e) => {
+                eprintln!("logger: failed to get the current time: {}", e);
+                tick
+            },
+        };
+        println!("waiting {} millis...", wait.as_millis());
+        std::thread::sleep(wait);
 
-        std::thread::sleep(
-            std::time::Duration::from_millis(millis_to_wait)
-        );
-
-        let stats = get_containers_stats(&socket_path)?;
-
-        // 起動後の最初の tick は前回の統計が無いので、何も記録されない
-        let usages = calc_usages(
+        let result = run_tick(
             tick.as_millis() as u16,
-            &stats, &prev_stats,
+            get_containers_stats(socket_path),
+            &mut prev_stats,
+            |line| log_daily(DAILY_LOG_PATH, line),
+            log_cache,
         );
-        if let Some(usages) = usages {
-            log_daily(DAILY_LOG_PATH, usages.to_string())?;
-            let mut lock = log_cache.write()
-                .expect("failed to get write lock for log_cache");
-            store_usages(&usages, &mut lock);
+        if let Err(e) = result {
+            eprintln!("logger: tick skipped: {}", e);
         }
 
+        // 失敗した tick でも、次の tick の時刻は進める
         timing += tick.as_millis();
-        prev_stats = stats;
     }
 }
 
@@ -766,16 +823,39 @@ fn restore_from_reader<R: std::io::BufRead>(
 pub fn read_log(
     log_cache: &log_cache::SharedUsageCache
 ) -> Result<(), error::Error> {
+    read_log_from(DAILY_LOG_PATH, log_cache)
+}
+
+/// ログファイルを開きます。ファイルが無ければ None を返します
+fn open_log<P: AsRef<std::path::Path>>(
+    path: P,
+) -> Result<Option<std::fs::File>, error::Error> {
+    match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// ログファイルからキャッシュを復元します
+/// ファイルが無い場合は、復元する点が無いものとして成功で返します
+fn read_log_from<P: AsRef<std::path::Path>>(
+    path: P,
+    log_cache: &log_cache::SharedUsageCache,
+) -> Result<(), error::Error> {
 
     // 1コンテナに入るのは1行につき1点までなので、末尾の MAX_LOG_LENGTH 行で足りる
-    let nlines = check_nlines()?;
+    let Some(nlines) = check_nlines(&path)? else {
+        println!("log file does not exist. nothing to restore.");
+        return Ok(());
+    };
     let nlines_to_skip = nlines.saturating_sub(log_cache::MAX_LOG_LENGTH as u64);
 
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .create(false)
-        .write(false)
-        .open(DAILY_LOG_PATH)?;
+    // 数えたあとに消された場合も、無いものとして扱う
+    let Some(file) = open_log(&path)? else {
+        println!("log file does not exist. nothing to restore.");
+        return Ok(());
+    };
     let reader = std::io::BufReader::new(file);
 
     let summary = {
@@ -794,10 +874,11 @@ pub fn read_log(
 }
 
 
-fn check_nlines() -> Result<u64, error::Error> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .open(DAILY_LOG_PATH)?;
+/// ログファイルの行数を返します。ファイルが無ければ None を返します
+fn check_nlines<P: AsRef<std::path::Path>>(
+    path: P,
+) -> Result<Option<u64>, error::Error> {
+    let Some(file) = open_log(path)? else { return Ok(None); };
     let mut reader = std::io::BufReader::new(file);
     let mut nlines: u64 = 0;
     let mut buffer: Vec<u8> = Vec::new();
@@ -808,7 +889,7 @@ fn check_nlines() -> Result<u64, error::Error> {
         }
         nlines += 1;
     }
-    Ok(nlines)
+    Ok(Some(nlines))
 }
 
 #[cfg(test)]
@@ -907,24 +988,232 @@ mod tests {
 
     #[test]
     fn collection_skips_only_the_affected_container() {
-        let names: Vec<String> = ["a", "b", "c", "d", "e"]
+        let names: Vec<String> = ["a", "b", "c", "d", "e", "f"]
             .iter().map(|s| s.to_string()).collect();
         let mut asked: Vec<String> = Vec::new();
-        let stats = collect_stats(names, |name| {
+        let collected = collect_stats(names, |name| {
             asked.push(name.to_string());
             match name {
                 // ZERO_TIME を返すコンテナ
                 "b" => Ok(idle_stats(ZERO_TIME)),
                 // 統計の取得に失敗するコンテナ
                 "d" => Err("connection refused (expected in this test)".into()),
+                // 時刻を解釈できないコンテナ
+                "f" => Ok(idle_stats("not a time")),
                 _ => Ok(idle_stats("2026-01-01T00:00:10Z")),
             }
         });
         // 途中で打ち切らず、全コンテナに問い合わせる
-        assert_eq!(asked, vec!["a", "b", "c", "d", "e"]);
-        let mut collected: Vec<&String> = stats.keys().collect();
-        collected.sort();
-        assert_eq!(collected, vec!["a", "c", "e"]);
+        assert_eq!(asked, vec!["a", "b", "c", "d", "e", "f"]);
+        let mut usable: Vec<&String> = collected.stats.keys().collect();
+        usable.sort();
+        assert_eq!(usable, vec!["a", "c", "e"]);
+        // 一覧には、採れなかったコンテナも残る
+        assert_eq!(collected.listed, vec!["a", "b", "c", "d", "e", "f"]);
+    }
+
+    /// 1 tick 分の収集結果を作る。None は「一覧には載っているが採れなかった」
+    fn collected(entries: Vec<(&str, Option<Stats>)>) -> Collected {
+        let names: Vec<String> =
+            entries.iter().map(|(name, _)| name.to_string()).collect();
+        let mut entries: HashMap<String, Option<Stats>> = entries.into_iter()
+            .map(|(name, stats)| (name.to_string(), stats))
+            .collect();
+        collect_stats(names, |name| {
+            entries.remove(name).flatten()
+                .ok_or_else(|| "no stats (expected in this test)".into())
+        })
+    }
+
+    /// write だけが増えていく統計
+    fn written(read: &str, bytes: u64) -> Option<Stats> {
+        Some(stats_at(read, 0, 0, (0, bytes), (0, 0)))
+    }
+
+    /// run_tick を、ログの追記先をメモリに差し替えて呼ぶ
+    struct Logger {
+        prev_stats: HashMap<String, Stats>,
+        cache: log_cache::SharedUsageCache,
+        lines: Vec<String>,
+    }
+    impl Logger {
+        fn new() -> Self {
+            Logger {
+                prev_stats: HashMap::new(),
+                cache: create_shared_cache(),
+                lines: Vec::new(),
+            }
+        }
+        fn tick(
+            &mut self,
+            collected: Result<Collected, error::Error>,
+        ) -> Result<bool, error::Error> {
+            let lines = &mut self.lines;
+            run_tick(
+                TICK_MILLIS, collected, &mut self.prev_stats,
+                |line| { lines.push(line.to_string()); Ok(()) },
+                &self.cache,
+            )
+        }
+        fn writes(&self, name: &str) -> Vec<(String, Option<u32>)> {
+            self.cache.read().unwrap().get(name).unwrap().iter()
+                .map(|p| (time::millis_to_iso8601(p.time_ms), p.write_kbps))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn skipped_container_loses_one_point_and_resumes_with_real_elapsed_time() {
+        let mut logger = Logger::new();
+        // 起動後の最初の tick は記録しない
+        assert!(!logger.tick(Ok(collected(vec![
+            ("web", written("2026-01-01T00:00:00Z", 0)),
+            ("db", written("2026-01-01T00:00:00Z", 0)),
+        ]))).unwrap());
+        assert!(logger.tick(Ok(collected(vec![
+            ("web", written("2026-01-01T00:00:10Z", 1_000_000)),
+            ("db", written("2026-01-01T00:00:10Z", 1_000_000)),
+        ]))).unwrap());
+        // db は一覧に載っているが、統計を採れなかった
+        assert!(logger.tick(Ok(collected(vec![
+            ("web", written("2026-01-01T00:00:20Z", 2_000_000)),
+            ("db", None),
+        ]))).unwrap());
+        // 前回の値（10秒の時点）が残っている
+        assert_eq!(
+            logger.prev_stats["db"].time.as_deref(),
+            Some("2026-01-01T00:00:10Z"),
+        );
+        // db が戻る。10秒の時点から 6,000,000 バイト増えた
+        assert!(logger.tick(Ok(collected(vec![
+            ("web", written("2026-01-01T00:00:30Z", 3_000_000)),
+            ("db", written("2026-01-01T00:00:30Z", 7_000_000)),
+        ]))).unwrap());
+
+        assert_eq!(logger.writes("web"), vec![
+            ("2026-01-01T00:00:10.000Z".to_string(), Some(100)),
+            ("2026-01-01T00:00:20.000Z".to_string(), Some(100)),
+            ("2026-01-01T00:00:30.000Z".to_string(), Some(100)),
+        ]);
+        // 欠けるのは1点だけ。戻った点は 20秒で割った 300 kB/s（10秒で割った 600 ではない）
+        assert_eq!(logger.writes("db"), vec![
+            ("2026-01-01T00:00:10.000Z".to_string(), Some(100)),
+            ("2026-01-01T00:00:30.000Z".to_string(), Some(300)),
+        ]);
+        assert_eq!(logger.lines.len(), 3);
+    }
+
+    #[test]
+    fn zero_time_and_unparsable_time_also_keep_the_previous_stats() {
+        for bad_time in [ZERO_TIME, "not a time"] {
+            let mut logger = Logger::new();
+            logger.tick(Ok(collected(vec![
+                ("web", written("2026-01-01T00:00:00Z", 0)),
+                ("db", written("2026-01-01T00:00:00Z", 0)),
+            ]))).unwrap();
+            logger.tick(Ok(collected(vec![
+                ("web", written("2026-01-01T00:00:10Z", 0)),
+                ("db", written(bad_time, 999_999_999)),
+            ]))).unwrap();
+            logger.tick(Ok(collected(vec![
+                ("web", written("2026-01-01T00:00:20Z", 0)),
+                ("db", written("2026-01-01T00:00:20Z", 4_000_000)),
+            ]))).unwrap();
+            assert_eq!(logger.writes("db"), vec![
+                ("2026-01-01T00:00:20.000Z".to_string(), Some(200)),
+            ], "{}", bad_time);
+        }
+    }
+
+    #[test]
+    fn stats_of_unlisted_container_are_forgotten() {
+        let mut logger = Logger::new();
+        logger.tick(Ok(collected(vec![
+            ("web", written("2026-01-01T00:00:00Z", 0)),
+            ("db", written("2026-01-01T00:00:00Z", 0)),
+        ]))).unwrap();
+        assert!(logger.prev_stats.contains_key("db"));
+        // db が一覧から消えた（止まった）
+        logger.tick(Ok(collected(vec![
+            ("web", written("2026-01-01T00:00:10Z", 0)),
+        ]))).unwrap();
+        assert!(!logger.prev_stats.contains_key("db"));
+        assert_eq!(logger.prev_stats.len(), 1);
+
+        // 同じ名前で戻ってきても、止まる前の値との差分は取らない
+        // (最初の tick は記録せず、次の tick から記録する)
+        logger.tick(Ok(collected(vec![
+            ("web", written("2026-01-01T01:00:00Z", 0)),
+            ("db", written("2026-01-01T01:00:00Z", 50_000_000)),
+        ]))).unwrap();
+        assert!(logger.cache.read().unwrap().get("db").is_none());
+        logger.tick(Ok(collected(vec![
+            ("web", written("2026-01-01T01:00:10Z", 0)),
+            ("db", written("2026-01-01T01:00:10Z", 51_000_000)),
+        ]))).unwrap();
+        assert_eq!(logger.writes("db"), vec![
+            ("2026-01-01T01:00:10.000Z".to_string(), Some(100)),
+        ]);
+
+        // コンテナが1つも無い tick では、全部消える
+        logger.tick(Ok(collected(vec![]))).unwrap();
+        assert!(logger.prev_stats.is_empty());
+    }
+
+    #[test]
+    fn failed_ticks_are_skipped_and_the_logger_goes_on() {
+        let mut logger = Logger::new();
+        let tick = |second: u32, bytes: u64| Ok(collected(vec![
+            ("web", written(&format!("2026-01-01T00:00:{:02}Z", second), bytes)),
+        ]));
+        assert!(!logger.tick(tick(0, 0)).unwrap());
+        assert!(logger.tick(tick(10, 1_000_000)).unwrap());
+        // コンテナ一覧の取得に失敗した tick。エラーが返るだけで、何も壊れない
+        for _ in 0..2 {
+            let failed = logger.tick(Err("cannot list containers (expected in this test)".into()));
+            assert!(failed.is_err());
+        }
+        assert_eq!(logger.lines.len(), 1);
+        // 前回の統計は残っているので、次に採れた tick で30秒分を30秒で割って記録する
+        assert!(logger.tick(tick(40, 4_000_000)).unwrap());
+        assert_eq!(logger.writes("web"), vec![
+            ("2026-01-01T00:00:10.000Z".to_string(), Some(100)),
+            ("2026-01-01T00:00:40.000Z".to_string(), Some(100)),
+        ]);
+
+        // ログへの追記に失敗した tick。キャッシュにも入れず、次の tick は通常どおり
+        let failed = run_tick(
+            TICK_MILLIS, tick(50, 5_000_000), &mut logger.prev_stats,
+            |_| Err("disk full (expected in this test)".into()),
+            &logger.cache,
+        );
+        assert!(failed.is_err());
+        assert_eq!(logger.writes("web").len(), 2);
+        // 前回の統計は失敗した tick の値に進んでいるので、差分はその後の5秒分
+        assert!(logger.tick(tick(55, 6_000_000)).unwrap());
+        assert_eq!(
+            logger.writes("web").last().unwrap(),
+            &("2026-01-01T00:00:55.000Z".to_string(), Some(200)),
+        );
+        assert_eq!(logger.lines.len(), 3);
+    }
+
+    #[test]
+    fn missing_log_file_is_not_an_error() {
+        let path = std::env::temp_dir().join(format!(
+            "cephylas-test-missing-log-{}-{:?}",
+            std::process::id(), std::thread::current().id(),
+        ));
+        assert!(!path.exists());
+        let cache = create_shared_cache();
+        read_log_from(&path, &cache).unwrap();
+        assert!(cache.read().unwrap().container_names().is_empty());
+        assert_eq!(check_nlines(&path).unwrap(), None);
+        // 読むだけなので、ファイルを作らない
+        assert!(!path.exists());
+
+        // 無いこと以外の失敗は、従来どおりエラーにする（ディレクトリは読めない）
+        assert!(read_log_from(std::env::temp_dir(), &cache).is_err());
     }
 
     #[test]
