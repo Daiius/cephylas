@@ -761,10 +761,19 @@ fn next_boundary_after(now_millis: u128, tick_millis: u128) -> u128 {
 /// - 予定の時刻が tick より先: 時計が戻った
 ///   予定の時刻まで待たない（その間、収集も古い点の削除も止まってしまう）
 ///
+/// last_millis は直前に実行した tick の時刻です（まだ実行していなければ None）
+/// 決めた時刻がそれと同じなら、その次の境界にします（同じ境界で2回実行しない）
+/// - 待っている間に壁時計がわずかに遅れると、境界の少し手前で起きて実行したことになり、
+///   次の周で、現在時刻より後の最初の境界が「いま実行した境界」になる
+/// - 決めた時刻が直前の時刻より前なら、時計が 1 tick を超えて戻っている
+///   その場合は直前の時刻に縛られず、現在時刻を基準に仕切り直す（待つのは tick 以下）
+///
 /// 返す待ち時間は 0 より長く、tick 以下です
+/// 直前の境界を避けた場合だけ tick を超えますが、tick の2倍以下です
 fn next_tick(
     now_millis: u128,
     timing_millis: u128,
+    last_millis: Option<u128>,
     tick_millis: u128,
 ) -> (std::time::Duration, u128) {
     let tick_millis = tick_millis.max(1);
@@ -775,10 +784,62 @@ fn next_tick(
     } else {
         next_boundary_after(now_millis, tick_millis)
     };
-    // 差は tick 以下なので u64 に収まる（tick が極端に大きい場合だけ丸める）
+    let timing_millis = if last_millis == Some(timing_millis) {
+        timing_millis + tick_millis
+    } else {
+        timing_millis
+    };
+    // 差は tick の2倍以下なので u64 に収まる（tick が極端に大きい場合だけ丸める）
     let wait_millis = u64::try_from(timing_millis - now_millis).unwrap_or(u64::MAX);
 
     (std::time::Duration::from_millis(wait_millis), timing_millis)
+}
+
+/// tick の時刻の進み方。次に予定している時刻と、直前に実行した時刻を持ちます
+/// 時計には触りません（現在時刻は呼び出し側が渡す）
+struct TickSchedule {
+    tick_millis: u128,
+    /// 予定している次の tick の時刻
+    timing_millis: u128,
+    /// 直前に実行した tick の時刻
+    last_millis: Option<u128>,
+}
+
+impl TickSchedule {
+    /// 最初の tick を、now_millis より後の最初の境界にします
+    fn starting_at(now_millis: u128, tick: std::time::Duration) -> Self {
+        let tick_millis = tick.as_millis().max(1);
+        TickSchedule {
+            tick_millis,
+            timing_millis: next_boundary_after(now_millis, tick_millis),
+            last_millis: None,
+        }
+    }
+
+    /// 次に実行する tick を決め、それまでの待ち時間と、その tick の時刻を返します
+    /// 呼び出し側は、待ったあとで必ずその tick を実行すること（実行したものとして覚える）
+    ///
+    /// 時計が飛んでいたら、tick の時刻を現在時刻に合わせ直します（next_tick）
+    /// 現在時刻を取れなかった場合（None）は、予定の時刻のまま tick だけ待ちます
+    fn advance(&mut self, now_millis: Option<u128>) -> (std::time::Duration, u128) {
+        let (wait, timing_millis) = match now_millis {
+            Some(now_millis) => next_tick(
+                now_millis, self.timing_millis, self.last_millis, self.tick_millis,
+            ),
+            None => (
+                std::time::Duration::from_millis(
+                    u64::try_from(self.tick_millis).unwrap_or(u64::MAX),
+                ),
+                self.timing_millis,
+            ),
+        };
+        self.last_millis = Some(timing_millis);
+        // その tick が失敗しても、次の tick の時刻は進める
+        // 処理が tick より長引いていたら、次の周で合わせ直す
+        self.timing_millis = timing_millis + self.tick_millis;
+
+        (wait, timing_millis)
+    }
 }
 
 fn get_now_as_millis() -> Result<u128, std::time::SystemTimeError> {
@@ -1032,26 +1093,23 @@ pub fn log_json(
     }
 
     let tick = TICK;
-    // 次の tick の時刻。壁時計の 10 秒境界に揃える
-    let mut timing = next_boundary_after(get_now_as_millis()?, tick.as_millis());
+    // tick の時刻。壁時計の 10 秒境界に揃える
+    let mut schedule = TickSchedule::starting_at(get_now_as_millis()?, tick);
 
     let mut state = LoggerState::new();
     // 経過時間を core 自身で測るための単調時計の起点
     let started = std::time::Instant::now();
     // ここから先の失敗では止まらない。その tick を飛ばして次へ進む
     loop {
-        // 時計が飛んでいたら、tick の時刻を現在時刻に合わせ直す（next_tick）
-        let wait = match get_now_as_millis() {
-            Ok(now) => {
-                let (wait, next) = next_tick(now, timing, tick.as_millis());
-                timing = next;
-                wait
-            },
+        // 時計が飛んでいたら、tick の時刻を現在時刻に合わせ直す（TickSchedule::advance）
+        let now = match get_now_as_millis() {
+            Ok(now) => Some(now),
             Err(e) => {
                 eprintln!("logger: failed to get the current time: {}", e);
-                tick
+                None
             },
         };
+        let (wait, _) = schedule.advance(now);
         println!("waiting {} millis...", wait.as_millis());
         std::thread::sleep(wait);
 
@@ -1076,13 +1134,10 @@ pub fn log_json(
             |line| log_daily(DAILY_LOG_PATH, line),
             log_cache,
         );
+        // 失敗した tick でも、次の tick の時刻は進めてある（TickSchedule::advance）
         if let Err(e) = result {
             eprintln!("logger: tick skipped: {}", e);
         }
-
-        // 失敗した tick でも、次の tick の時刻は進める
-        // ここまでの処理が tick より長引いていたら、次の周で合わせ直す
-        timing += tick.as_millis();
     }
 }
 
@@ -1268,8 +1323,15 @@ mod tests {
     /// 2026-01-01T00:00:00Z（10 秒境界）
     const BOUNDARY_MILLIS: u128 = 1_767_225_600_000;
 
+    /// まだ1回も実行していない状態での next_tick
     fn wait_and_timing(now: u128, timing: u128) -> (u128, u128) {
-        let (wait, timing) = next_tick(now, timing, 10_000);
+        let (wait, timing) = next_tick(now, timing, None, 10_000);
+        (wait.as_millis(), timing)
+    }
+
+    /// 直前に last を実行した状態での next_tick（予定は last の 1 tick 後）
+    fn wait_and_timing_after(now: u128, last: u128) -> (u128, u128) {
+        let (wait, timing) = next_tick(now, last + 10_000, Some(last), 10_000);
         (wait.as_millis(), timing)
     }
 
@@ -1309,7 +1371,7 @@ mod tests {
         let (mut now, mut timing) = (t + 3_600_000 + 4_000, t);
         let mut waits = Vec::new();
         for _ in 0..3 {
-            let (wait, next) = next_tick(now, timing, 10_000);
+            let (wait, next) = next_tick(now, timing, None, 10_000);
             waits.push(wait.as_millis());
             // 待ったあと、処理に 200 ミリ秒掛かる
             now += wait.as_millis() + 200;
@@ -1340,7 +1402,207 @@ mod tests {
             assert_eq!(timing % 10_000, 0);
         }
         // tick が 0 でも止まらない（0 で割らない）
-        assert_eq!(next_tick(5, 3, 0), (std::time::Duration::from_millis(1), 6));
+        assert_eq!(next_tick(5, 3, None, 0), (std::time::Duration::from_millis(1), 6));
+    }
+
+    #[test]
+    fn next_tick_does_not_run_the_same_boundary_twice() {
+        let t = BOUNDARY_MILLIS;
+        // 通常: 直前の境界の少しあと。予定（次の境界）まで待つ
+        assert_eq!(wait_and_timing_after(t + 200, t), (9_800, t + 10_000));
+        assert_eq!(wait_and_timing_after(t, t), (10_000, t + 10_000));
+        // 壁時計が遅れて、境界 t の手前で t を実行した。合わせ直した先は t になるが、
+        // もう実行したので、その次の境界まで待つ（待ちは tick をわずかに超える）
+        assert_eq!(wait_and_timing_after(t - 1, t), (10_001, t + 10_000));
+        assert_eq!(wait_and_timing_after(t - 100, t), (10_100, t + 10_000));
+        assert_eq!(wait_and_timing_after(t - 9_999, t), (19_999, t + 10_000));
+        // ちょうど 1 tick 手前（合わせ直した先が t になる、いちばん大きな遅れ）
+        assert_eq!(wait_and_timing_after(t - 10_000, t), (20_000, t + 10_000));
+        // 1 tick を超えて戻った: 直前の境界に縛られず、現在時刻の次の境界へ（待ちは tick 以下）
+        assert_eq!(wait_and_timing_after(t - 10_001, t), (1, t - 10_000));
+        assert_eq!(wait_and_timing_after(t - 3_600_000 + 4_000, t), (6_000, t - 3_590_000));
+        // 進んだ場合は、直前の境界は関係しない
+        assert_eq!(wait_and_timing_after(t + 12_345, t), (7_655, t + 20_000));
+        // 予定そのものが直前の境界と同じでも、同じ境界は返さない
+        let (wait, timing) = next_tick(t - 3_000, t, Some(t), 10_000);
+        assert_eq!((wait.as_millis(), timing), (13_000, t + 10_000));
+
+        // どの現在時刻でも: 直前の境界は返さず、待ちは 0 より長く 2 tick 以下で、
+        // tick を超えるのは直前の境界を避けたときだけ
+        for offset in (-40_000i64..=40_000).step_by(7) {
+            let now = (t as i64 + offset) as u128;
+            let (wait, timing) = wait_and_timing_after(now, t);
+            assert_ne!(timing, t, "{}", offset);
+            assert_eq!(timing, now + wait);
+            assert_eq!(timing % 10_000, 0);
+            assert!(wait > 0 && wait <= 20_000, "{} {}", offset, wait);
+            if wait > 10_000 {
+                assert_eq!(timing, t + 10_000, "{}", offset);
+                assert_eq!(next_boundary_after(now, 10_000), t, "{}", offset);
+            }
+        }
+    }
+
+    // ---- tick を刻むループ（時計を差し替えた模擬） ----
+
+    /// 模擬の時計。壁時計は、単調時計に offset を足したもの
+    struct SimulatedLoop {
+        schedule: TickSchedule,
+        /// 単調時計（ミリ秒）。sleep で進む
+        monotonic: i64,
+        /// 壁時計 − 単調時計
+        offset: i64,
+        /// 実行した tick の (時刻, 実行した時点の単調時計)
+        ticks: Vec<(u128, i64)>,
+        /// 待ち時間
+        waits: Vec<u128>,
+    }
+
+    impl SimulatedLoop {
+        /// 壁時計が wall のときに起動する
+        fn starting_at(wall: u128) -> Self {
+            SimulatedLoop {
+                schedule: TickSchedule::starting_at(wall, std::time::Duration::from_secs(10)),
+                monotonic: 0,
+                offset: wall as i64,
+                ticks: Vec::new(),
+                waits: Vec::new(),
+            }
+        }
+
+        /// log_json のループを1周する
+        /// 待っている間に壁時計が drift だけずれ（負なら遅れる）、処理に work だけ掛かる
+        fn turn(&mut self, drift: i64, work: i64) {
+            let wall = (self.monotonic + self.offset) as u128;
+            let (wait, timing) = self.schedule.advance(Some(wall));
+            self.waits.push(wait.as_millis());
+            self.monotonic += wait.as_millis() as i64;
+            self.offset += drift;
+            self.ticks.push((timing, self.monotonic));
+            self.monotonic += work;
+        }
+
+        fn timings(&self) -> Vec<u128> {
+            self.ticks.iter().map(|(timing, _)| *timing).collect()
+        }
+
+        /// 隣り合う tick の、実際の（単調時計での）間隔
+        fn intervals(&self) -> Vec<i64> {
+            self.ticks.windows(2).map(|w| w[1].1 - w[0].1).collect()
+        }
+    }
+
+    /// first から 10 秒おきに n 個
+    fn boundaries_from(first: u128, n: usize) -> Vec<u128> {
+        (0..n).map(|i| first + i as u128 * 10_000).collect()
+    }
+
+    #[test]
+    fn loop_runs_every_boundary_once_on_a_steady_clock() {
+        let t = BOUNDARY_MILLIS;
+        let mut sim = SimulatedLoop::starting_at(t - 6_300);
+        for _ in 0..6 { sim.turn(0, 200); }
+        assert_eq!(sim.timings(), boundaries_from(t, 6));
+        assert_eq!(sim.waits, [6_300, 9_800, 9_800, 9_800, 9_800, 9_800]);
+        assert_eq!(sim.intervals(), [10_000; 5]);
+    }
+
+    #[test]
+    fn loop_does_not_repeat_a_boundary_when_the_wall_clock_lags_slightly() {
+        let t = BOUNDARY_MILLIS;
+        // 2周目を待っている間に、壁時計が 300 ミリ秒遅れる（処理は 200 ミリ秒）
+        // 境界の 300 ミリ秒手前で起きて実行するので、次の周の現在時刻はまだ同じ境界の手前
+        let mut sim = SimulatedLoop::starting_at(t - 6_300);
+        for drift in [0, -300, 0, 0, 0] { sim.turn(drift, 200); }
+        // 同じ境界を2回実行せず、境界を飛ばしもしない
+        assert_eq!(sim.timings(), boundaries_from(t, 5));
+        // 遅れた分だけ1回長く待つ。短い間隔の点は入らない
+        assert_eq!(sim.waits, [6_300, 9_800, 10_100, 9_800, 9_800]);
+        assert_eq!(sim.intervals(), [10_000, 10_300, 10_000, 10_000]);
+
+        // 遅れの大きさと処理時間を変えても同じ（1秒未満の後ろ向きのずれ）
+        for lag in [1, 50, 199, 200, 201, 500, 999] {
+            for work in [0, 1, 200, 800] {
+                let mut sim = SimulatedLoop::starting_at(t - 6_300);
+                for drift in [0, -lag, 0, 0, 0] { sim.turn(drift, work); }
+                assert_eq!(sim.timings(), boundaries_from(t, 5), "lag {} work {}", lag, work);
+                assert!(
+                    sim.intervals().iter().all(|i| (10_000..=11_000).contains(i)),
+                    "lag {} work {}: {:?}", lag, work, sim.intervals(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn loop_follows_a_wall_clock_that_keeps_running_slow() {
+        let t = BOUNDARY_MILLIS;
+        // 時刻の補正が続いて、壁時計が tick ごとに 30 ミリ秒ずつ遅れていく
+        let mut sim = SimulatedLoop::starting_at(t - 6_300);
+        for _ in 0..40 { sim.turn(-30, 20); }
+        assert_eq!(sim.timings(), boundaries_from(t, 40));
+        assert!(sim.intervals().iter().all(|i| (10_000..=10_100).contains(i)));
+    }
+
+    #[test]
+    fn loop_resumes_within_one_tick_after_the_clock_jumps_back() {
+        let t = BOUNDARY_MILLIS;
+        for back in [10_300, 60_000, 3_600_000, 86_400_000] {
+            // 3周目を待っている間に、時計が back だけ戻る
+            let mut sim = SimulatedLoop::starting_at(t - 6_300);
+            for drift in [0, 0, -back, 0, 0, 0] { sim.turn(drift, 200); }
+            // 戻る前の時刻（直前に実行した境界）まで待たない。どの待ちも tick 以下
+            assert!(sim.waits.iter().all(|w| *w > 0 && *w <= 10_000), "{} {:?}", back, sim.waits);
+            // 戻った先の時刻（直前に実行した境界より前）から、境界を1つずつ進む
+            let resumed = sim.timings()[3];
+            assert!(resumed < t + 20_000, "{} {}", back, resumed);
+            assert_eq!(resumed, next_boundary_after(t + 20_200 - back as u128, 10_000));
+            assert_eq!(sim.timings()[..3], boundaries_from(t, 3)[..], "{}", back);
+            assert_eq!(sim.timings()[3..], boundaries_from(resumed, 3)[..], "{}", back);
+        }
+    }
+
+    #[test]
+    fn loop_handles_a_backward_step_shorter_than_one_tick() {
+        let t = BOUNDARY_MILLIS;
+        // 3周目を待っている間に、時計が 5 秒戻る
+        // 戻った先の次の境界は、いま実行した境界と同じなので、その次まで待つ
+        let mut sim = SimulatedLoop::starting_at(t - 6_300);
+        for drift in [0, 0, -5_000, 0, 0] { sim.turn(drift, 200); }
+        assert_eq!(sim.timings(), boundaries_from(t, 5));
+        assert_eq!(sim.waits, [6_300, 9_800, 9_800, 14_800, 9_800]);
+    }
+
+    #[test]
+    fn loop_does_not_catch_up_after_the_clock_jumps_forward() {
+        let t = BOUNDARY_MILLIS;
+        // 3周目を待っている間に、時計が 1 時間進む
+        let mut sim = SimulatedLoop::starting_at(t - 6_300);
+        for drift in [0, 0, 3_600_000, 0, 0, 0] { sim.turn(drift, 200); }
+        // 進んだ分の tick を連続して実行しない。どの待ちも 0 より長く tick 以下
+        assert!(sim.waits.iter().all(|w| *w > 0 && *w <= 10_000), "{:?}", sim.waits);
+        assert_eq!(sim.timings()[..3], boundaries_from(t, 3)[..]);
+        // 進んだ先の、次の境界から1つずつ進む
+        assert_eq!(sim.timings()[3..], boundaries_from(t + 3_600_000 + 30_000, 3)[..]);
+
+        // 処理が tick より長引いた場合も、飛んだ tick を取り戻さず、境界に戻る
+        let mut sim = SimulatedLoop::starting_at(t - 6_300);
+        for work in [200, 23_456, 200, 200] { sim.turn(0, work); }
+        assert_eq!(sim.timings(), [t, t + 10_000, t + 40_000, t + 50_000]);
+        assert_eq!(sim.waits, [6_300, 9_800, 6_544, 9_800]);
+    }
+
+    #[test]
+    fn loop_keeps_ticking_when_the_clock_cannot_be_read() {
+        let t = BOUNDARY_MILLIS;
+        let mut schedule = TickSchedule::starting_at(t - 6_300, std::time::Duration::from_secs(10));
+        assert_eq!(schedule.advance(Some(t - 6_300)).1, t);
+        // 現在時刻を取れない周は、tick だけ待って、予定の時刻のまま進む
+        let (wait, timing) = schedule.advance(None);
+        assert_eq!((wait.as_millis(), timing), (10_000, t + 10_000));
+        // 取れるようになったら、続きから進む（同じ境界に戻らない）
+        let (wait, timing) = schedule.advance(Some(t + 10_200));
+        assert_eq!((wait.as_millis(), timing), (9_800, t + 20_000));
     }
 
     // ---- Docker ソケットからの応答の読み取り ----
