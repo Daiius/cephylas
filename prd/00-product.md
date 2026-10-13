@@ -85,7 +85,8 @@ core は [02](./02-core.md)、web は [03](./03-web.md)、公開範囲は [04](.
 | コンテナ別の REST API | 実装済み | [02](./02-core.md) |
 | 4 種のチャートと凡例兼フィルタ | 実装済み | [03](./03-web.md) |
 | `'use cache'` によるキャッシュと Partial Prerender | 実装済み | [03](./03-web.md) |
-| 全コンテナ分を 1 回で返す bulk endpoint | 計画中 | [02](./02-core.md) |
+| 全コンテナ分を 1 回で返す bulk endpoint（`/usages/{kind}`） | 実装済み | [02](./02-core.md) §REST API（現行） |
+| web の取得を 1 チャート 1 リクエストにする | 計画中 | [03](./03-web.md) §データ取得 |
 | Cloudflare Access による画面と API の制限 | 計画中 | [04](./04-access-and-privacy.md) |
 | 再起動時のキャッシュ復元の不具合の解消 | 実装済み | [02](./02-core.md) §キャッシュ |
 | 不正なリクエストで API が止まる問題の解消 | 実装済み | [02](./02-core.md) §REST API（現行） |
