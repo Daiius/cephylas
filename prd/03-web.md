@@ -3,8 +3,7 @@
 web は Next.js（App Router）のアプリで、`next/` に置く。core の API からデータを取り、
 Chart.js で描画する。
 
-**実装済みの範囲**: 本章の内容はすべて実装済みである。bulk endpoint への移行（§データ取得）だけが
-計画中である。
+**実装済みの範囲**: 本章の内容はすべて実装済みである。
 
 ## スタック
 
@@ -29,23 +28,31 @@ Chart.js で描画する。
 
 🔒 **core の API を叩くのは Server Component だけである**（[01](./01-architecture.md) §通信の向き）。
 
-- 取得関数は `next/src/lib/fetchers.ts` に集める。
+**チャート 1 枚につき 1 リクエスト**である。core の `/usages/{kind}` が全コンテナ分の系列を
+まとめて返す（[02](./02-core.md) §REST API（現行））。1 回の表示で core に送るのは 4 本である。
+
+- 取得関数は `next/src/lib/fetchers.ts` の `fetchUsages(kind)` の 1 つである。
+  `kind` は `cpu` / `memory` / `io` / `net`。
 - API の URL は環境変数 `API_URL` から読む。未設定なら `http://localhost:7878` を使う
   （dev で core を手元に立てたときの既定）。
-- レスポンスは zod で検証し、Chart.js 用の `{ x: time, y: 値 }` に変換する。
+- レスポンスは zod で検証する。系列の `t` と `v` の長さが違う応答は、検証で失敗として扱う。
 - 戻り値は `FetchResult<T>`（`{ ok: true, data }` または `{ ok: false, error: { message } }`）で、
   例外は投げない。**error 側は `Error` インスタンスではなく、シリアライズできる形にする。**
   `'use cache'` の境界を越えて返すためである。
 
-各チャートの Server Component（`CpuChart.tsx` など）は、まず `/containers` で名前の一覧を取り、
-次にコンテナ別の API を `Promise.all` で並列に叩く。IO とネットワークは 1 コンテナにつき
-2 本（read と write、recv と send）叩く。
+各チャートの Server Component（`CpuChart.tsx` など）は、受け取った全コンテナ分を
+Chart.js のデータセットに変換する。
+
+- **コンテナの並びは web 側で決める。** コンテナ名を**コードポイント順**に並べ替える
+  （`sortedContainerNames`）。core の並び（[02](./02-core.md) §REST API（現行））と同じ結果になるが、
+  JSON のキーの順序には依存しない。ロケールに依存する比較（`localeCompare`）は使わない。
+- 点は `{ x: t[i], y: v[i] }` である。**`x` は数値**（エポックからのミリ秒）で、
+  Chart.js の時間軸にそのまま渡す。
+- CPU とメモリは 1 コンテナにつき 1 本、IO とネットワークは 1 コンテナにつき 2 本
+  （read と write、recv と send）のデータセットを作る。1 本目が実線、2 本目が破線である。
 
 取得に失敗したときは、チャートの代わりに「取得中...」という文言を出す。
 ⚠ 失敗と取得中を区別しておらず、失敗の理由も画面には出ない。
-
-**計画中**: core に bulk endpoint が入ったら、チャート 1 枚につき 1 リクエストに切り替える
-（[02](./02-core.md) §計画中の API）。
 
 ## キャッシュ構成
 
@@ -56,9 +63,8 @@ Chart.js で描画する。
 - 寿命は `cacheLife({ revalidate: 10, expire: 60, stale: 10 })` である。core の収集間隔
   （10 秒）に合わせている。
 - タグは `chart:cpu` / `chart:memory` / `chart:io` / `chart:net`。
-- `fetchContainers` だけは取得関数の側でも `'use cache'`（タグは `containers`）を宣言する。
-  4 枚のチャートが同じ結果を共有するためである。
-- それ以外の取得関数は cache を宣言しない（チャート側の cache に含まれる）。
+- 取得関数（`fetchUsages`）は cache を宣言しない（チャート側の cache に含まれる）。
+  4 枚のチャートが共有する取得は無く、`containers` というタグも無い。
 
 🔒 **不変条件**: cache される関数の中で、リクエストごとに変わる API（`cookies()`、`headers()`、
 `searchParams` の await など）を呼ばない。
@@ -78,7 +84,7 @@ Chart.js で描画する。
   Chart.js の型は `next/src/types/chartjs.d.ts` の declaration merging で拡張している。
 - Chart.js 標準の凡例とタイトルは使わない。タイトルは HTML の `<h3>` で出し、
   その下に自前の凡例を置く。
-- 時刻はブラウザのタイムゾーンで表示される（core が返すのは UTC）。
+- 時刻はブラウザのタイムゾーンで表示される（core が返すのはエポックからのミリ秒）。
 
 ⚠ データセットが変わるたびに Chart.js のインスタンスを作り直している。
 フィルタの切り替えだけは作り直さず、`update('none')` で反映する。
@@ -117,9 +123,10 @@ clear();                  // 全表示に戻す
 ## 色
 
 `next/src/lib/colors.ts` が、**コンテナ名のアルファベット順の位置**に Tableau 10 の配色を
-順に割り当てる。core の `/containers` がアルファベット順で返すことに依存している
-（[02](./02-core.md) §REST API）。
+順に割り当てる。並びは web 側の並べ替え（§データ取得）で決まり、core が返す順序には
+依存しない。
 
+- 並べ替えはコードポイント順なので、大文字で始まる名前は小文字で始まる名前より前に来る。
 - コンテナが 10 個以下なら色は衝突しない。11 個目からは同じ色が巡回する。
 - 同じコンテナは 4 枚のチャートで同じ色になる。
 - ⚠ コンテナが増減してアルファベット順の位置が変わると、既存のコンテナの色もずれる。
@@ -132,7 +139,6 @@ clear();                  // 全表示に戻す
 
 ## gap / 検討中
 
-- `next/src/lib/downsample.ts` はどこからも使われていない（[01](./01-architecture.md) §責務の分担）。
 - `next.config.ts` の `output: 'standalone'` は、Vercel へ配置する現在の構成では使っていない。
   残す理由があるかは要確認。
 - `package.json` の `lint` スクリプト（`next lint`）は、現行の Next.js で動くか要確認。
