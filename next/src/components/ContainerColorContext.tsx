@@ -8,6 +8,7 @@ import {
   useId,
   useMemo,
   useState,
+  useSyncExternalStore,
   type ReactNode,
 } from 'react';
 
@@ -84,13 +85,31 @@ export const ContainerColorProvider = ({ children }: { children: ReactNode }) =>
   );
 };
 
+// 「このチャートのハイドレートが済んだか」を表すフラグ。値は変わらないので購読は空である。
+// サーバでの描画とハイドレート中の描画では false、ハイドレートの直後に React が true で
+// 描き直す。ハイドレートを伴わずにクライアントで初めて描くときは、最初から true になる
+// (合わせるべき HTML が無い)。
+const subscribeNothing = () => () => {};
+const useHydrated = (): boolean =>
+  useSyncExternalStore(
+    subscribeNothing,
+    () => true,
+    () => false,
+  );
+
 /**
  * このチャートが持つコンテナ名を登録し、名前から色を引く関数を返す。
  * 線の色 (Chart) と凡例の色 (MiniLegend) は、必ずこの同じ関数から取る。
  *
- * 和集合が変わると関数も新しくなるので、それを契機に全チャートが色を更新する。
- * 登録が反映される前 (最初の描画) は、和集合に無い名前について、このチャート自身の
- * 名前一覧での位置を使う。名前が全チャートで同じなら、最初から最終的な色になる。
+ * **ハイドレートが済むまでは、必ずこのチャート自身の名前一覧での位置で色を決める**
+ * (和集合を見ない)。サーバでは登録 (effect) が走らないので、サーバが出す HTML は
+ * 必ずこの色である。先にハイドレートした別のチャートの登録が和集合に入っていても、
+ * 最初の描画をサーバの HTML と一致させる。React は本番で属性の食い違いを直さないので、
+ * 食い違うと凡例の点だけがサーバの色のまま残り、線の色とずれる。
+ *
+ * ハイドレートのあとは和集合での位置を使う (和集合にまだ無い名前は、自身の一覧での
+ * 位置)。和集合が変わると関数も新しくなるので、それを契機に全チャートが色を更新する。
+ * 名前が全チャートで同じなら、どの段階でも同じ色になる (切り替えで色は変わらない)。
  */
 export const useContainerColors = (ownNames: readonly string[]): ColorOf => {
   const ctx = useContext(ContainerColorContext);
@@ -101,6 +120,7 @@ export const useContainerColors = (ownNames: readonly string[]): ColorOf => {
   }
   const { indexOf, register, unregister } = ctx;
   const id = useId();
+  const hydrated = useHydrated();
 
   // ownNames は描画のたびに新しい配列で来うるので、中身で同一性を判定する。
   const key = JSON.stringify(ownNames);
@@ -120,12 +140,14 @@ export const useContainerColors = (ownNames: readonly string[]): ColorOf => {
   return useCallback(
     (containerName: string) => {
       const index =
-        indexOf.get(containerName) ?? ownIndexOf.get(containerName) ?? 0;
+        (hydrated ? indexOf.get(containerName) : undefined) ??
+        ownIndexOf.get(containerName) ??
+        0;
       return {
         border: borderColorFor(index),
         background: backgroundColorFor(index),
       };
     },
-    [indexOf, ownIndexOf],
+    [hydrated, indexOf, ownIndexOf],
   );
 };

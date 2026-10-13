@@ -10,7 +10,7 @@
 // ここでは 'use cache' を宣言しない (呼び出す chart 側の cache に含まれる)。
 import z from 'zod';
 
-import { accessFetchInit } from '@/lib/access-headers';
+import { LEGACY_PATH_TIMEOUT_MS, coreFetch, startCoreDeadline } from '@/lib/core-fetch';
 
 type LegacyKind = 'cpu' | 'memory' | 'io' | 'net';
 type LegacySeries = { t: number[]; v: (number | null)[] };
@@ -53,22 +53,35 @@ const seriesOf: Record<
   ],
 };
 
-// この経路のリクエストは、すべてここを通る (Cloudflare Access のヘッダもここで付ける)。
-// ヘッダを付けるときはリダイレクトを追わないので、3xx は下の失敗に入る。
-const getJson = async <T>(url: string, schema: z.ZodType<T>): Promise<T> => {
-  const response = await fetch(url, accessFetchInit());
+// この経路のリクエストは、すべてここを通る (期限と Cloudflare Access のヘッダは
+// coreFetch が付ける)。ヘッダを付けるときはリダイレクトを追わないので、3xx は下の失敗に入る。
+// deadline はこの経路全体で共有する期限で、1 本ごとの期限と早い方で打ち切られる
+// (本文の読み取り中でも同じ)。期限切れは例外になり、経路全体の失敗になる。
+const getJson = async <T>(
+  url: string,
+  schema: z.ZodType<T>,
+  deadline: AbortSignal,
+): Promise<T> => {
+  const response = await coreFetch(url, deadline);
   if (!response.ok) {
     throw new Error(`fetch failed with ${response.status}`);
   }
   return schema.parse(await response.json());
 };
 
-// 時刻を解釈できない要素は捨てる。t と v は必ず同じ長さになる。
+// 時刻として使える値 (エポックからのミリ秒) か。有限でない値と、0 以下を弾く
+// (core の valid_time_millis と同じ基準)。Docker が時刻を持たないときに返す
+// `0001-01-01T00:00:00Z` は、Date.parse では NaN にならず負の値になるので、
+// NaN の判定だけでは残り、横軸が西暦 1 年から始まってしまう。
+export const isValidTimeMillis = (t: number): boolean =>
+  Number.isFinite(t) && t > 0;
+
+// 時刻として使えない要素は捨てる。t と v は必ず同じ長さになる。
 const toSeries = (points: LegacyPoint[], field: ValueField): LegacySeries => {
   const series: LegacySeries = { t: [], v: [] };
   for (const point of points) {
     const t = point.time == null ? NaN : Date.parse(point.time);
-    if (Number.isNaN(t)) continue;
+    if (!isValidTimeMillis(t)) continue;
     series.t.push(t);
     series.v.push(point[field] ?? null);
   }
@@ -77,14 +90,16 @@ const toSeries = (points: LegacyPoint[], field: ValueField): LegacySeries => {
 
 /**
  * コンテナ別の API から、`/usages/{kind}` と同じ形のデータを組み立てる。
- * 1 本でも失敗したら例外を投げる (呼び出し側が全体を失敗として扱う)。
+ * 1 本でも失敗したら (期限切れを含む) 例外を投げる (呼び出し側が全体を失敗として扱う)。
  * リクエストは `/containers` の 1 本と、コンテナ数 × 系列数の本数になる。
  */
 export const fetchUsagesFromContainerApis = async (
   apiUrl: string,
   kind: LegacyKind,
 ): Promise<LegacyUsages> => {
-  const names = await getJson(`${apiUrl}/containers`, containersSchema);
+  // `/containers` と、その後のコンテナ別のリクエストのすべてで、1 つの期限を共有する。
+  const deadline = startCoreDeadline(LEGACY_PATH_TIMEOUT_MS);
+  const names = await getJson(`${apiUrl}/containers`, containersSchema, deadline);
   const series = seriesOf[kind];
 
   const entries = await Promise.all(
@@ -94,6 +109,7 @@ export const fetchUsagesFromContainerApis = async (
           const points = await getJson(
             `${apiUrl}/containers/${name}/${path}`,
             pointsSchema,
+            deadline,
           );
           return [seriesName, toSeries(points, field)] as const;
         }),
