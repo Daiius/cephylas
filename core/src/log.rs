@@ -380,12 +380,16 @@ fn blkio_counters(entries: &json::JsonValue, op: &str) -> Vec<(String, u64)> {
 /// - 両方にあるもの: 差分を足す（積算値が戻っていたら、そのものの差分だけを 0 とする）
 /// - 今回だけにあるもの（追加された）: 0 から数え始めるので、今回の値を足す
 /// - 前回だけにあるもの（外された）: 数えない
-/// 今回または前回の内訳が無ければ None です
+///
+/// 今回の内訳が無ければ None です（値そのものが無い）
+/// 前回の内訳が無いだけなら、今回のものはすべて「追加された」ものとして数えます
+/// (まだ一度も読み書きしていないコンテナは、IO の要素を1つも返さない。
+///  前回の統計そのものが無いコンテナは、呼び出し側が先に飛ばしている)
 fn increase_of(
     current: &[(String, u64)],
     previous: &[(String, u64)],
 ) -> Option<u64> {
-    if current.is_empty() || previous.is_empty() {
+    if current.is_empty() {
         return None;
     }
     Some(
@@ -2623,18 +2627,87 @@ mod tests {
     }
 
     #[test]
-    fn networks_appearing_or_disappearing_as_a_whole_is_null() {
-        let some = r#"{"eth0":{"rx_bytes":1000,"tx_bytes":1000}}"#;
-        // 前回は networks が無かった / 今回は無い。差分を取れないので null
-        for (before, after) in [
-            (stats_from_parts(T0, None, None, None), net_stats(T10, some)),
-            (net_stats(T0, some), stats_from_parts(T10, None, None, None)),
-            (net_stats(T0, "{}"), net_stats(T10, some)),
+    fn first_interfaces_count_from_zero_and_no_interface_is_null() {
+        let some = r#"{"eth0":{"rx_bytes":1000,"tx_bytes":3500}}"#;
+        // 前回は networks が無かった（null・空も同じ）。今回の値を 0 からの増分として数える
+        for before in [
+            stats_from_parts(T0, None, None, None),
+            net_stats(T0, "null"),
+            net_stats(T0, "{}"),
         ] {
-            let usage = usage_between(before, after);
+            let usage = usage_between(before, net_stats(T10, some));
+            assert_eq!(usage.net.recvkBps, Some(0.1));
+            assert_eq!(usage.net.sendkBps, Some(0.35));
+        }
+        // 今回は networks が無い。値そのものが無いので null
+        for after in [
+            stats_from_parts(T10, None, None, None),
+            net_stats(T10, "{}"),
+        ] {
+            let usage = usage_between(net_stats(T0, some), after);
             assert_eq!(usage.net.recvkBps, None);
             assert_eq!(usage.net.sendkBps, None);
+            assert_eq!(usage.net.recvkB, None);
         }
+    }
+
+    #[test]
+    fn first_io_of_an_op_counts_from_zero() {
+        let read_only = r#"[{"major":8,"minor":0,"op":"read","value":1000}]"#;
+        let both = concat!(
+            r#"[{"major":8,"minor":0,"op":"read","value":2000},"#,
+            r#"{"major":8,"minor":0,"op":"write","value":3500}]"#,
+        );
+        // 前回は read の要素だけ。今回初めて write の要素が現れた
+        let usage = usage_between(io_stats(T0, read_only), io_stats(T10, both));
+        assert_eq!(usage.io.readkBps, Some(0.1));
+        assert_eq!(usage.io.writekBps, Some(0.35));
+        let line = usage.to_string();
+        assert!(line.contains(
+            r#""io":{"readkB":2,"writekB":3,"readkBps":0.10,"writekBps":0.35}"#
+        ), "{}", line);
+
+        // 前回は IO の要素が1つも無かった（空・null・キーごと無い・ほかの op だけ）
+        // まだ読み書きしていなかったコンテナの、最初の読み書きにあたる
+        for before in [
+            io_stats(T0, "[]"),
+            io_stats(T0, "null"),
+            stats_from_parts(T0, None, None, None),
+            io_stats(T0, r#"[{"major":8,"minor":0,"op":"total","value":99999}]"#),
+        ] {
+            let usage = usage_between(before, io_stats(T10, both));
+            assert_eq!(usage.io.readkBps, Some(0.2));
+            assert_eq!(usage.io.writekBps, Some(0.35));
+        }
+
+        // 今回の要素が無い op は、従来どおり null（増分 0 ではない）
+        let usage = usage_between(io_stats(T0, both), io_stats(T10, read_only));
+        assert_eq!(usage.io.readkBps, Some(0.0));
+        assert_eq!(usage.io.writekBps, None);
+        assert_eq!(usage.io.writekB, None);
+    }
+
+    #[test]
+    fn first_io_reaches_the_log_and_the_cache() {
+        // 起動直後で IO の無いコンテナが、3 tick 目に初めて書き込む
+        let io = |read: &str, blkio: &str| Some(io_stats(read, blkio));
+        let wrote = r#"[{"major":8,"minor":0,"op":"write","value":3500}]"#;
+        let mut logger = Logger::new();
+        assert!(!logger.tick(Ok(collected(vec![("web", io(T0, "null"))]))).unwrap());
+        assert!(logger.tick(Ok(collected(vec![("web", io(T10, "null"))]))).unwrap());
+        assert!(logger.tick(Ok(collected(vec![
+            ("web", io("2026-01-01T00:00:20Z", wrote)),
+        ]))).unwrap());
+        assert!(logger.tick(Ok(collected(vec![
+            ("web", io("2026-01-01T00:00:30Z", wrote)),
+        ]))).unwrap());
+        // IO が無い間は null、最初の書き込みは 0 からの増分、そのあとは 0
+        assert_eq!(logger.writes("web"), vec![
+            ("2026-01-01T00:00:10.000Z".to_string(), None),
+            ("2026-01-01T00:00:20.000Z".to_string(), Some(0.35)),
+            ("2026-01-01T00:00:30.000Z".to_string(), Some(0.0)),
+        ]);
+        assert!(logger.lines[1].contains(r#""writekBps":0.35"#), "{}", logger.lines[1]);
     }
 
     #[test]
