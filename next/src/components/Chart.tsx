@@ -1,21 +1,25 @@
 'use client'
 
 import { clsx } from 'clsx'
-import { useEffect, useRef } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 
 import { Chart as ChartJs, type ChartDataset } from 'chart.js/auto';
 import 'chartjs-adapter-luxon';
 
+import { useContainerColors } from './ContainerColorContext';
 import { useFilter } from './FilterContext';
 import { MiniLegend } from './MiniLegend';
 
-// 時間軸チャートの 1 点。Chart.js の Point は { x: number; y: number } だが
-// time scale だと文字列を runtime で受け付けるので独自に定義する。
-export type TimedPoint = { x?: string; y?: number | null };
+// 時間軸チャートの 1 点。x はエポックからのミリ秒 (time scale は数値を受け取れる)。
+// Chart.js の Point は { x: number; y: number } だが、欠損を null で持つので
+// 独自に定義する。
+export type TimedPoint = { x: number; y: number | null };
 type TimedSeries = TimedPoint[];
 
 // containerName は src/types/chartjs.d.ts の declaration merging で
 // ChartDatasetProperties 自体に生えているので、ここで再宣言は不要。
+// 色 (borderColor / backgroundColor) はサーバからは渡さない。このコンポーネントが
+// ContainerColorContext から引いて当てる。
 export type AppDataset = ChartDataset<'line', TimedSeries>;
 
 export type ChartProps = {
@@ -37,6 +41,14 @@ export const Chart = ({
   const refChart = useRef<ChartJs<'line', TimedSeries> | null>(null);
   const { hidden } = useFilter();
 
+  // このチャートが持つコンテナ名を登録し、画面全体で共通の色を引く。
+  // 凡例 (MiniLegend) にも同じ colorOf を渡すので、線と凡例の色は必ず一致する。
+  const containerNames = useMemo(
+    () => datasets.flatMap((d) => (d.containerName ? [d.containerName] : [])),
+    [datasets],
+  );
+  const colorOf = useContainerColors(containerNames);
+
   useEffect(() => {
     if (!refCanvas.current) return;
 
@@ -45,6 +57,12 @@ export const Chart = ({
       data: {
         datasets: datasets.map((d) => ({
           ...d,
+          ...(d.containerName
+            ? {
+                borderColor: colorOf(d.containerName).border,
+                backgroundColor: colorOf(d.containerName).background,
+              }
+            : {}),
           hidden: d.containerName ? hidden.has(d.containerName) : false,
         })),
       },
@@ -125,12 +143,28 @@ export const Chart = ({
     chart.update('none');
   }, [hidden]);
 
+  // 色の変更も、作り直さずに update('none') で反映する。
+  // 画面全体の名前の一覧が変わると colorOf が新しくなり、全チャートでこれが走る。
+  // (datasets が変わったときは上の effect が作り直した直後にここも走るが、同じ色を
+  //  当て直すだけである)
+  useEffect(() => {
+    const chart = refChart.current;
+    if (!chart) return;
+    chart.data.datasets.forEach((d) => {
+      if (!d.containerName) return;
+      const color = colorOf(d.containerName);
+      d.borderColor = color.border;
+      d.backgroundColor = color.background;
+    });
+    chart.update('none');
+  }, [colorOf, datasets]);
+
   return (
     <div className='w-full mb-2'>
       {title && (
         <h3 className='text-sm font-semibold px-2 pt-2'>{title}</h3>
       )}
-      <MiniLegend datasets={datasets} />
+      <MiniLegend datasets={datasets} colorOf={colorOf} />
       <div className='w-full h-[75svh]'>
         <canvas
           ref={refCanvas}

@@ -71,7 +71,7 @@ sequenceDiagram
         logger ->> cache : コンテナごとに 1 点追加し、24 時間より古い点を捨てる
     end
 
-    web ->> server : GET /containers/{name}/cpu など
-    server ->> cache : 読み取り + ダウンサンプリング
-    server -->> web : JSON
+    web ->> server : GET /usages/cpu など（種別ごとに 1 回）
+    server ->> cache : 読み取り + 系列ごとのダウンサンプリング
+    server -->> web : JSON（全コンテナ分）
 ```
