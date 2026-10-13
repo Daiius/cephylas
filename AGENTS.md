@@ -35,6 +35,8 @@ Docker container のリソース使用率を記録・可視化する Web アプ�
 5. **`'use cache'` を付けた関数の中で `cookies()` / `headers()` / `searchParams` を呼ばない。**
    cache 越しに返す値はシリアライズできる形にする（`Error` インスタンスを返さない）。
 6. **UI は light テーマのみ。** Chart.js がダークテーマを持たない。
+7. **Access のサービストークンの値を、ログ・エラーメッセージ・戻り値・クライアントへ渡す props に
+   出さない。** 環境変数を読むのはサーバ専用のモジュール（`next/src/lib/access-headers.ts`）だけ。
 
 ## 公開リポジトリでの秘匿
 

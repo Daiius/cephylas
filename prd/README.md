@@ -35,8 +35,8 @@ Docker Engine API を Unix ソケット越しに自前の HTTP で叩き、REST 
 
 - **実装済み**: 10 秒間隔の収集 / JSONL ログ / メモリ上の 24 時間キャッシュ / ダウンサンプリング /
   全コンテナ分を 1 回で返す **bulk endpoint** とコンテナ別の REST API（[02](./02-core.md)） /
-  4 種のチャート / 凡例兼フィルタ。
-- **計画中**: **Cloudflare Access による閲覧と API の制限**（[04](./04-access-and-privacy.md)）。
+  4 種のチャート / 凡例兼フィルタ / Access のサービストークンのヘッダを付ける web 側の準備。
+- **計画中**: **Cloudflare Access の導入による閲覧と API の制限**（[04](./04-access-and-privacy.md)）。
 - **検討中**: 週・月単位へのログ要約。約束はしない。
 
 ## アーキ概観
@@ -67,6 +67,7 @@ Rust プロジェクトである。詳細は [01-architecture.md](./01-architect
 
 - 🔒 **秘密情報は文書にもコードにも書かない。** `.env*` の値、Cloudflare Access の
   サービストークンなどの資格情報。`.env*` は**読まない・コミットしない**。
+  環境変数の**名前**は書いてよい（`CF_ACCESS_CLIENT_ID` など）。**値は書かない。**
 - 🔒 **ドメイン・VPS の接続先・本番の具体設定は書かない。** `<frontend-domain>` /
   `<api-domain>` / `<root-domain>` のプレースホルダを用いる。TLS・リバースプロキシ・
   アクセス制限・ログローテーションは**姿勢のみ**を記述する。
@@ -87,6 +88,6 @@ Rust プロジェクトである。詳細は [01-architecture.md](./01-architect
 | [01-architecture.md](./01-architecture.md) | core と web の分担 / 通信の向き / リポジトリ構成 / 設計方針 |
 | [02-core.md](./02-core.md) | 収集 / 使用率の算出 / ログ形式 / キャッシュ / ダウンサンプリング / REST API / gap |
 | [03-web.md](./03-web.md) | ページ構成 / チャート / 凡例兼フィルタ / 色 / キャッシュ構成 |
-| [04-access-and-privacy.md](./04-access-and-privacy.md) | 公開してよい情報の線 / Cloudflare Access の計画 |
+| [04-access-and-privacy.md](./04-access-and-privacy.md) | 公開してよい情報の線 / Cloudflare Access の計画と web 側の準備 |
 | [05-deploy.md](./05-deploy.md) | 開発環境 / Vercel / VPS / ログローテーション（姿勢のみ） |
 | [_grilling/decisions.md](./_grilling/decisions.md) | 仕様策定の経緯（正典ではない） |

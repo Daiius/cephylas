@@ -20,6 +20,7 @@
 
 - 画面は `http://localhost:3000`、core の API は `http://localhost:7878` である。
 - `API_URL` が未設定なら、web は `http://localhost:7878` を叩く。
+  dev では `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` を設定しない（§本番の形）。
 - dev の core は `core/` をマウントして `cargo run` する（`core/Dockerfile`）。
   ソースを変えたらコンテナを再起動する。
 - `log/` をマウントし、`log/log_daily` を読み書きする。
@@ -64,8 +65,19 @@ dev だけに要る設定は `compose.dev.yml` に置く。本番は `compose.de
 | core | 作者の VPS 上のコンテナ |
 | nginx | 同じ VPS 上のコンテナ。`https://<api-domain>/cephylas/*` を core へ中継する |
 
-- **web は `main` への push で Vercel が自動でデプロイする。** Vercel 側で `API_URL` を
-  API の公開 URL に設定する。
+- **web は `main` への push で Vercel が自動でデプロイする。** Vercel 側に設定する環境変数は
+  次のとおりである（値はここに書かない）。
+
+  | 環境変数 | 内容 | 設定する時期 |
+  |---|---|---|
+  | `API_URL` | API の公開 URL | 設定済み |
+  | `CF_ACCESS_CLIENT_ID` | Cloudflare Access のサービストークンの ID | Access の導入時（計画中） |
+  | `CF_ACCESS_CLIENT_SECRET` | 同じサービストークンのシークレット | Access の導入時（計画中） |
+
+  - 下の 2 つは**必ず両方を設定する**。両方があるときだけ、web は core への fetch に
+    ヘッダを付ける（[04](./04-access-and-privacy.md) §web 側の準備（実装済み））。
+    Access を導入するまでは設定しない。未設定でも現状どおりに動く。
+  - 🔒 いずれにも `NEXT_PUBLIC_` を付けない。
 - **core の更新を自動で配置する仕組みはリポジトリに無い。** VPS 上で `compose.yml` に
   `compose.prod.yml` を重ねて起動する想定である。本番向けのイメージ定義は
   `core/Dockerfile.prod`（release ビルドを distroless に載せる）にある。

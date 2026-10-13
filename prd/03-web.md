@@ -38,6 +38,14 @@ Chart.js で描画する。
   `kind` は `cpu` / `memory` / `io` / `net`。
 - API の URL は環境変数 `API_URL` から読む。未設定なら `http://localhost:7878` を使う
   （dev で core を手元に立てたときの既定）。
+- **core へのすべての fetch に、Cloudflare Access のサービストークンのヘッダを付けられる。**
+  環境変数 `CF_ACCESS_CLIENT_ID` と `CF_ACCESS_CLIENT_SECRET` の**両方が空でない値で
+  設定されているときだけ**、`CF-Access-Client-Id` と `CF-Access-Client-Secret` を付ける。
+  どちらも未設定なら何も付けない（現状の本番と dev の動作）。片方だけの設定や、
+  ヘッダとして送れない値のときは、ヘッダを付けず、サーバ側のログに警告を出す。
+  組み立ては `next/src/lib/access-headers.ts` の 1 か所で行い、`fetchUsages` と互換の経路の
+  両方がそれを使う。🔒 値はサーバ側でだけ読み、ログにも戻り値にも含めない
+  （[04](./04-access-and-privacy.md) §web 側の準備（実装済み））。
 - レスポンスは zod で検証する。系列の `t` と `v` の長さが違う応答は、検証で失敗として扱う。
 - 戻り値は `FetchResult<T>`（`{ ok: true, data }` または `{ ok: false, error: { message } }`）で、
   例外は投げない。**error 側は `Error` インスタンスではなく、シリアライズできる形にする。**
