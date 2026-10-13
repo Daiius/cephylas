@@ -4,6 +4,9 @@
 // (import してよいのは fetchers.ts と fetchers-legacy.ts だけ)。
 // 🔒 トークンの値を、ログ・エラーメッセージ・戻り値 (FetchResult や props) に含めない。
 // このモジュールが値を渡す先は、fetch の headers だけである。
+// 🔒 ヘッダを付ける fetch では、リダイレクトを追わない。独自のヘッダは別オリジンへの
+// リダイレクトにも転送されるので、追うとトークンが core 以外の宛先へ渡りうる。
+// headers と redirect を別々に指定せず、必ず accessFetchInit() の戻り値をそのまま渡す。
 
 export type AccessHeaders = {
   'CF-Access-Client-Id': string;
@@ -47,15 +50,30 @@ export const buildAccessHeaders = (
   };
 };
 
+/** core への fetch に渡すオプション。ヘッダを付けるときは、必ずリダイレクトを追わない。 */
+export type AccessFetchInit =
+  | { headers: AccessHeaders; redirect: 'manual' }
+  | Record<string, never>;
+
+/**
+ * ヘッダの有無と、リダイレクトを追うかどうかを連動させる (純粋な関数)。
+ * ヘッダを付けないときは何も指定しない (fetch の既定どおりリダイレクトを追う)。
+ */
+export const toAccessFetchInit = (result: AccessHeadersResult): AccessFetchInit =>
+  result.status === 'ok' ? { headers: result.headers, redirect: 'manual' } : {};
+
 // 警告はプロセスにつき 1 回だけ出す (リクエストのたびに出すと、互換の経路で数十行になる)。
 let warned = false;
 
 /**
- * core への fetch に付けるヘッダを返す。core へのリクエストは、必ずこれを通す。
+ * core への fetch に渡すオプションを返す。core へのリクエストは、必ずこれを通す。
  * 環境変数はサーバ側でだけ読む (`NEXT_PUBLIC_` を付けない)。
  * 設定に誤りがあるときは、ヘッダを付けず、サーバ側のログに警告を出す (値は出さない)。
+ *
+ * ヘッダを付けたリクエストが 3xx を受けたときは、追わずにその応答が返る
+ * (`ok` は false)。呼び出し側では「2xx 以外のステータス」として扱われる。
  */
-export const accessHeaders = (): AccessHeaders | Record<string, never> => {
+export const accessFetchInit = (): AccessFetchInit => {
   const result = buildAccessHeaders(
     process.env.CF_ACCESS_CLIENT_ID,
     process.env.CF_ACCESS_CLIENT_SECRET,
@@ -64,11 +82,11 @@ export const accessHeaders = (): AccessHeaders | Record<string, never> => {
     warned = true;
     console.warn(
       result.status === 'partial'
-        ? 'accessHeaders: only one of CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET is set; ' +
+        ? 'accessFetchInit: only one of CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET is set; ' +
             'sending no Cloudflare Access headers'
-        : 'accessHeaders: CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET contain characters ' +
+        : 'accessFetchInit: CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET contain characters ' +
             'not allowed in a header value; sending no Cloudflare Access headers',
     );
   }
-  return result.headers;
+  return toAccessFetchInit(result);
 };

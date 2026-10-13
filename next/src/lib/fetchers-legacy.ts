@@ -10,7 +10,7 @@
 // ここでは 'use cache' を宣言しない (呼び出す chart 側の cache に含まれる)。
 import z from 'zod';
 
-import { accessHeaders } from '@/lib/access-headers';
+import { accessFetchInit } from '@/lib/access-headers';
 
 type LegacyKind = 'cpu' | 'memory' | 'io' | 'net';
 type LegacySeries = { t: number[]; v: (number | null)[] };
@@ -54,8 +54,9 @@ const seriesOf: Record<
 };
 
 // この経路のリクエストは、すべてここを通る (Cloudflare Access のヘッダもここで付ける)。
+// ヘッダを付けるときはリダイレクトを追わないので、3xx は下の失敗に入る。
 const getJson = async <T>(url: string, schema: z.ZodType<T>): Promise<T> => {
-  const response = await fetch(url, { headers: accessHeaders() });
+  const response = await fetch(url, accessFetchInit());
   if (!response.ok) {
     throw new Error(`fetch failed with ${response.status}`);
   }

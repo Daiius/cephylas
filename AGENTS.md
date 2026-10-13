@@ -37,6 +37,7 @@ Docker container のリソース使用率を記録・可視化する Web アプ�
 6. **UI は light テーマのみ。** Chart.js がダークテーマを持たない。
 7. **Access のサービストークンの値を、ログ・エラーメッセージ・戻り値・クライアントへ渡す props に
    出さない。** 環境変数を読むのはサーバ専用のモジュール（`next/src/lib/access-headers.ts`）だけ。
+   core への fetch には、必ず `accessFetchInit()` の戻り値を渡す（ヘッダを付けるときはリダイレクトを追わない）。
 
 ## 公開リポジトリでの秘匿
 
