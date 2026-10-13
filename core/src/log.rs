@@ -36,13 +36,21 @@ pub struct MemoryStats {
 }
 #[derive(Debug)]
 pub struct IoStats {
+    /// 全デバイスの合計
     read: Option<u64>,
     write: Option<u64>,
+    /// デバイス（major:minor）ごとの積算値。差分はデバイスごとに取る
+    read_by_device: Vec<(String, u64)>,
+    write_by_device: Vec<(String, u64)>,
 }
 #[derive(Debug)]
 pub struct NetStats {
+    /// 全インターフェースの合計
     send: Option<u64>,
     recv: Option<u64>,
+    /// インターフェースごとの積算値。差分はインターフェースごとに取る
+    send_by_interface: Vec<(String, u64)>,
+    recv_by_interface: Vec<(String, u64)>,
 }
 #[derive(Debug)]
 pub struct Stats {
@@ -58,8 +66,14 @@ impl Default for Stats {
             time: None,
             cpu: CpuStats { total: None, system: None, ncpu: None, },
             memory: MemoryStats { used: None, available: None, },
-            io: IoStats { read: None, write: None },
-            net: NetStats { recv: None, send: None },
+            io: IoStats {
+                read: None, write: None,
+                read_by_device: Vec::new(), write_by_device: Vec::new(),
+            },
+            net: NetStats {
+                recv: None, send: None,
+                recv_by_interface: Vec::new(), send_by_interface: Vec::new(),
+            },
         }
     }
 }
@@ -319,29 +333,71 @@ fn used_memory(memory_stats: &json::JsonValue) -> Option<u64> {
     Some(usage - inactive_file.unwrap_or(0))
 }
 
-/// 全インターフェースの積算値（バイト）を合算します
-/// networks が無ければ（ホストネットワークなど）None です
-fn sum_networks(networks: &json::JsonValue, key: &str) -> Option<u64> {
-    if !networks.is_object() {
+/// 内訳（名前ごとの積算値）の合計を返します。内訳が無ければ None です
+fn total_of(parts: &[(String, u64)]) -> Option<u64> {
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.iter().map(|(_, v)| *v).fold(0_u64, u64::saturating_add))
+}
+
+/// インターフェースごとの積算値（バイト）を取り出します
+/// networks が無ければ（ホストネットワークなど）空です
+fn network_counters(networks: &json::JsonValue, key: &str) -> Vec<(String, u64)> {
+    networks.entries()
+        .filter_map(|(name, interface)|
+            interface[key].as_u64().map(|v| (name.to_string(), v))
+        )
+        .collect()
+}
+
+/// デバイス（major:minor）ごとの積算値（バイト）のうち、op が一致するものを取り出します
+/// op は大文字小文字を区別しません（cgroup v1 は Read / Write、v2 は read / write）
+/// 一致する要素が1つも無ければ（配列が無い・null・空の場合を含む）空です
+fn blkio_counters(entries: &json::JsonValue, op: &str) -> Vec<(String, u64)> {
+    let mut counters: Vec<(String, u64)> = Vec::new();
+    for entry in entries.members() {
+        if !entry["op"].as_str().is_some_and(|v| v.eq_ignore_ascii_case(op)) {
+            continue;
+        }
+        let Some(value) = entry["value"].as_u64() else { continue; };
+        let device = format!("{}:{}", entry["major"], entry["minor"]);
+        // 同じデバイスの要素が複数あれば足す
+        match counters.iter_mut().find(|(name, _)| *name == device) {
+            Some((_, sum)) => *sum = sum.saturating_add(value),
+            None => counters.push((device, value)),
+        }
+    }
+
+    counters
+}
+
+/// 内訳ごとの差分を合算して、前回からの増分（バイト）を求めます
+///
+/// 合計同士の差ではなく、名前（インターフェース・デバイス）ごとの差を足します
+/// 合計の差だと、大きな積算値を持つものが外れた tick で合計が減り、
+/// 残ったものの増分まで 0 になってしまうためです
+/// - 両方にあるもの: 差分を足す（積算値が戻っていたら、そのものの差分だけを 0 とする）
+/// - 今回だけにあるもの（追加された）: 0 から数え始めるので、今回の値を足す
+/// - 前回だけにあるもの（外された）: 数えない
+/// 今回または前回の内訳が無ければ None です
+fn increase_of(
+    current: &[(String, u64)],
+    previous: &[(String, u64)],
+) -> Option<u64> {
+    if current.is_empty() || previous.is_empty() {
         return None;
     }
     Some(
-        networks.entries()
-            .filter_map(|(_, interface)| interface[key].as_u64())
+        current.iter()
+            .map(|(name, value)| {
+                let before = previous.iter()
+                    .find(|(prev_name, _)| prev_name == name)
+                    .map_or(0, |(_, prev_value)| *prev_value);
+                value.saturating_sub(before)
+            })
             .fold(0_u64, u64::saturating_add)
     )
-}
-
-/// 全デバイスの積算値（バイト）のうち、op が一致するものを合算します
-/// op は大文字小文字を区別しません（cgroup v1 は Read / Write、v2 は read / write）
-/// 一致する要素が1つも無ければ（配列が無い・null・空の場合を含む）None です
-fn sum_blkio(entries: &json::JsonValue, op: &str) -> Option<u64> {
-    entries.members()
-        .filter(|entry|
-            entry["op"].as_str().is_some_and(|v| v.eq_ignore_ascii_case(op))
-        )
-        .filter_map(|entry| entry["value"].as_u64())
-        .fold(None, |sum, v| Some(sum.unwrap_or(0_u64).saturating_add(v)))
 }
 
 fn reshape_json(
@@ -362,11 +418,11 @@ fn reshape_json(
     let available_memory =
         json["memory_stats"]["limit"]
         .as_u64();
-    let net_rx = sum_networks(&json["networks"], "rx_bytes");
-    let net_tx = sum_networks(&json["networks"], "tx_bytes");
+    let net_rx = network_counters(&json["networks"], "rx_bytes");
+    let net_tx = network_counters(&json["networks"], "tx_bytes");
     let blkio = &json["blkio_stats"]["io_service_bytes_recursive"];
-    let blkio_read = sum_blkio(blkio, "read");
-    let blkio_write = sum_blkio(blkio, "write");
+    let blkio_read = blkio_counters(blkio, "read");
+    let blkio_write = blkio_counters(blkio, "write");
     let time = json["read"].as_str();
 
     Stats {
@@ -380,12 +436,16 @@ fn reshape_json(
             available: available_memory
         },
         io: IoStats {
-            read: blkio_read,
-            write: blkio_write, 
+            read: total_of(&blkio_read),
+            write: total_of(&blkio_write),
+            read_by_device: blkio_read,
+            write_by_device: blkio_write,
         },
         net: NetStats {
-            send: net_tx,
-            recv: net_rx,
+            send: total_of(&net_tx),
+            recv: total_of(&net_rx),
+            send_by_interface: net_tx,
+            recv_by_interface: net_rx,
         }
     }
 }
@@ -630,18 +690,16 @@ fn valid_time_millis(time_str: &str) -> Option<i64> {
     time::iso8601_to_millis(time_str).ok().filter(|millis| *millis > 0)
 }
 
-/// 積算値（バイト）の差分を、実測の経過時間で割って kB/s にします
+/// 増分（バイト）を、実測の経過時間で割って kB/s にします
 /// bytes / ms = kB / s（1 kB = 1000 バイト）
 /// 切り捨てずに小数で返します（整数にすると 1 kB/s 未満が 0 になる）
 fn rate_kb_per_s(
-    current: Option<u64>,
-    previous: Option<u64>,
+    current: &[(String, u64)],
+    previous: &[(String, u64)],
     elapsed_millis: u64,
 ) -> Option<f32> {
-    current.zip(previous)
-        .map(|(a, b)|
-            (a.saturating_sub(b) as f64 / elapsed_millis as f64) as f32
-        )
+    increase_of(current, previous)
+        .map(|bytes| (bytes as f64 / elapsed_millis as f64) as f32)
         .filter(|rate| rate.is_finite())
 }
 
@@ -732,18 +790,18 @@ fn calc_usages_with(
 
         // IO calculations
         let io_read_kb_per_s = rate_kb_per_s(
-            stats.io.read, prev_stats.io.read, elapsed_millis,
+            &stats.io.read_by_device, &prev_stats.io.read_by_device, elapsed_millis,
         );
         let io_write_kb_per_s = rate_kb_per_s(
-            stats.io.write, prev_stats.io.write, elapsed_millis,
+            &stats.io.write_by_device, &prev_stats.io.write_by_device, elapsed_millis,
         );
 
         // Net calculations
         let net_send_kb_per_s = rate_kb_per_s(
-            stats.net.send, prev_stats.net.send, elapsed_millis,
+            &stats.net.send_by_interface, &prev_stats.net.send_by_interface, elapsed_millis,
         );
         let net_recv_kb_per_s = rate_kb_per_s(
-            stats.net.recv, prev_stats.net.recv, elapsed_millis,
+            &stats.net.recv_by_interface, &prev_stats.net.recv_by_interface, elapsed_millis,
         );
 
         usages.insert(
@@ -2296,8 +2354,13 @@ mod tests {
         assert_eq!(multi.net.recv, Some(12_001));
         assert_eq!(multi.net.send, Some(20_302));
 
-        // 速度も合算した値の差分: (12001 - 3000) / 10000 ms、(20302 - 4000) / 10000 ms
-        let usage = usage_between(single, multi);
+        // 速度は、インターフェースごとの差分の合算
+        // recv: (9000 + 0 + 1) / 10000 ms、send: (16000 + 300 + 2) / 10000 ms
+        let before = stats_from_parts(T0, None, Some(concat!(
+            r#"{"eth1":{"rx_bytes":1000,"tx_bytes":4000},"#,
+            r#""eth2":{"rx_bytes":2000,"tx_bytes":0}}"#,
+        )), None);
+        let usage = usage_between(before, multi);
         assert_eq!(usage.net.recvkB, Some(12));
         assert_eq!(usage.net.sendkB, Some(20));
         let line = usage.to_string();
@@ -2484,5 +2547,165 @@ mod tests {
         assert_eq!(usage.cpu.percentage, Some(expected));
         assert_eq!(usage.cpu.total, Some(1));
         assert_eq!(usage.cpu.system, Some(10_000));
+    }
+
+    fn net_stats(read: &str, networks: &str) -> Stats {
+        stats_from_parts(read, None, Some(networks), None)
+    }
+
+    fn io_stats(read: &str, blkio: &str) -> Stats {
+        stats_from_parts(read, None, None, Some(blkio))
+    }
+
+    #[test]
+    fn removed_interface_does_not_hide_the_traffic_of_the_others() {
+        // eth1 は大きな積算値を持つ。次の tick までに外され、eth0 だけが残る
+        let usage = usage_between(
+            net_stats(T0, concat!(
+                r#"{"eth0":{"rx_bytes":0,"tx_bytes":500},"#,
+                r#""eth1":{"rx_bytes":1000000,"tx_bytes":2000000}}"#,
+            )),
+            net_stats(T10, r#"{"eth0":{"rx_bytes":1000,"tx_bytes":4000}}"#),
+        );
+        // eth0 の増分（1,000 / 3,500 バイト）が、合計の減少に埋もれずに残る
+        // 合計同士の差（1,000 - 1,000,000）だと 0 になっていた
+        assert_eq!(usage.net.recvkBps, Some(0.1));
+        assert_eq!(usage.net.sendkBps, Some(0.35));
+        // 積算値は、その時点で残っているインターフェースの合計
+        assert_eq!(usage.net.recvkB, Some(1));
+        assert_eq!(usage.net.sendkB, Some(4));
+        let line = usage.to_string();
+        assert!(line.contains(
+            r#""net":{"recvkB":1,"sendkB":4,"recvkBps":0.10,"sendkBps":0.35}"#
+        ), "{}", line);
+    }
+
+    #[test]
+    fn added_interface_counts_from_zero() {
+        // eth1 が追加された。新しいインターフェースの積算値は 0 から始まるので、
+        // 今回の値がそのまま増分になる
+        let usage = usage_between(
+            net_stats(T0, r#"{"eth0":{"rx_bytes":50000,"tx_bytes":60000}}"#),
+            net_stats(T10, concat!(
+                r#"{"eth0":{"rx_bytes":51000,"tx_bytes":60000},"#,
+                r#""eth1":{"rx_bytes":2000,"tx_bytes":500}}"#,
+            )),
+        );
+        // (1,000 + 2,000) / 10,000 ms、(0 + 500) / 10,000 ms
+        assert_eq!(usage.net.recvkBps, Some(0.3));
+        assert_eq!(usage.net.sendkBps, Some(0.05));
+
+        // 入れ替わった場合: 外された分は数えず、追加された分は 0 から数える
+        let usage = usage_between(
+            net_stats(T0, r#"{"eth0":{"rx_bytes":900000,"tx_bytes":900000}}"#),
+            net_stats(T10, r#"{"eth1":{"rx_bytes":2000,"tx_bytes":0}}"#),
+        );
+        assert_eq!(usage.net.recvkBps, Some(0.2));
+        assert_eq!(usage.net.sendkBps, Some(0.0));
+    }
+
+    #[test]
+    fn counter_reset_of_one_interface_does_not_cancel_the_others() {
+        // eth1 の積算値だけが戻った（つなぎ直しなど）。eth1 の差分だけを 0 とし、
+        // eth0 の増分は残す
+        let usage = usage_between(
+            net_stats(T0, concat!(
+                r#"{"eth0":{"rx_bytes":1000,"tx_bytes":1000},"#,
+                r#""eth1":{"rx_bytes":800000,"tx_bytes":800000}}"#,
+            )),
+            net_stats(T10, concat!(
+                r#"{"eth0":{"rx_bytes":6000,"tx_bytes":1000},"#,
+                r#""eth1":{"rx_bytes":300,"tx_bytes":0}}"#,
+            )),
+        );
+        assert_eq!(usage.net.recvkBps, Some(0.5));
+        assert_eq!(usage.net.sendkBps, Some(0.0));
+    }
+
+    #[test]
+    fn networks_appearing_or_disappearing_as_a_whole_is_null() {
+        let some = r#"{"eth0":{"rx_bytes":1000,"tx_bytes":1000}}"#;
+        // 前回は networks が無かった / 今回は無い。差分を取れないので null
+        for (before, after) in [
+            (stats_from_parts(T0, None, None, None), net_stats(T10, some)),
+            (net_stats(T0, some), stats_from_parts(T10, None, None, None)),
+            (net_stats(T0, "{}"), net_stats(T10, some)),
+        ] {
+            let usage = usage_between(before, after);
+            assert_eq!(usage.net.recvkBps, None);
+            assert_eq!(usage.net.sendkBps, None);
+        }
+    }
+
+    #[test]
+    fn removed_device_does_not_hide_the_io_of_the_others() {
+        // 8:16 は大きな積算値を持つ。次の tick までに要素が消え、8:0 だけが残る
+        let usage = usage_between(
+            io_stats(T0, concat!(
+                r#"[{"major":8,"minor":0,"op":"read","value":1000},"#,
+                r#"{"major":8,"minor":0,"op":"write","value":2000},"#,
+                r#"{"major":8,"minor":16,"op":"read","value":5000000},"#,
+                r#"{"major":8,"minor":16,"op":"write","value":6000000}]"#,
+            )),
+            io_stats(T10, concat!(
+                r#"[{"major":8,"minor":0,"op":"read","value":4500},"#,
+                r#"{"major":8,"minor":0,"op":"write","value":3000}]"#,
+            )),
+        );
+        assert_eq!(usage.io.readkBps, Some(0.35));
+        assert_eq!(usage.io.writekBps, Some(0.1));
+        assert_eq!(usage.io.readkB, Some(4));
+    }
+
+    #[test]
+    fn io_increase_is_taken_per_device() {
+        // 追加されたデバイス（253:0）は 0 から数える
+        // major が同じで minor が違うデバイスは、別のものとして扱う
+        let usage = usage_between(
+            io_stats(T0, concat!(
+                r#"[{"major":8,"minor":0,"op":"Read","value":1000},"#,
+                r#"{"major":8,"minor":16,"op":"Read","value":700000},"#,
+                r#"{"major":8,"minor":0,"op":"Write","value":0}]"#,
+            )),
+            io_stats(T10, concat!(
+                r#"[{"major":8,"minor":0,"op":"read","value":2000},"#,
+                // 積算値が戻ったデバイス。このデバイスの差分だけを 0 とする
+                r#"{"major":8,"minor":16,"op":"read","value":100},"#,
+                r#"{"major":253,"minor":0,"op":"read","value":500},"#,
+                r#"{"major":8,"minor":0,"op":"write","value":0},"#,
+                r#"{"major":253,"minor":0,"op":"write","value":3500}]"#,
+            )),
+        );
+        // read: 1,000 + 0 + 500、write: 0 + 3,500
+        assert_eq!(usage.io.readkBps, Some(0.15));
+        assert_eq!(usage.io.writekBps, Some(0.35));
+
+        // 同じデバイスの要素が複数あれば、足してから差を取る
+        let stats = io_stats(T0, concat!(
+            r#"[{"major":8,"minor":0,"op":"read","value":10},"#,
+            r#"{"major":8,"minor":0,"op":"Read","value":5}]"#,
+        ));
+        assert_eq!(stats.io.read, Some(15));
+        assert_eq!(stats.io.read_by_device, vec![("8:0".to_string(), 15)]);
+    }
+
+    #[test]
+    fn interface_removed_while_stats_were_carried_over() {
+        // 採れなかった tick をまたいでも、内訳ごとの前回値で差分を取る
+        let net = |read: &str, networks: &str| Some(net_stats(read, networks));
+        let mut logger = Logger::new();
+        logger.tick(Ok(collected(vec![("web", net(T0, concat!(
+            r#"{"eth0":{"rx_bytes":0,"tx_bytes":0},"#,
+            r#""eth1":{"rx_bytes":9000000,"tx_bytes":9000000}}"#,
+        )))]))).unwrap();
+        assert!(!logger.tick(Ok(collected(vec![("web", None)]))).unwrap());
+        // 20秒後。eth1 は外されている。eth0 の 7,000 バイトを 20秒で割る
+        assert!(logger.tick(Ok(collected(vec![("web", net(
+            "2026-01-01T00:00:20Z", r#"{"eth0":{"rx_bytes":7000,"tx_bytes":0}}"#,
+        ))]))).unwrap());
+        let lock = logger.cache.read().unwrap();
+        let point = lock.get("web").unwrap()[0];
+        assert_eq!(point.recv_kbps, Some(0.35));
+        assert_eq!(point.send_kbps, Some(0.0));
     }
 }
