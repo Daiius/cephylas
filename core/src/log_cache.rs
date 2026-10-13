@@ -119,6 +119,29 @@ impl UsageKind {
     }
 }
 
+/// 途切れとみなす、元の隣り合う2点の時刻の差（これを超えたら途切れ）
+/// 収集は10秒間隔なので、6回分を超えて点が無い場合にあたります
+pub const GAP_THRESHOLD_MILLIS: i64 = 60_000;
+
+/// 途切れの目印つきの系列の1要素
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Sample<'a> {
+    /// 間引きで選ばれた点
+    Point(&'a UsagePoint),
+    /// 途切れの目印。値は目印の時刻（途切れの直前の元の点の時刻 + 1ミリ秒）です
+    /// 値を持たない点（null）として出力し、グラフの線をここで切ります
+    Gap(i64),
+}
+
+impl Sample<'_> {
+    pub fn time_ms(&self) -> i64 {
+        match self {
+            Sample::Point(point) => point.time_ms,
+            Sample::Gap(time_ms) => *time_ms,
+        }
+    }
+}
+
 pub struct DownsampleOption {
     pub nsample: usize,
 }
@@ -303,28 +326,76 @@ impl UsageCache {
         series: Series,
     ) -> Option<Vec<&UsagePoint>> {
         let data = self.map.get(container_name)?;
-        let n = data.len();
-        let nsample = downsample_option.nsample;
-        if nsample >= n || nsample < 3 {
-            return Some(data.iter().collect());
-        }
-
-        let origin = data[0].time_ms;
-        let xy = |i: usize| {
-            let point = &data[i];
-            (
-                point.time_ms.wrapping_sub(origin) as f64 / 1000.0,
-                series.value(point),
-            )
-        };
 
         Some(
-            lttb_indices(n, nsample, xy)
+            selected_indices(data, downsample_option, series)
                 .into_iter()
                 .map(|i| &data[i])
                 .collect()
         )
     }
+
+    /// downsample と同じ点を選んだうえで、途切れの位置に目印を挟んで返します
+    /// 知らないコンテナ名なら None を返します
+    ///
+    /// 選ばれて隣り合う2点の間に、元の（間引く前の）隣り合う2点の時刻の差が
+    /// GAP_THRESHOLD_MILLIS を超える箇所があれば、その2点の間に目印を1つだけ挟みます
+    /// 複数あっても1つで、最初の途切れの位置を使います
+    /// 目印の時刻は前後の点の間に入るので、時刻の昇順は保たれます
+    /// 元の点は、系列全体で1回だけ走査します
+    pub fn downsample_with_gaps(
+        &self,
+        container_name: &str,
+        downsample_option: &DownsampleOption,
+        series: Series,
+    ) -> Option<Vec<Sample<'_>>> {
+        let data = self.map.get(container_name)?;
+        let indices = selected_indices(data, downsample_option, series);
+
+        let mut samples = Vec::with_capacity(indices.len());
+        let mut previous: Option<usize> = None;
+        for index in indices {
+            if let Some(previous) = previous {
+                let gap = (previous..index).find(|&i| {
+                    data[i + 1].time_ms.saturating_sub(data[i].time_ms)
+                        > GAP_THRESHOLD_MILLIS
+                });
+                if let Some(i) = gap {
+                    // 次の点は60秒より先にあるので、+1 しても追い越さない
+                    samples.push(Sample::Gap(data[i].time_ms + 1));
+                }
+            }
+            samples.push(Sample::Point(&data[index]));
+            previous = Some(index);
+        }
+
+        Some(samples)
+    }
+}
+
+/// 1系列から残す点の添字を、昇順で返します
+/// 点数が nsample 以下なら全部、超えていれば LTTB で nsample 個を選びます
+fn selected_indices(
+    data: &VecDeque<UsagePoint>,
+    downsample_option: &DownsampleOption,
+    series: Series,
+) -> Vec<usize> {
+    let n = data.len();
+    let nsample = downsample_option.nsample;
+    if nsample >= n || nsample < 3 {
+        return (0..n).collect();
+    }
+
+    let origin = data[0].time_ms;
+    let xy = |i: usize| {
+        let point = &data[i];
+        (
+            point.time_ms.wrapping_sub(origin) as f64 / 1000.0,
+            series.value(point),
+        )
+    };
+
+    lttb_indices(n, nsample, xy)
 }
 
 pub type SharedUsageCache = Arc<RwLock<UsageCache>>;
@@ -698,6 +769,193 @@ mod tests {
             .downsample("web", &DownsampleOption::default(), Series::NetSend)
             .unwrap();
         assert!(sampled.iter().any(|p| p.time_ms == spike && p.send_kbps == Some(0.35)));
+    }
+
+    // ---- 途切れの目印 ----
+
+    /// 時刻の列から "web" の系列を作る（値は添字ごとに変える）
+    fn cache_at(times: &[i64]) -> UsageCache {
+        let mut cache = UsageCache::new();
+        for (i, t) in times.iter().enumerate() {
+            assert!(cache.insert("web", point(*t, (i * 7 % 13) as u32)));
+        }
+        cache
+    }
+
+    fn with_gaps<'a>(
+        cache: &'a UsageCache,
+        option: &DownsampleOption,
+        series: Series,
+    ) -> Vec<Sample<'a>> {
+        cache.downsample_with_gaps("web", option, series).unwrap()
+    }
+
+    fn gap_times(samples: &[Sample]) -> Vec<i64> {
+        samples.iter()
+            .filter_map(|s| match s {
+                Sample::Gap(t) => Some(*t),
+                Sample::Point(_) => None,
+            })
+            .collect()
+    }
+
+    /// 目印を除くと downsample の結果と同じで、時刻が昇順であること
+    fn assert_same_points_in_order(
+        cache: &UsageCache,
+        option: &DownsampleOption,
+        series: Series,
+        samples: &[Sample],
+    ) {
+        let points: Vec<&UsagePoint> = samples.iter()
+            .filter_map(|s| match s {
+                Sample::Point(p) => Some(*p),
+                Sample::Gap(_) => None,
+            })
+            .collect();
+        assert_eq!(points, cache.downsample("web", option, series).unwrap());
+        assert!(samples.windows(2).all(|w| w[0].time_ms() < w[1].time_ms()));
+    }
+
+    #[test]
+    fn series_without_gaps_gets_no_marker() {
+        let option = DownsampleOption::default();
+        for n in [0_i64, 1, 2, 512, 2000] {
+            let times: Vec<i64> = (0..n).map(|i| BASE_MS + i * TICK_MS).collect();
+            let cache = cache_at(&times);
+            if n == 0 {
+                assert!(cache.downsample_with_gaps("web", &option, Series::Cpu).is_none());
+                continue;
+            }
+            let samples = with_gaps(&cache, &option, Series::Cpu);
+            assert!(gap_times(&samples).is_empty());
+            assert_eq!(samples.len(), (n as usize).min(512));
+            assert_same_points_in_order(&cache, &option, Series::Cpu, &samples);
+        }
+    }
+
+    #[test]
+    fn gap_is_marked_only_beyond_the_threshold() {
+        let option = DownsampleOption::default();
+        // ちょうど60秒の差は途切れではない
+        let cache = cache_at(&[BASE_MS, BASE_MS + GAP_THRESHOLD_MILLIS]);
+        assert!(gap_times(&with_gaps(&cache, &option, Series::Cpu)).is_empty());
+
+        // 1ミリ秒でも超えたら途切れ。目印は直前の点の 1 ミリ秒後
+        let cache = cache_at(&[BASE_MS, BASE_MS + GAP_THRESHOLD_MILLIS + 1]);
+        let samples = with_gaps(&cache, &option, Series::Cpu);
+        assert_eq!(samples.len(), 3);
+        assert_eq!(samples[1], Sample::Gap(BASE_MS + 1));
+        assert_same_points_in_order(&cache, &option, Series::Cpu, &samples);
+    }
+
+    #[test]
+    fn gaps_are_marked_in_a_series_that_is_not_downsampled() {
+        // 3点 → 5分の途切れ → 2点 → 61秒の途切れ → 1点
+        let times = [
+            BASE_MS, BASE_MS + 10_000, BASE_MS + 20_000,
+            BASE_MS + 320_000, BASE_MS + 330_000,
+            BASE_MS + 391_000,
+        ];
+        let cache = cache_at(&times);
+        let option = DownsampleOption::default();
+        for series in [Series::Cpu, Series::IoWrite, Series::NetRecv] {
+            let samples = with_gaps(&cache, &option, series);
+            let got: Vec<i64> = samples.iter().map(|s| s.time_ms()).collect();
+            assert_eq!(got, vec![
+                BASE_MS, BASE_MS + 10_000, BASE_MS + 20_000,
+                BASE_MS + 20_001,
+                BASE_MS + 320_000, BASE_MS + 330_000,
+                BASE_MS + 330_001,
+                BASE_MS + 391_000,
+            ]);
+            assert_eq!(gap_times(&samples), vec![BASE_MS + 20_001, BASE_MS + 330_001]);
+            assert_same_points_in_order(&cache, &option, series, &samples);
+        }
+    }
+
+    #[test]
+    fn gap_is_marked_once_in_a_downsampled_series() {
+        // 2000点。添字 1000 と 1001 の間だけ 1 時間空ける
+        let times: Vec<i64> = (0..2000_i64)
+            .map(|i| BASE_MS + i * TICK_MS + if i > 1000 { 3_600_000 } else { 0 })
+            .collect();
+        let cache = cache_at(&times);
+        let option = DownsampleOption::default();
+        for series in [Series::Cpu, Series::Memory, Series::IoRead, Series::NetSend] {
+            let samples = with_gaps(&cache, &option, series);
+            assert_eq!(samples.len(), 513);
+            // 途切れの直前の点が選ばれていなくても、目印はその点の 1 ミリ秒後
+            assert_eq!(gap_times(&samples), vec![times[1000] + 1]);
+            assert_same_points_in_order(&cache, &option, series, &samples);
+        }
+    }
+
+    #[test]
+    fn several_gaps_between_two_selected_points_get_one_marker() {
+        // 全部の間隔が途切れ（70秒）の10点を、3点に間引く
+        // 選ばれた点の間ごとに目印は1つで、最初の途切れ（= 手前の点の直後）に置く
+        let times: Vec<i64> = (0..10_i64).map(|i| BASE_MS + i * 70_000).collect();
+        let cache = cache_at(&times);
+        let option = DownsampleOption { nsample: 3 };
+        let picked = cache.downsample("web", &option, Series::Cpu).unwrap();
+        assert_eq!(picked.len(), 3);
+        let samples = with_gaps(&cache, &option, Series::Cpu);
+        assert_eq!(samples.len(), 5);
+        assert_eq!(
+            gap_times(&samples),
+            vec![picked[0].time_ms + 1, picked[1].time_ms + 1],
+        );
+        assert_same_points_in_order(&cache, &option, Series::Cpu, &samples);
+
+        // 間引かなければ、途切れごとに1つずつ入る
+        let all = with_gaps(&cache, &DownsampleOption::default(), Series::Cpu);
+        assert_eq!(all.len(), 19);
+        assert_eq!(gap_times(&all).len(), 9);
+    }
+
+    #[test]
+    fn markers_match_a_naive_scan_of_the_original_points() {
+        // 24時間分の点数で、途切れを散らす（1つのバケットに複数入るものを含む）
+        // 目印の位置を、選ばれた2点ごとに元の点を調べ直す素朴な方法と比べる
+        let gap_after = [
+            0_usize, 300, 1000, 1001, 1002, 1003, 1004,
+            4000, 4100, 8000, 8638,
+        ];
+        let mut times = Vec::new();
+        let mut t = BASE_MS;
+        for i in 0..MAX_LOG_LENGTH {
+            times.push(t);
+            t += if gap_after.contains(&i) { 61_000 } else { 1000 };
+        }
+        let cache = cache_at(&times);
+        let option = DownsampleOption::default();
+        for series in [
+            Series::Cpu, Series::Memory, Series::IoRead,
+            Series::IoWrite, Series::NetRecv, Series::NetSend,
+        ] {
+            let picked = cache.downsample("web", &option, series).unwrap();
+            let mut expected = Vec::new();
+            let mut most_gaps_in_a_pair = 0;
+            for pair in picked.windows(2) {
+                let between: Vec<i64> = gap_after.iter()
+                    .map(|i| times[*i])
+                    .filter(|t| *t >= pair[0].time_ms && *t < pair[1].time_ms)
+                    .collect();
+                most_gaps_in_a_pair = most_gaps_in_a_pair.max(between.len());
+                if let Some(first) = between.first() {
+                    expected.push(first + 1);
+                }
+            }
+            // 5連続の途切れは高々2つのバケットに入るので、どこかの2点の間に複数入る
+            assert!(most_gaps_in_a_pair >= 2);
+
+            let samples = with_gaps(&cache, &option, series);
+            assert_eq!(gap_times(&samples), expected);
+            // 目印は途切れの数を超えない
+            assert!(expected.len() <= gap_after.len());
+            assert_eq!(samples.len(), 512 + expected.len());
+            assert_same_points_in_order(&cache, &option, series, &samples);
+        }
     }
 
     #[test]
