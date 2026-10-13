@@ -11,6 +11,14 @@ const DAILY_LOG_PATH: &str = "./log/log_daily";
 const DOCKER_API_CONTAINERS: &str = "/containers/json";
 const DOCKER_API_STATS: &str = "/containers/{}/stats?stream=false&one-shot=true";
 
+/// Docker ソケットへの1回の問い合わせに掛けてよい時間の上限
+/// 1回の読み書きの待ち時間の上限と、接続してから応答を読み切るまでの合計の上限を兼ねる
+/// (dockerd が応答を返さないときに、logger が止まり続けないようにするため)
+const DOCKER_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 収集の間隔
+const TICK: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// 時刻が進まない統計が、同じコンテナでこの回数だけ続いたら、
 /// 前回の統計を今回の値に置き換える
 const MAX_STALLED_TICKS: u8 = 3;
@@ -236,6 +244,10 @@ impl std::fmt::Display for Usages {
     }
 }
 
+/// Docker ソケットに GET を1回送り、応答（ヘッダ込み）を文字列で返します
+///
+/// 読み書きには DOCKER_IO_TIMEOUT のタイムアウトを掛け、
+/// 接続してから応答を読み切るまでの合計も同じ時間で打ち切ります
 fn call_docker_api<
     P: AsRef<std::path::Path>,
     S: AsRef<str>,
@@ -245,6 +257,9 @@ fn call_docker_api<
 ) -> Result<String, std::io::Error> {
     let mut stream = 
         std::os::unix::net::UnixStream::connect(socket_path)?;
+    let started = std::time::Instant::now();
+    stream.set_read_timeout(Some(DOCKER_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(DOCKER_IO_TIMEOUT))?;
     let request = format!(
         "GET {} HTTP/1.1\r\n\
          Host: localhost\r\n\
@@ -255,10 +270,60 @@ fn call_docker_api<
 
     std::io::Write::write_all(&mut stream, request.as_bytes())?;
 
-    let mut response = String::new();
-    std::io::Read::read_to_string(&mut stream, &mut response)?;
+    // 応答を読むのに使えるのは、接続と送信に掛かった分を引いた残りの時間
+    read_response_within(
+        &mut stream,
+        DOCKER_IO_TIMEOUT.saturating_sub(started.elapsed()),
+        |stream, remaining| stream.set_read_timeout(Some(remaining)),
+    )
+}
 
-    Ok(response)
+/// 相手が閉じるまで応答を読みます。読み切るまでの合計が timeout を超えたら打ち切ります
+///
+/// readごとのタイムアウトだけでは、少しずつ返し続けられると合計が延びるので、
+/// readのたびに limit_next_read で残り時間を渡し、その時間だけ待たせます
+/// 期限を過ぎてから届いた分は（EOFであっても）受け付けません
+/// readの失敗（ソケットのタイムアウトを含む）は、そのままエラーとして返します
+fn read_response_within<R, L>(
+    stream: &mut R,
+    timeout: std::time::Duration,
+    mut limit_next_read: L,
+) -> Result<String, std::io::Error>
+where
+    R: std::io::Read,
+    L: FnMut(&mut R, std::time::Duration) -> std::io::Result<()>,
+{
+    let timed_out = || std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "timed out while reading the response from docker",
+    );
+    let started = std::time::Instant::now();
+    let mut response: Vec<u8> = Vec::new();
+    let mut chunk = [0; 8192];
+
+    loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(timed_out());
+        }
+        limit_next_read(stream, remaining)?;
+        let n = match stream.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if started.elapsed() > timeout {
+            return Err(timed_out());
+        }
+        if n == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..n]);
+    }
+
+    String::from_utf8(response).map_err(|e| std::io::Error::new(
+        std::io::ErrorKind::InvalidData, e.utf8_error(),
+    ))
 }
 
 fn get_container_names<T: AsRef<std::path::Path>>(
@@ -679,6 +744,43 @@ fn record_tick<W: FnOnce(&str) -> Result<(), error::Error>>(
     Ok(true)
 }
 
+/// now_millis より後の、最初の tick の境界（エポックからのミリ秒）
+/// now_millis がちょうど境界なら、その次の境界です
+fn next_boundary_after(now_millis: u128, tick_millis: u128) -> u128 {
+    let tick_millis = tick_millis.max(1);
+    now_millis - now_millis % tick_millis + tick_millis
+}
+
+/// 次の tick までの待ち時間と、その tick の時刻を決めます
+///
+/// timing_millis は予定していた次の tick の時刻です（前回の tick の時刻 + tick）
+/// 現在時刻より後で、tick 以内に来るなら、そのまま使います
+/// そうでなければ、現在時刻より後の最初の境界に合わせ直します
+/// - 予定の時刻が現在時刻以下: 処理が tick より長引いた、または時計が進んだ
+///   遅れた分の tick は取り戻さない（待ちなしで連続して実行しない）
+/// - 予定の時刻が tick より先: 時計が戻った
+///   予定の時刻まで待たない（その間、収集も古い点の削除も止まってしまう）
+///
+/// 返す待ち時間は 0 より長く、tick 以下です
+fn next_tick(
+    now_millis: u128,
+    timing_millis: u128,
+    tick_millis: u128,
+) -> (std::time::Duration, u128) {
+    let tick_millis = tick_millis.max(1);
+    let on_schedule = timing_millis > now_millis
+        && timing_millis - now_millis <= tick_millis;
+    let timing_millis = if on_schedule {
+        timing_millis
+    } else {
+        next_boundary_after(now_millis, tick_millis)
+    };
+    // 差は tick 以下なので u64 に収まる（tick が極端に大きい場合だけ丸める）
+    let wait_millis = u64::try_from(timing_millis - now_millis).unwrap_or(u64::MAX);
+
+    (std::time::Duration::from_millis(wait_millis), timing_millis)
+}
+
 fn get_now_as_millis() -> Result<u128, std::time::SystemTimeError> {
     let duration = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?;
@@ -929,22 +1031,22 @@ pub fn log_json(
         std::fs::create_dir("./log")?;
     }
 
-    let now_as_millis = get_now_as_millis()?;
-    let tick = std::time::Duration::from_secs(10);
-    let mut timing = now_as_millis + (
-          tick.as_millis() //* 2  // NOTE if tick is short, maybe more wait needed.
-        - now_as_millis % tick.as_millis()
-    );
+    let tick = TICK;
+    // 次の tick の時刻。壁時計の 10 秒境界に揃える
+    let mut timing = next_boundary_after(get_now_as_millis()?, tick.as_millis());
 
     let mut state = LoggerState::new();
     // 経過時間を core 自身で測るための単調時計の起点
     let started = std::time::Instant::now();
     // ここから先の失敗では止まらない。その tick を飛ばして次へ進む
     loop {
+        // 時計が飛んでいたら、tick の時刻を現在時刻に合わせ直す（next_tick）
         let wait = match get_now_as_millis() {
-            Ok(now) => std::time::Duration::from_millis(
-                timing.saturating_sub(now) as u64
-            ),
+            Ok(now) => {
+                let (wait, next) = next_tick(now, timing, tick.as_millis());
+                timing = next;
+                wait
+            },
             Err(e) => {
                 eprintln!("logger: failed to get the current time: {}", e);
                 tick
@@ -979,6 +1081,7 @@ pub fn log_json(
         }
 
         // 失敗した tick でも、次の tick の時刻は進める
+        // ここまでの処理が tick より長引いていたら、次の周で合わせ直す
         timing += tick.as_millis();
     }
 }
@@ -1159,6 +1262,235 @@ mod tests {
     use crate::log_cache::{ create_shared_cache, DownsampleOption, Series };
 
     const TICK_MILLIS: u16 = 10_000;
+
+    // ---- tick の時刻 ----
+
+    /// 2026-01-01T00:00:00Z（10 秒境界）
+    const BOUNDARY_MILLIS: u128 = 1_767_225_600_000;
+
+    fn wait_and_timing(now: u128, timing: u128) -> (u128, u128) {
+        let (wait, timing) = next_tick(now, timing, 10_000);
+        (wait.as_millis(), timing)
+    }
+
+    #[test]
+    fn next_tick_waits_until_the_scheduled_boundary() {
+        let t = BOUNDARY_MILLIS;
+        // 通常: 前回の処理が終わってから、予定の境界まで待つ。予定は変えない
+        assert_eq!(wait_and_timing(t - 9_700, t), (9_700, t));
+        assert_eq!(wait_and_timing(t - 1, t), (1, t));
+        // 前回の処理が一瞬で終わった（まるまる 1 tick 待つ）
+        assert_eq!(wait_and_timing(t - 10_000, t), (10_000, t));
+        // 起動直後と同じ計算。境界の途中から、次の境界まで
+        assert_eq!(next_boundary_after(t - 9_700, 10_000), t);
+        assert_eq!(next_boundary_after(t - 1, 10_000), t);
+    }
+
+    #[test]
+    fn next_tick_on_the_exact_boundary_moves_to_the_next_one() {
+        let t = BOUNDARY_MILLIS;
+        // 予定の時刻ちょうど（処理にちょうど 1 tick 掛かった）: 待ちなしにせず、次の境界へ
+        assert_eq!(wait_and_timing(t, t), (10_000, t + 10_000));
+        assert_eq!(next_boundary_after(t, 10_000), t + 10_000);
+        // 1 ミリ秒でも過ぎていれば、その次の境界までの残りを待つ
+        assert_eq!(wait_and_timing(t + 1, t), (9_999, t + 10_000));
+    }
+
+    #[test]
+    fn next_tick_does_not_catch_up_after_the_clock_jumps_forward() {
+        let t = BOUNDARY_MILLIS;
+        // 処理が tick より長引いた（Docker の応答が滞った）: 飛んだ tick は取り戻さない
+        assert_eq!(wait_and_timing(t + 12_345, t), (7_655, t + 20_000));
+        // 時計が 1 時間進んだ（サスペンドからの復帰、時刻の補正）
+        // 360 回分を連続で実行せず、現在時刻の次の境界まで待つ
+        assert_eq!(wait_and_timing(t + 3_600_000 + 4_000, t), (6_000, t + 3_610_000));
+
+        // そのあとは通常どおり、1 tick ずつ進む
+        let (mut now, mut timing) = (t + 3_600_000 + 4_000, t);
+        let mut waits = Vec::new();
+        for _ in 0..3 {
+            let (wait, next) = next_tick(now, timing, 10_000);
+            waits.push(wait.as_millis());
+            // 待ったあと、処理に 200 ミリ秒掛かる
+            now += wait.as_millis() + 200;
+            timing = next + 10_000;
+        }
+        assert_eq!(waits, [6_000, 9_800, 9_800]);
+        assert_eq!(timing, t + 3_640_000);
+    }
+
+    #[test]
+    fn next_tick_does_not_stall_after_the_clock_jumps_back() {
+        let t = BOUNDARY_MILLIS;
+        // 時計が 1 時間戻った: 予定の時刻（1 時間先）まで待たず、現在時刻の次の境界へ
+        assert_eq!(wait_and_timing(t - 3_600_000 + 4_000, t), (6_000, t - 3_590_000));
+        // 1 tick を 1 ミリ秒でも超える待ちは、合わせ直す
+        assert_eq!(wait_and_timing(t - 10_001, t), (1, t - 10_000));
+        // 戻った先がちょうど境界でも、待つのは 1 tick まで
+        assert_eq!(wait_and_timing(t - 3_600_000, t), (10_000, t - 3_590_000));
+    }
+
+    #[test]
+    fn next_tick_always_waits_between_zero_and_one_tick() {
+        let t = BOUNDARY_MILLIS;
+        for now in [0, 1, 9_999, 10_000, t - 86_400_000, t - 10_001, t - 5, t, t + 5, t + 86_400_000] {
+            let (wait, timing) = wait_and_timing(now, t);
+            assert!(wait > 0 && wait <= 10_000, "{} {}", now, wait);
+            assert_eq!(timing, now + wait);
+            assert_eq!(timing % 10_000, 0);
+        }
+        // tick が 0 でも止まらない（0 で割らない）
+        assert_eq!(next_tick(5, 3, 0), (std::time::Duration::from_millis(1), 6));
+    }
+
+    // ---- Docker ソケットからの応答の読み取り ----
+
+    /// 用意したバイト列を chunk_size ずつ返すストリーム
+    /// readのたびに delay だけ待ち、読み切ったあとは after の振る舞いをする
+    struct ScriptedStream {
+        data: Vec<u8>,
+        position: usize,
+        chunk_size: usize,
+        delay: std::time::Duration,
+        after: After,
+        /// limit_next_read で渡された上限
+        limits_seen: Vec<std::time::Duration>,
+    }
+    enum After {
+        /// 相手が閉じた
+        Eof,
+        /// ソケットのタイムアウト（read_timeout を過ぎた）
+        TimedOut,
+        /// 同じバイトを返し続ける（閉じない）
+        Forever,
+    }
+    impl ScriptedStream {
+        fn new(data: &[u8], chunk_size: usize, after: After) -> Self {
+            ScriptedStream {
+                data: data.to_vec(),
+                position: 0,
+                chunk_size,
+                delay: std::time::Duration::ZERO,
+                after,
+                limits_seen: Vec::new(),
+            }
+        }
+    }
+    impl std::io::Read for ScriptedStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(self.delay);
+            let rest = &self.data[self.position..];
+            if rest.is_empty() {
+                return match self.after {
+                    After::Eof => Ok(0),
+                    After::TimedOut => Err(std::io::ErrorKind::WouldBlock.into()),
+                    After::Forever => { buf[0] = b'x'; Ok(1) },
+                };
+            }
+            let n = rest.len().min(self.chunk_size).min(buf.len());
+            buf[..n].copy_from_slice(&rest[..n]);
+            self.position += n;
+            Ok(n)
+        }
+    }
+
+    fn read_scripted(
+        stream: &mut ScriptedStream,
+        timeout: std::time::Duration,
+    ) -> Result<String, std::io::Error> {
+        read_response_within(stream, timeout, |stream, remaining| {
+            stream.limits_seen.push(remaining);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn docker_response_is_read_until_the_peer_closes() {
+        let timeout = std::time::Duration::from_secs(5);
+        let response = stats_response("2026-01-01T00:00:10Z", 1, 2, (3, 4), (5, 6));
+        // 1回で届いても、少しずつ届いても、同じ文字列になる
+        for chunk_size in [1, 7, 100_000] {
+            let mut stream = ScriptedStream::new(response.as_bytes(), chunk_size, After::Eof);
+            assert_eq!(read_scripted(&mut stream, timeout).unwrap(), response);
+            // readのたびに残り時間を渡している（増えることはない）
+            assert!(stream.limits_seen.len() >= 2);
+            assert!(stream.limits_seen.iter().all(|limit| *limit <= timeout));
+            assert!(stream.limits_seen.windows(2).all(|w| w[1] <= w[0]));
+        }
+        // 読み取った応答は、そのまま統計として解釈できる
+        let mut stream = ScriptedStream::new(response.as_bytes(), 7, After::Eof);
+        let text = read_scripted(&mut stream, timeout).unwrap();
+        assert!(parse_stats_response(&text).is_ok());
+
+        // 空の応答（すぐ閉じられた）は空文字列。utf-8 でなければエラー
+        let mut empty = ScriptedStream::new(b"", 1, After::Eof);
+        assert_eq!(read_scripted(&mut empty, timeout).unwrap(), "");
+        let mut invalid = ScriptedStream::new(b"\xff\xfe", 1, After::Eof);
+        assert_eq!(
+            read_scripted(&mut invalid, timeout).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData,
+        );
+    }
+
+    #[test]
+    fn docker_response_that_stops_is_an_error() {
+        // 途中まで返して黙った（ソケットのタイムアウト）: 届いた分を使わずにエラーにする
+        let timeout = std::time::Duration::from_secs(5);
+        for data in [&b""[..], b"HTTP/1.1 200 OK\r\n\r\n{\"read\":"] {
+            let mut stream = ScriptedStream::new(data, 100, After::TimedOut);
+            assert_eq!(
+                read_scripted(&mut stream, timeout).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+            );
+        }
+        // 残り時間を設定できなかった場合も、読まずにエラーにする
+        let mut stream = ScriptedStream::new(b"data", 100, After::Eof);
+        let result = read_response_within(
+            &mut stream,
+            timeout,
+            |_, _| Err(std::io::ErrorKind::InvalidInput.into()),
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(stream.position, 0);
+    }
+
+    #[test]
+    fn docker_response_is_cut_off_at_the_total_deadline() {
+        let timeout = std::time::Duration::from_millis(100);
+
+        // 少しずつ返し続けて閉じない相手: readは毎回成功するが、合計の期限で打ち切る
+        let mut trickle = ScriptedStream::new(b"", 1, After::Forever);
+        trickle.delay = std::time::Duration::from_millis(5);
+        let started = std::time::Instant::now();
+        let error = read_scripted(&mut trickle, timeout).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() >= timeout, "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(2000),
+            "{:?}", started.elapsed(),
+        );
+        assert!(trickle.limits_seen.windows(2).all(|w| w[1] <= w[0]));
+
+        // 期限を過ぎてから届いた終わり（EOF）は受け付けない
+        let mut late = ScriptedStream::new(b"[]", 100, After::Eof);
+        late.delay = std::time::Duration::from_millis(80);
+        assert_eq!(
+            read_scripted(&mut late, timeout).unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut,
+        );
+        // 期限内に終われば受け付ける
+        let mut in_time = ScriptedStream::new(b"[]", 100, After::Eof);
+        in_time.delay = std::time::Duration::from_millis(5);
+        assert_eq!(read_scripted(&mut in_time, timeout).unwrap(), "[]");
+
+        // 残り時間が無ければ、1回も読まない
+        let mut unread = ScriptedStream::new(b"[]", 100, After::Eof);
+        assert_eq!(
+            read_scripted(&mut unread, std::time::Duration::ZERO).unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut,
+        );
+        assert_eq!(unread.position, 0);
+    }
 
     /// Docker の stats API が返す応答（ヘッダ込み）を組み立てる
     /// 値はすべて積算値。cpu と system は ns、ほかはバイト
