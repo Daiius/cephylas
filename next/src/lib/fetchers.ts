@@ -1,6 +1,6 @@
 import z from 'zod';
 
-import { accessFetchInit } from '@/lib/access-headers';
+import { coreFetch } from '@/lib/core-fetch';
 import { sortContainerNames } from '@/lib/colors';
 import { fetchUsagesFromContainerApis } from '@/lib/fetchers-legacy';
 
@@ -47,6 +47,8 @@ export type Usages<K extends UsageKind> = z.infer<(typeof usagesSchemas)[K]>;
  * 表示できるよう、ステータスは限定しない。
  * 次の場合は切り替えず、失敗を返す。
  * - 接続そのものの失敗 (fetch が例外を投げる)。同じ宛先なので試しても無駄である
+ * - 期限切れ (core-fetch.ts)。応答のヘッダを待つ間でも、本文を読む間でも同じ。
+ *   接続の失敗と同じく、同じ宛先が応答しないので試しても無駄である
  * - 2xx だが本文が不正 (JSON として読めない、検証の失敗)。`/usages` を持つ core の
  *   不具合であり、黙って別の経路に逃がさない
  */
@@ -54,9 +56,11 @@ export const fetchUsages = async <K extends UsageKind>(
   kind: K,
 ): Promise<FetchResult<Usages<K>>> => {
   try {
-    // Cloudflare Access のサービストークン (設定されているときだけ付く)。
-    // 付けるときはリダイレクトを追わないので、3xx は下の「2xx 以外」に入る。
-    const response = await fetch(`${API_URL}/usages/${kind}`, accessFetchInit());
+    // coreFetch が、期限と Cloudflare Access のサービストークン (設定されているとき
+    // だけ) を付ける。トークンを付けるときはリダイレクトを追わないので、3xx は下の
+    // 「2xx 以外」に入る。期限切れは例外になり (本文の読み取り中でも同じ)、下の catch で
+    // 失敗として返る。互換の経路には入らない。
+    const response = await coreFetch(`${API_URL}/usages/${kind}`);
     let json: unknown;
     if (response.ok) {
       json = await response.json();
