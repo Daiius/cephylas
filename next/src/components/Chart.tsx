@@ -129,7 +129,7 @@ export const Chart = ({
     };
     // datasets を依存に入れると毎回 destroy/create される。
     // datasets はサーバから new array で来るので、本来は安定化したいが
-    // PR 1 では動作優先で再生成を許容する。
+    // 動作優先で再生成を許容している。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [datasets]);
 

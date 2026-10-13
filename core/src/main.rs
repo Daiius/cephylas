@@ -7,8 +7,6 @@ mod time;
 
 use log_cache::create_shared_cache;
 
-const MAX_LOG_LINES: usize = 8640;
-
 fn main() -> Result<(), error::Error> {
 
     let log_cache = create_shared_cache();

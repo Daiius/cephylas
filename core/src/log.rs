@@ -954,8 +954,16 @@ pub fn log_json(
         std::thread::sleep(wait);
 
         // 待ったあとの現在時刻。取れなければ、この tick では時間による削除をしない
-        let now_millis = get_now_as_millis().ok()
-            .and_then(|now| i64::try_from(now).ok());
+        let now_millis = match get_now_as_millis() {
+            Ok(now) => i64::try_from(now).ok(),
+            Err(e) => {
+                eprintln!(
+                    "logger: failed to get the current time; \
+                     skipping time-based pruning for this tick: {}", e,
+                );
+                None
+            },
+        };
         let collected = get_containers_stats(socket_path);
         let result = run_tick(
             tick.as_millis() as u16,
