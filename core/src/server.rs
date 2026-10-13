@@ -120,70 +120,32 @@ fn write_response<W: Write>(
     Ok(())
 }
 
-/// 注意: かなり微妙な実装です
-/// ログは1日でローテーションされるので(運用の仕方次第......)
-/// 時刻のみ解釈して一日の始まりから何秒経ったかに変換します
-fn limited_convert_time_string_to_f32(
-    time_str: &str
-) -> Result<f32, error::Error> {
-    // ISO time string は YYYY/MM/ddTHH:mm:ss.nnnnn という形式
-    if let [_year_month_date, time] =
-        time_str.split('T').collect::<Vec<&str>>()[..]
-    {
-        // 今はyear, month, dateは無視...
-        if let [hours, minutes, seconds] =
-            time.split(':').collect::<Vec<&str>>()[..]
-        {
-            let seconds = str::parse::<f32>(&seconds.replace("Z",""))
-                .map_err(|e| e.to_string())?;
-            let minutes = str::parse::<f32>(minutes)
-                .map_err(|e| e.to_string())?;
-            let hours = str::parse::<f32>(hours)
-                .map_err(|e| e.to_string())?;
-
-            return Ok(
-                ((hours * 60.0) + minutes) * 60.0 + seconds
-            )
-        }
-    }
-    Err(error::Error::OtherError("invalid time format".to_string()))
-}
-
-/// ダウンサンプリングのx座標を返します
-/// 時刻を解釈できない点は0.0として扱い、panicさせません
-fn time_to_x(time_str: &str) -> f32 {
-    limited_convert_time_string_to_f32(time_str).unwrap_or(0.0)
-}
-
-/// Vec<&T> 型の使用率データをjson文字列に変換します
-pub fn data_to_json<T: ToString>(data: Vec<&T>) -> String {
-    format!(
-        "[{}]",
-        data.iter()
-            .map(|d| d.to_string())
-            .collect::<Vec<String>>()
-            .join(",")
-    )
-}
-
-/// 1コンテナ分の系列をダウンサンプリングしてjson文字列にします
+/// 1コンテナ・1系列をダウンサンプリングしてjson文字列にします
 /// 知らないコンテナ名ならNoneを返します
-fn downsampled_json<T: ToString, F: Fn(&T) -> (f32, f32)>(
-    map: &log_cache::UsageCacheMap<T>,
+fn series_json(
+    cache: &log_cache::UsageCache,
     container_name: &str,
-    fxy: F,
+    series: log_cache::Series,
 ) -> Option<String> {
-    map.downsample(
+    let points = cache.downsample(
         container_name,
         &log_cache::DownsampleOption::default(),
-        fxy,
-    ).map(data_to_json)
+        series,
+    )?;
+
+    Some(format!(
+        "[{}]",
+        points.iter()
+            .map(|point| series.point_to_json(point))
+            .collect::<Vec<String>>()
+            .join(",")
+    ))
 }
 
 /// リソース使用状況を記録しているコンテナの名前を
 /// アルファベット順に並べたjson文字列を返します
 fn container_names_json(cache: &log_cache::UsageCache) -> String {
-    let data = cache.cpu.container_names()
+    let data = cache.container_names()
         .iter()
         .map(|s| format!("\"{}\"", s))
         .collect::<Vec<String>>()
@@ -207,30 +169,18 @@ fn route(
     let body = match &parts[..] {
         ["containers"] =>
             Some(container_names_json(&cache)),
-        ["containers", name, "cpu"] => downsampled_json(
-            &cache.cpu, name,
-            |c| (time_to_x(&c.time), c.percentage.unwrap_or_default()),
-        ),
-        ["containers", name, "memory"] => downsampled_json(
-            &cache.memory, name,
-            |m| (time_to_x(&m.time), m.percentage.unwrap_or_default()),
-        ),
-        ["containers", name, "io", "read"] => downsampled_json(
-            &cache.io, name,
-            |r| (time_to_x(&r.time), r.readkBps.unwrap_or_default() as f32),
-        ),
-        ["containers", name, "io", "write"] => downsampled_json(
-            &cache.io, name,
-            |w| (time_to_x(&w.time), w.writekBps.unwrap_or_default() as f32),
-        ),
-        ["containers", name, "net", "recv"] => downsampled_json(
-            &cache.net, name,
-            |r| (time_to_x(&r.time), r.recvkBps.unwrap_or_default() as f32),
-        ),
-        ["containers", name, "net", "send"] => downsampled_json(
-            &cache.net, name,
-            |s| (time_to_x(&s.time), s.sendkBps.unwrap_or_default() as f32),
-        ),
+        ["containers", name, "cpu"] =>
+            series_json(&cache, name, log_cache::Series::Cpu),
+        ["containers", name, "memory"] =>
+            series_json(&cache, name, log_cache::Series::Memory),
+        ["containers", name, "io", "read"] =>
+            series_json(&cache, name, log_cache::Series::IoRead),
+        ["containers", name, "io", "write"] =>
+            series_json(&cache, name, log_cache::Series::IoWrite),
+        ["containers", name, "net", "recv"] =>
+            series_json(&cache, name, log_cache::Series::NetRecv),
+        ["containers", name, "net", "send"] =>
+            series_json(&cache, name, log_cache::Series::NetSend),
         _ => None,
     };
 
@@ -482,8 +432,7 @@ pub fn start_server(
 mod tests {
     use super::*;
     use crate::log_cache::{
-        create_shared_cache, SharedUsageCache,
-        TimedCpuUsage, TimedMemoryUsage, TimedIoUsage, TimedNetUsage,
+        create_shared_cache, SharedUsageCache, UsagePoint,
     };
 
     /// 入力を読み切るとEOFになり、書き込みはメモリに溜めるストリーム
@@ -503,40 +452,48 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
     }
 
+    /// 2026-01-01T00:00:00Z
+    const BASE_MS: i64 = 1_767_225_600_000;
+
+    /// i 番目の点の時刻（1秒間隔）
+    fn time_ms_at(i: usize) -> i64 {
+        BASE_MS + i as i64 * 1000
+    }
+
+    /// time_ms_at(i) を API が返す文字列（ミリ秒精度）
+    /// 変換の関数を通さずに組み立てる。i は1日分（86400）未満であること
     fn time_at(i: usize) -> String {
+        assert!(i < 86_400);
         format!(
-            "2026-01-01T{:02}:{:02}:{:02}.000000000Z",
+            "2026-01-01T{:02}:{:02}:{:02}.000Z",
             i / 3600, (i / 60) % 60, i % 60,
         )
     }
 
     /// "web" と "db" の2コンテナに npoints 点ずつ入れたキャッシュ
-    fn cache_with(npoints: usize, time_of: fn(usize) -> String) -> SharedUsageCache {
+    fn cache_with(npoints: usize, time_of: fn(usize) -> i64) -> SharedUsageCache {
         let cache = create_shared_cache();
         {
             let mut lock = cache.write().unwrap();
             for name in ["web", "db"] {
                 for i in 0..npoints {
                     let v = (i % 7) as u32;
-                    lock.cpu.insert(name.to_string(), TimedCpuUsage {
-                        time: time_of(i), percentage: Some(v as f32),
-                    });
-                    lock.memory.insert(name.to_string(), TimedMemoryUsage {
-                        time: time_of(i), percentage: Some(v as f32),
-                    });
-                    lock.io.insert(name.to_string(), TimedIoUsage {
-                        time: time_of(i), readkBps: Some(v), writekBps: None,
-                    });
-                    lock.net.insert(name.to_string(), TimedNetUsage {
-                        time: time_of(i), recvkBps: None, sendkBps: Some(v),
-                    });
+                    assert!(lock.insert(name, UsagePoint {
+                        time_ms: time_of(i),
+                        cpu: Some(v as f32),
+                        memory: Some(v as f32 + 0.5),
+                        read_kbps: Some(v),
+                        write_kbps: None,
+                        recv_kbps: None,
+                        send_kbps: Some(v),
+                    }));
                 }
             }
         }
         cache
     }
 
-    fn small_cache() -> SharedUsageCache { cache_with(3, time_at) }
+    fn small_cache() -> SharedUsageCache { cache_with(3, time_ms_at) }
 
     /// 生のバイト列を送り、書き出された応答をそのまま返す
     fn exchange(cache: &SharedUsageCache, input: &[u8]) -> String {
@@ -596,12 +553,74 @@ mod tests {
     #[test]
     fn cpu_and_memory_return_series() {
         let cache = small_cache();
-        for kind in ["cpu", "memory"] {
+        for (kind, expected) in [("cpu", 1.0), ("memory", 1.5)] {
             let parsed = assert_json_ok(&get(&cache, &format!("/containers/web/{}", kind)));
             assert_eq!(parsed.len(), 3);
             assert_eq!(parsed[1]["time"], time_at(1).as_str());
-            assert_eq!(parsed[1]["percentage"], 1.0);
+            assert_eq!(parsed[1]["percentage"], expected);
+            // 要素が持つのは time と percentage だけ
+            assert_eq!(parsed[1].len(), 2);
         }
+    }
+
+    #[test]
+    fn response_bodies_keep_their_exact_shape() {
+        // 時刻はミリ秒精度の ISO 8601 (UTC、Z 終端)
+        // 小数は2桁、整数はそのまま、欠損は null
+        let cache = create_shared_cache();
+        {
+            let mut lock = cache.write().unwrap();
+            lock.insert("web", UsagePoint {
+                time_ms: BASE_MS + 10_023,
+                cpu: Some(0.125),
+                memory: Some(3.64),
+                read_kbps: Some(0),
+                write_kbps: Some(1234),
+                recv_kbps: None,
+                send_kbps: Some(5),
+            });
+            lock.insert("web", UsagePoint {
+                time_ms: BASE_MS + 20_000,
+                cpu: None,
+                memory: Some(100.0),
+                read_kbps: None,
+                write_kbps: None,
+                recv_kbps: Some(7),
+                send_kbps: None,
+            });
+        }
+        let body_of = |path: &str| {
+            let response = get(&cache, path);
+            assert_json_ok(&response);
+            split(&response).2.to_string()
+        };
+        assert_eq!(
+            body_of("/containers/web/cpu"),
+            concat!(
+                r#"[{"time":"2026-01-01T00:00:10.023Z","percentage":0.12},"#,
+                r#"{"time":"2026-01-01T00:00:20.000Z","percentage":null}]"#,
+            ),
+        );
+        assert_eq!(
+            body_of("/containers/web/memory"),
+            concat!(
+                r#"[{"time":"2026-01-01T00:00:10.023Z","percentage":3.64},"#,
+                r#"{"time":"2026-01-01T00:00:20.000Z","percentage":100.00}]"#,
+            ),
+        );
+        let io = concat!(
+            r#"[{"time":"2026-01-01T00:00:10.023Z","readkBps":0,"writekBps":1234},"#,
+            r#"{"time":"2026-01-01T00:00:20.000Z","readkBps":null,"writekBps":null}]"#,
+        );
+        assert_eq!(body_of("/containers/web/io/read"), io);
+        assert_eq!(body_of("/containers/web/io/write"), io);
+        let net = concat!(
+            r#"[{"time":"2026-01-01T00:00:10.023Z","recvkBps":null,"sendkBps":5},"#,
+            r#"{"time":"2026-01-01T00:00:20.000Z","recvkBps":7,"sendkBps":null}]"#,
+        );
+        assert_eq!(body_of("/containers/web/net/recv"), net);
+        assert_eq!(body_of("/containers/web/net/send"), net);
+        assert_eq!(body_of("/containers"), r#"["web"]"#);
     }
 
     #[test]
@@ -610,8 +629,10 @@ mod tests {
         for kind in ["read", "write"] {
             let parsed = assert_json_ok(&get(&cache, &format!("/containers/web/io/{}", kind)));
             assert_eq!(parsed.len(), 3);
+            assert_eq!(parsed[2]["time"], time_at(2).as_str());
             assert_eq!(parsed[2]["readkBps"], 2.0);
             assert!(parsed[2]["writekBps"].is_null());
+            assert_eq!(parsed[2].len(), 3);
         }
     }
 
@@ -621,16 +642,18 @@ mod tests {
         for kind in ["recv", "send"] {
             let parsed = assert_json_ok(&get(&cache, &format!("/containers/db/net/{}", kind)));
             assert_eq!(parsed.len(), 3);
+            assert_eq!(parsed[2]["time"], time_at(2).as_str());
             assert!(parsed[2]["recvkBps"].is_null());
             assert_eq!(parsed[2]["sendkBps"], 2.0);
+            assert_eq!(parsed[2].len(), 3);
         }
     }
 
     #[test]
     fn long_series_is_downsampled() {
-        let cache = cache_with(2000, time_at);
+        let cache = cache_with(2000, time_ms_at);
         let parsed = assert_json_ok(&get(&cache, "/containers/web/cpu"));
-        assert!(parsed.len() <= 512, "{}", parsed.len());
+        assert_eq!(parsed.len(), 512);
         assert_eq!(parsed[0]["time"], time_at(0).as_str());
         assert_eq!(parsed[parsed.len() - 1]["time"], time_at(1999).as_str());
     }
@@ -871,17 +894,15 @@ mod tests {
     }
 
     #[test]
-    fn unparsable_time_does_not_panic() {
-        // ダウンサンプリングが走る点数(512超)で、解釈できない時刻を混ぜる
-        fn broken_time(i: usize) -> String {
-            match i % 4 {
-                0 => "0001-01-01T00:00:00Z".to_string(),
-                1 => "not a time".to_string(),
-                2 => "2026-01-01Txx:yy:zz".to_string(),
-                _ => String::new(),
-            }
+    fn series_across_days_is_served_on_every_route() {
+        // 時刻は数値で持つので、解釈できない時刻はキャッシュに入りえない
+        // 代わりに、日付と年をまたぐ系列（ダウンサンプリングが走る点数）を
+        // 全経路で返せることを確かめる
+        fn around_new_year(i: usize) -> i64 {
+            // 2025-12-31T23:50:00Z から10秒間隔
+            BASE_MS - 600_000 + i as i64 * 10_000
         }
-        let cache = cache_with(2000, broken_time);
+        let cache = cache_with(2000, around_new_year);
         for path in [
             "/containers/web/cpu",
             "/containers/web/memory",
@@ -891,15 +912,16 @@ mod tests {
             "/containers/web/net/send",
         ] {
             let parsed = assert_json_ok(&get(&cache, path));
-            assert!(parsed.len() >= 2 && parsed.len() <= 512, "{}", parsed.len());
+            assert_eq!(parsed.len(), 512);
+            assert_eq!(parsed[0]["time"], "2025-12-31T23:50:00.000Z");
+            // 1999 × 10秒 = 5時間33分10秒後
+            assert_eq!(parsed[511]["time"], "2026-01-01T05:23:10.000Z");
+            // 文字列として昇順（= 時刻として昇順）
+            let times: Vec<&str> = parsed.members()
+                .map(|p| p["time"].as_str().unwrap())
+                .collect();
+            assert!(times.windows(2).all(|w| w[0] < w[1]));
         }
-    }
-
-    #[test]
-    fn time_to_x_falls_back_to_zero() {
-        assert_eq!(time_to_x("2026-01-01T01:01:01.5Z"), 3661.5);
-        assert_eq!(time_to_x("not a time"), 0.0);
-        assert_eq!(time_to_x(""), 0.0);
     }
 
     /// write lockを持ったままpanicさせて、lockをpoisonする
@@ -1074,18 +1096,15 @@ mod tests {
                 for i in 0..crate::log_cache::MAX_LOG_LENGTH {
                     let name = format!("c{}", c);
                     let v = (i % 13) as u32;
-                    lock.cpu.insert(name.clone(), TimedCpuUsage {
-                        time: time_at(i), percentage: Some(v as f32),
-                    });
-                    lock.memory.insert(name.clone(), TimedMemoryUsage {
-                        time: time_at(i), percentage: Some(v as f32),
-                    });
-                    lock.io.insert(name.clone(), TimedIoUsage {
-                        time: time_at(i), readkBps: Some(v), writekBps: Some(1),
-                    });
-                    lock.net.insert(name, TimedNetUsage {
-                        time: time_at(i), recvkBps: Some(v), sendkBps: Some(1),
-                    });
+                    assert!(lock.insert(&name, UsagePoint {
+                        time_ms: time_ms_at(i),
+                        cpu: Some(v as f32),
+                        memory: Some(v as f32),
+                        read_kbps: Some(v),
+                        write_kbps: Some(1),
+                        recv_kbps: Some(v),
+                        send_kbps: Some(1),
+                    }));
                 }
             }
         }

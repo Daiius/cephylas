@@ -31,18 +31,21 @@ classDiagram
         net: NetUsage
     }
     class UsageCache {
-        cpu: UsageCacheMap(TimedCpuUsage)
-        memory: UsageCacheMap(TimedMemoryUsage)
-        io: UsageCacheMap(TimedIoUsage)
-        net: UsageCacheMap(TimedNetUsage)
+        map: HashMap(String, VecDeque(UsagePoint))
     }
-    class UsageCacheMap {
-        map: HashMap(String, LogVec)
+    class UsagePoint {
+        time_ms: i64
+        cpu: Option(f32)
+        memory: Option(f32)
+        read_kbps: Option(u32)
+        write_kbps: Option(u32)
+        recv_kbps: Option(u32)
+        send_kbps: Option(u32)
     }
     Usages --> Usage : コンテナ名ごと
-    UsageCache --> UsageCacheMap : 種別ごと
+    UsageCache --> UsagePoint : コンテナ名ごとに時刻順
     note for Usages "ログ 1 行 = 1 tick"
-    note for UsageCacheMap "LogVec は最大 8640 点の VecDeque"
+    note for UsageCache "最新の点から 24 時間分、1 コンテナ最大 8640 点"
 ```
 
 ## 処理の流れ
@@ -56,7 +59,7 @@ sequenceDiagram
     participant server as server thread
     participant web as Next.js
 
-    note over logger,cache : 起動時: ログ末尾 8640 行からキャッシュを復元
+    note over logger,cache : 起動時: ログ末尾 8640 行からキャッシュを復元（ログが無ければ空）
 
     loop 10 秒ごと
         logger ->> docker : GET /containers/json
@@ -65,7 +68,7 @@ sequenceDiagram
         end
         note over logger : 前回との差分から使用率を算出
         logger ->> log : JSONL を 1 行追記
-        logger ->> cache : 各系列に 1 点追加
+        logger ->> cache : コンテナごとに 1 点追加し、24 時間より古い点を捨てる
     end
 
     web ->> server : GET /containers/{name}/cpu など

@@ -3,6 +3,7 @@ mod error;
 mod log;
 mod server;
 mod log_cache;
+mod time;
 
 use log_cache::create_shared_cache;
 
