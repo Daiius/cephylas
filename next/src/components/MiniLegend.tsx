@@ -10,8 +10,8 @@ const DOUBLE_CLICK_THRESHOLD_MS = 250;
 
 /**
  * 各チャート上に表示する凡例。クリック/タップで表示/非表示を切替えられる。
- * Sidebar/drawer のチェックボックスと同じ FilterContext を共有しているので
- * どちらで操作しても同期する。
+ * 4 枚のチャートの凡例が同じ FilterContext を共有しているので、
+ * どのチャートで操作しても全チャートに反映される。
  *
  * IO/Net のように 1 コンテナで複数 dataset (read/write) ある場合は
  * 同名コンテナを 1 行に集約する (line style での違いはチャートで読む)。

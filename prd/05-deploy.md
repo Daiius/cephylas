@@ -1,7 +1,7 @@
 # 05. 開発環境とデプロイ
 
 本章は**姿勢のみ**を書く。ドメイン・接続先・設定値・手順の実物は書かない
-（[README](./README.md) §秘匿方針）。実値は gitignore 対象の `.claude/local/` に置く。
+（[README](./README.md) §公開リポジトリでの秘匿方針）。実値は gitignore 対象の `.claude/local/` に置く。
 
 **実装済みの範囲**: §開発環境と §本番の形は現状のとおりである。
 
@@ -83,6 +83,8 @@ dev だけに要る設定は `compose.dev.yml` に置く。本番は `compose.de
   `core/Dockerfile.prod`（release ビルドを distroless に載せる）にある。
   ⚠ リポジトリ内の `compose.yml` は dev 用の `core/Dockerfile` を指したままで、
   本番が実際にどの定義で動いているかはリポジトリからは分からない（要確認）。
+  ⚠ `compose.prod.yml` は core に `env_file: .env.production` を指定しているが、
+  core は環境変数を読まない。残す理由があるかは要確認。
 - **web が新しい API を必要とする変更は、core の配置を先に行う。** web は `main` への
   マージで自動的に配置されるが、core は手で更新するまで古いままである。順序を逆にすると、
   web が叩く経路が本番の core に無く、チャートが表示されない。
@@ -91,7 +93,7 @@ dev だけに要る設定は `compose.dev.yml` に置く。本番は `compose.de
     以前の web は動き続ける（[02](./02-core.md) §REST API（現行））。
   - **`/usages/*` への切り替えは、この順序を必要としない。** web が互換の経路を持ち、
     `/usages/*` の応答が 2xx 以外ならコンテナ別の API から同じ内容を組み立てる
-    （[03](./03-web.md) §古い core 向けの互換の経路）。core と web のどちらを先に配置しても動く。
+    （[03](./03-web.md) §古い core 向けの互換の経路（一時的））。core と web のどちらを先に配置しても動く。
     互換の経路は、本番の core を更新したあとで削除する（計画中）。
 - **nginx は core への中継だけを行う**（`nginx.conf`）。web は Vercel にあるので、
   nginx から Next.js へは中継しない。`nginx.conf` は 80 番で待ち受けるだけで TLS を扱わない。
@@ -100,8 +102,9 @@ dev だけに要る設定は `compose.dev.yml` に置く。本番は `compose.de
   （[01](./01-architecture.md) §設計方針）。
 - **core は Docker ソケットを読める必要がある。** core が送るのは GET だけだが、
   ソケットに届くプロセスは Docker を操作できる。core のコンテナをインターネットに
-  直接さらさない理由の 1 つである。⚠ ソケットのマウントはリポジトリ内のどの compose にも
-  書かれておらず、本番での与え方は運用側の設定である（要確認）。
+  直接さらさない理由の 1 つである。⚠ ソケットのマウントは、本番が読む compose
+  （`compose.yml` / `compose.prod.yml`）には書かれていない（dev は `compose.dev.yml` が持つ）。
+  本番での与え方は運用側の設定である（要確認）。
 
 ### ベースイメージ
 
