@@ -292,6 +292,8 @@ fn write_json_string<W: std::fmt::Write>(
 /// 形は コンテナ名 → 系列名 → { "t": [ミリ秒, ...], "v": [値, ...] } です
 /// コンテナ名はアルファベット順に並べます
 /// 間引きは系列ごとに独立して行うので、同じコンテナでも系列によって t が変わります
+/// 間引いたあと、データが途切れていた箇所に値が null の点（目印）を1つ挟みます
+/// (log_cache::UsageCache::downsample_with_gaps。コンテナ別のAPIには入れません)
 /// 書き出し先を差し替えられるので、長さだけを数えることも、本文を作ることもできます
 /// (同じキャッシュに対しては、どちらも同じバイト列になる)
 fn write_usages_json<W: std::fmt::Write>(
@@ -308,21 +310,26 @@ fn write_usages_json<W: std::fmt::Write>(
         out.write_str(":{")?;
         for (j, (key, series)) in kind.series().iter().enumerate() {
             // 名前は直前に一覧から取ったものなので、必ず見つかる
-            let points = cache.downsample(name, &option, *series)
+            // 途切れの目印もここで決まる。長さを数える回と書く回で同じ並びになる
+            let samples = cache.downsample_with_gaps(name, &option, *series)
                 .unwrap_or_default();
             if j > 0 { out.write_char(',')?; }
             write!(out, "\"{}\":{{\"t\":[", key)?;
-            for (k, point) in points.iter().enumerate() {
+            for (k, sample) in samples.iter().enumerate() {
                 if k > 0 { out.write_char(',')?; }
-                write!(out, "{}", point.time_ms)?;
+                write!(out, "{}", sample.time_ms())?;
             }
             out.write_str("],\"v\":[")?;
-            for (k, point) in points.iter().enumerate() {
+            for (k, sample) in samples.iter().enumerate() {
                 if k > 0 { out.write_char(',')?; }
-                match series.raw_value(point) {
-                    // NaN や無限大はjsonに書けない。1つで本文全体が壊れるので欠損にする
-                    Some(v) if v.is_finite() => write!(out, "{:.2}", v)?,
-                    _ => out.write_str("null")?,
+                match sample {
+                    log_cache::Sample::Point(point) => match series.raw_value(point) {
+                        // NaN や無限大はjsonに書けない。1つで本文全体が壊れるので欠損にする
+                        Some(v) if v.is_finite() => write!(out, "{:.2}", v)?,
+                        _ => out.write_str("null")?,
+                    },
+                    // 途切れの目印。値の無い点として出し、線をここで切る
+                    log_cache::Sample::Gap(_) => out.write_str("null")?,
                 }
             }
             out.write_str("]}")?;
@@ -1151,6 +1158,214 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         for (name, _) in parsed.entries() {
             assert!(name.starts_with("\u{1}\"\\\u{1}\"\\"), "{:?}", name);
+        }
+    }
+
+    // ---- /usages/{kind} の途切れの目印 ----
+
+    /// i 番目の点の時刻（10秒間隔）。添字 1000 と 1001 の間だけ 1 時間空く
+    fn time_ms_with_gap(i: usize) -> i64 {
+        BASE_MS + i as i64 * 10_000 + if i > 1000 { 3_600_000 } else { 0 }
+    }
+
+    /// 途切れの目印の時刻（途切れの直前の点の 1 ミリ秒後）
+    fn marker_ms() -> i64 { time_ms_with_gap(1000) + 1 }
+
+    #[test]
+    fn usages_mark_a_gap_with_one_null_point() {
+        // web は 10秒 → 20秒 のあと 70 秒空いて 90秒。db は 60 秒ちょうどで、途切れではない
+        let cache = create_shared_cache();
+        {
+            let mut lock = cache.write().unwrap();
+            for (name, offsets) in [
+                ("web", [10_000, 20_000, 90_000]),
+                ("db", [10_000, 70_000, 80_000]),
+            ] {
+                for offset in offsets {
+                    assert!(lock.insert(name, UsagePoint {
+                        time_ms: BASE_MS + offset,
+                        cpu: Some(1.5),
+                        memory: None,
+                        read_kbps: Some(2.0),
+                        write_kbps: None,
+                        recv_kbps: None,
+                        send_kbps: None,
+                    }));
+                }
+            }
+        }
+        assert_eq!(
+            body_of(&cache, "/usages/cpu"),
+            concat!(
+                r#"{"db":{"percentage":{"t":[1767225610000,1767225670000,1767225680000],"#,
+                r#""v":[1.50,1.50,1.50]}},"#,
+                r#""web":{"percentage":{"t":[1767225610000,1767225620000,1767225620001,"#,
+                r#"1767225690000],"v":[1.50,1.50,null,1.50]}}}"#,
+            ),
+        );
+        // 値が取れなかった点の null はそのまま出て、目印も同じ null で並ぶ
+        assert_eq!(
+            body_of(&cache, "/usages/io"),
+            concat!(
+                r#"{"db":{"read":{"t":[1767225610000,1767225670000,1767225680000],"#,
+                r#""v":[2.00,2.00,2.00]},"#,
+                r#""write":{"t":[1767225610000,1767225670000,1767225680000],"#,
+                r#""v":[null,null,null]}},"#,
+                r#""web":{"read":{"t":[1767225610000,1767225620000,1767225620001,"#,
+                r#"1767225690000],"v":[2.00,2.00,null,2.00]},"#,
+                r#""write":{"t":[1767225610000,1767225620000,1767225620001,"#,
+                r#"1767225690000],"v":[null,null,null,null]}}}"#,
+            ),
+        );
+
+        // コンテナ別のAPIには目印を入れない（形も中身も従来のまま）
+        assert_eq!(
+            body_of(&cache, "/containers/web/cpu"),
+            concat!(
+                r#"[{"time":"2026-01-01T00:00:10.000Z","percentage":1.50},"#,
+                r#"{"time":"2026-01-01T00:00:20.000Z","percentage":1.50},"#,
+                r#"{"time":"2026-01-01T00:01:30.000Z","percentage":1.50}]"#,
+            ),
+        );
+        assert_eq!(
+            body_of(&cache, "/containers/web/io/write"),
+            concat!(
+                r#"[{"time":"2026-01-01T00:00:10.000Z","readkBps":2.00,"writekBps":null},"#,
+                r#"{"time":"2026-01-01T00:00:20.000Z","readkBps":2.00,"writekBps":null},"#,
+                r#"{"time":"2026-01-01T00:01:30.000Z","readkBps":2.00,"writekBps":null}]"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn usages_mark_a_gap_in_every_series_with_or_without_downsampling() {
+        // 1500点（512点に間引く）と、5点（間引かない）。どちらも途切れを 1 つ含む
+        fn short_with_gap(i: usize) -> i64 { time_ms_with_gap(i + 999) }
+        for (npoints, time_of, expected, marker) in [
+            (1500, time_ms_with_gap as fn(usize) -> i64, 512, marker_ms()),
+            (5, short_with_gap as fn(usize) -> i64, 5, marker_ms()),
+        ] {
+            let cache = cache_with(npoints, time_of);
+            for (kind, series_names) in USAGE_KINDS {
+                let parsed = assert_json_ok(&get(&cache, &format!("/usages/{}", kind)));
+                for name in ["web", "db"] {
+                    for series_name in series_names {
+                        let series = &parsed[name][*series_name];
+                        let label = format!("{} {} {}", npoints, kind, series_name);
+                        // 間引いた点 + 目印 1 つ。t と v は同じ長さ
+                        assert_eq!(series["t"].len(), expected + 1, "{}", label);
+                        assert_eq!(series["v"].len(), expected + 1, "{}", label);
+                        let times = times_of(series);
+                        assert!(times.windows(2).all(|w| w[0] < w[1]), "{}", label);
+                        assert_eq!(times[0], time_of(0));
+                        assert_eq!(times[expected], time_of(npoints - 1));
+                        // 目印は 1 つだけで、その位置の値は null
+                        let at: Vec<usize> = times.iter().enumerate()
+                            .filter(|(_, t)| **t % 10_000 != 0)
+                            .map(|(i, _)| i)
+                            .collect();
+                        assert_eq!(at.len(), 1, "{}", label);
+                        assert_eq!(times[at[0]], marker, "{}", label);
+                        assert!(series["v"][at[0]].is_null(), "{}", label);
+                        // 目印の前後は、途切れをまたぐ元の点
+                        assert!(times[at[0] - 1] <= time_ms_with_gap(1000));
+                        assert!(times[at[0] + 1] >= time_ms_with_gap(1001));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn usages_mark_the_gap_in_both_read_and_write() {
+        // read と write で山の位置が違い、間引きの結果も違う系列
+        const READ_SPIKE: usize = 700;
+        const WRITE_SPIKE: usize = 1300;
+        let cache = create_shared_cache();
+        {
+            let mut lock = cache.write().unwrap();
+            for i in 0..2000 {
+                let spike = |at: usize| Some(if i == at { 500.0 } else { 1.0 });
+                assert!(lock.insert("web", UsagePoint {
+                    time_ms: time_ms_with_gap(i),
+                    cpu: Some(1.0),
+                    memory: Some(1.0),
+                    read_kbps: spike(READ_SPIKE),
+                    write_kbps: spike(WRITE_SPIKE),
+                    recv_kbps: spike(WRITE_SPIKE),
+                    send_kbps: spike(READ_SPIKE),
+                }));
+            }
+        }
+        for (kind, first, second, route) in [
+            ("io", "read", "write", "io/read"),
+            ("net", "send", "recv", "net/send"),
+        ] {
+            let parsed = assert_json_ok(&get(&cache, &format!("/usages/{}", kind)));
+            let first_times = times_of(&parsed["web"][first]);
+            let second_times = times_of(&parsed["web"][second]);
+            assert_ne!(first_times, second_times);
+            assert!(first_times.contains(&time_ms_with_gap(READ_SPIKE)));
+            assert!(second_times.contains(&time_ms_with_gap(WRITE_SPIKE)));
+            for (series_name, times) in [(first, &first_times), (second, &second_times)] {
+                assert_eq!(times.len(), 513);
+                assert_eq!(parsed["web"][series_name]["v"].len(), 513);
+                assert!(times.windows(2).all(|w| w[0] < w[1]));
+                let at = times.iter().position(|t| *t == marker_ms()).unwrap();
+                assert!(parsed["web"][series_name]["v"][at].is_null());
+                assert_eq!(times.iter().filter(|t| **t % 10_000 != 0).count(), 1);
+            }
+
+            // コンテナ別のAPIは 512 点のままで、目印を除いた /usages と同じ点を返す
+            let single = assert_json_ok(&get(&cache, &format!("/containers/web/{}", route)));
+            assert_eq!(single.len(), 512);
+            let without_marker: Vec<String> = first_times.iter()
+                .filter(|t| **t != marker_ms())
+                .map(|t| crate::time::millis_to_iso8601(*t))
+                .collect();
+            let single_times: Vec<&str> = single.members()
+                .map(|p| p["time"].as_str().unwrap())
+                .collect();
+            assert_eq!(single_times, without_marker);
+        }
+    }
+
+    #[test]
+    fn usages_body_with_markers_is_built_in_exactly_its_counted_length() {
+        // 24時間分の点数で、100点ごとに途切れがある系列（目印は 1 系列に 86 個）
+        fn gap_every_100(i: usize) -> i64 {
+            BASE_MS + i as i64 * 1000 + (i / 100) as i64 * 61_000
+        }
+        let cache = cache_with(crate::log_cache::MAX_LOG_LENGTH, gap_every_100);
+        let budget = leaked_budget(MAX_BULK_BODY_BYTES);
+        for kind in ["cpu", "memory", "io", "net"] {
+            let kind = crate::log_cache::UsageKind::from_path(kind).unwrap();
+            let len = {
+                let lock = cache.read().unwrap();
+                let len = usages_json_len(&lock, kind);
+                let body = usages_json_within(&lock, kind, len).unwrap();
+                assert_eq!(body.len(), len);
+                assert_eq!(body.capacity(), len);
+                // 1バイトでも足りなければ作らない
+                assert!(usages_json_within(&lock, kind, len - 1).is_none());
+
+                let parsed = json::parse(&body).unwrap();
+                for (_, container) in parsed.entries() {
+                    for (_, series) in container.entries() {
+                        assert_eq!(series["t"].len(), 512 + 86);
+                        assert_eq!(series["v"].len(), 512 + 86);
+                    }
+                }
+                len
+            };
+
+            // 取った枠・確保した領域・本文の長さが一致する
+            let response = usages_response(&cache, kind, len, budget).unwrap();
+            assert_eq!(response.body.len(), len);
+            assert_eq!(response.body.capacity(), len);
+            assert_eq!(used_bytes(budget), len);
+            drop(response);
+            assert_eq!(used_bytes(budget), 0);
         }
     }
 
