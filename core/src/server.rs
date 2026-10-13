@@ -153,6 +153,98 @@ fn container_names_json(cache: &log_cache::UsageCache) -> String {
     format!("[{}]", data)
 }
 
+/// /usages/{kind} の1点が本文に占めるバイト数の見積もり
+/// 時刻（13桁）と値（小数2桁。大きめに見て12文字）と、それぞれの区切り
+const USAGES_BYTES_PER_POINT: usize = 28;
+
+/// jsonの文字列として書き出します（引用符つき）
+/// Dockerのコンテナ名は英数字と _ . - だけだが、ログから復元した名前も通るので
+/// 本文全体が壊れないようエスケープする
+fn push_json_string(out: &mut String, value: &str) {
+    use std::fmt::Write as _;
+
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str(r#"\""#),
+            '\\' => out.push_str(r"\\"),
+            c if (c as u32) < 0x20 => {
+                // String への書き込みは失敗しない
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// usages_json の本文の長さの見積もり（最初に確保する大きさ）
+fn usages_json_capacity(
+    cache: &log_cache::UsageCache,
+    names: &[&String],
+    nseries: usize,
+    option: &log_cache::DownsampleOption,
+) -> usize {
+    2 + names.iter()
+        .map(|name| {
+            let per_series = 32
+                + cache.downsampled_len(name, option) * USAGES_BYTES_PER_POINT;
+            name.len() + 8 + nseries * per_series
+        })
+        .sum::<usize>()
+}
+
+/// 全コンテナ分の系列を、種別ごとに1つのjsonオブジェクトにします
+///
+/// 形は コンテナ名 → 系列名 → { "t": [ミリ秒, ...], "v": [値, ...] } です
+/// コンテナ名はアルファベット順に並べます
+/// 間引きは系列ごとに独立して行うので、同じコンテナでも系列によって t が変わります
+/// 本文は1つの String に直接書き出します（確保が最初の1回で済むように見積もる）
+fn usages_json(cache: &log_cache::UsageCache, kind: log_cache::UsageKind) -> String {
+    use std::fmt::Write as _;
+
+    let option = log_cache::DownsampleOption::default();
+    let names = cache.container_names();
+    let series_list = kind.series();
+
+    let mut out = String::with_capacity(
+        usages_json_capacity(cache, &names, series_list.len(), &option)
+    );
+
+    out.push('{');
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        push_json_string(&mut out, name);
+        out.push_str(":{");
+        for (j, (key, series)) in series_list.iter().enumerate() {
+            // 名前は直前に一覧から取ったものなので、必ず見つかる
+            let points = cache.downsample(name, &option, *series)
+                .unwrap_or_default();
+            if j > 0 { out.push(','); }
+            // String への書き込みは失敗しない
+            let _ = write!(out, "\"{}\":{{\"t\":[", key);
+            for (k, point) in points.iter().enumerate() {
+                if k > 0 { out.push(','); }
+                let _ = write!(out, "{}", point.time_ms);
+            }
+            out.push_str("],\"v\":[");
+            for (k, point) in points.iter().enumerate() {
+                if k > 0 { out.push(','); }
+                match series.raw_value(point) {
+                    // NaN や無限大はjsonに書けない。1つで本文全体が壊れるので欠損にする
+                    Some(v) if v.is_finite() => { let _ = write!(out, "{:.2}", v); }
+                    _ => out.push_str("null"),
+                }
+            }
+            out.push_str("]}");
+        }
+        out.push('}');
+    }
+    out.push('}');
+
+    out
+}
+
 /// パスから応答を決めます。ストリームには触りません
 /// 経路・コンテナ名・種別のどれかに一致しなければ404、
 /// 処理に失敗すればError型を返します（呼び出し側で500にします）
@@ -181,6 +273,9 @@ fn route(
             series_json(&cache, name, log_cache::Series::NetRecv),
         ["containers", name, "net", "send"] =>
             series_json(&cache, name, log_cache::Series::NetSend),
+        ["usages", kind] =>
+            log_cache::UsageKind::from_path(kind)
+                .map(|kind| usages_json(&cache, kind)),
         _ => None,
     };
 
@@ -589,11 +684,7 @@ mod tests {
                 send_kbps: None,
             });
         }
-        let body_of = |path: &str| {
-            let response = get(&cache, path);
-            assert_json_ok(&response);
-            split(&response).2.to_string()
-        };
+        let body_of = |path: &str| body_of(&cache, path);
         assert_eq!(
             body_of("/containers/web/cpu"),
             concat!(
@@ -621,6 +712,277 @@ mod tests {
         assert_eq!(body_of("/containers/web/net/recv"), net);
         assert_eq!(body_of("/containers/web/net/send"), net);
         assert_eq!(body_of("/containers"), r#"["web"]"#);
+    }
+
+    // ---- /usages/{kind}（全コンテナ分をまとめて返す） ----
+
+    const USAGE_KINDS: [(&str, &[&str]); 4] = [
+        ("cpu", &["percentage"]),
+        ("memory", &["percentage"]),
+        ("io", &["read", "write"]),
+        ("net", &["recv", "send"]),
+    ];
+
+    fn body_of(cache: &SharedUsageCache, path: &str) -> String {
+        let response = get(cache, path);
+        assert_json_ok(&response);
+        split(&response).2.to_string()
+    }
+
+    fn times_of(series: &json::JsonValue) -> Vec<i64> {
+        series["t"].members().map(|t| t.as_i64().unwrap()).collect()
+    }
+
+    #[test]
+    fn usages_bodies_keep_their_exact_shape() {
+        // 時刻はエポックからのミリ秒の整数、値は小数2桁、欠損は null
+        // キャッシュには web を先に入れるが、出力は名前の順（db が先）
+        let cache = create_shared_cache();
+        {
+            let mut lock = cache.write().unwrap();
+            lock.insert("web", UsagePoint {
+                time_ms: BASE_MS + 10_023,
+                cpu: Some(0.125),
+                memory: Some(3.64),
+                read_kbps: Some(0.0),
+                write_kbps: Some(1234.0),
+                recv_kbps: None,
+                send_kbps: Some(0.35),
+            });
+            lock.insert("web", UsagePoint {
+                time_ms: BASE_MS + 20_000,
+                cpu: None,
+                memory: Some(100.0),
+                read_kbps: None,
+                write_kbps: None,
+                recv_kbps: Some(12.345),
+                send_kbps: None,
+            });
+            lock.insert("db", UsagePoint {
+                time_ms: BASE_MS + 10_031,
+                cpu: Some(0.03),
+                memory: None,
+                read_kbps: Some(1.0),
+                write_kbps: Some(0.004),
+                recv_kbps: Some(2.5),
+                send_kbps: None,
+            });
+        }
+        assert_eq!(
+            body_of(&cache, "/usages/cpu"),
+            concat!(
+                r#"{"db":{"percentage":{"t":[1767225610031],"v":[0.03]}},"#,
+                r#""web":{"percentage":{"t":[1767225610023,1767225620000],"v":[0.12,null]}}}"#,
+            ),
+        );
+        assert_eq!(
+            body_of(&cache, "/usages/memory"),
+            concat!(
+                r#"{"db":{"percentage":{"t":[1767225610031],"v":[null]}},"#,
+                r#""web":{"percentage":{"t":[1767225610023,1767225620000],"v":[3.64,100.00]}}}"#,
+            ),
+        );
+        assert_eq!(
+            body_of(&cache, "/usages/io"),
+            concat!(
+                r#"{"db":{"read":{"t":[1767225610031],"v":[1.00]},"#,
+                r#""write":{"t":[1767225610031],"v":[0.00]}},"#,
+                r#""web":{"read":{"t":[1767225610023,1767225620000],"v":[0.00,null]},"#,
+                r#""write":{"t":[1767225610023,1767225620000],"v":[1234.00,null]}}}"#,
+            ),
+        );
+        assert_eq!(
+            body_of(&cache, "/usages/net"),
+            concat!(
+                r#"{"db":{"recv":{"t":[1767225610031],"v":[2.50]},"#,
+                r#""send":{"t":[1767225610031],"v":[null]}},"#,
+                r#""web":{"recv":{"t":[1767225610023,1767225620000],"v":[null,12.35]},"#,
+                r#""send":{"t":[1767225610023,1767225620000],"v":[0.35,null]}}}"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn usages_series_have_matching_lengths_and_are_downsampled() {
+        // 3点（間引かない）と 2000点（512点に間引く）
+        for (npoints, expected) in [(3, 3), (2000, 512)] {
+            let cache = cache_with(npoints, time_ms_at);
+            for (kind, series_names) in USAGE_KINDS {
+                let parsed = assert_json_ok(&get(&cache, &format!("/usages/{}", kind)));
+                // コンテナは web と db だけ
+                assert_eq!(parsed.len(), 2);
+                for name in ["web", "db"] {
+                    // 系列はその種別のものだけ
+                    assert_eq!(parsed[name].len(), series_names.len());
+                    for series_name in series_names {
+                        let series = &parsed[name][*series_name];
+                        // 系列が持つのは t と v だけ
+                        assert_eq!(series.len(), 2);
+                        assert_eq!(series["t"].len(), expected, "{} {}", kind, series_name);
+                        assert_eq!(series["v"].len(), expected, "{} {}", kind, series_name);
+                        let times = times_of(series);
+                        assert_eq!(times[0], time_ms_at(0));
+                        assert_eq!(times[expected - 1], time_ms_at(npoints - 1));
+                        assert!(times.windows(2).all(|w| w[0] < w[1]));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn usages_values_match_the_per_container_api() {
+        // 同じキャッシュなら、選ばれる点も値もコンテナ別のAPIと同じ
+        let cache = cache_with(2000, time_ms_at);
+        let bulk = assert_json_ok(&get(&cache, "/usages/io"));
+        let single = assert_json_ok(&get(&cache, "/containers/web/io/read"));
+        let read = &bulk["web"]["read"];
+        assert_eq!(read["t"].len(), single.len());
+        for (i, point) in single.members().enumerate() {
+            let time = crate::time::millis_to_iso8601(read["t"][i].as_i64().unwrap());
+            assert_eq!(point["time"], time.as_str());
+            assert_eq!(point["readkBps"], read["v"][i]);
+        }
+        // write は全点が欠損
+        assert!(bulk["web"]["write"]["v"].members().all(|v| v.is_null()));
+    }
+
+    #[test]
+    fn usages_read_and_write_are_downsampled_independently() {
+        // read と write で山の位置が違う系列
+        const READ_SPIKE: usize = 700;
+        const WRITE_SPIKE: usize = 1300;
+        let cache = create_shared_cache();
+        {
+            let mut lock = cache.write().unwrap();
+            for i in 0..2000 {
+                let spike = |at: usize| Some(if i == at { 500.0 } else { 1.0 });
+                assert!(lock.insert("web", UsagePoint {
+                    time_ms: time_ms_at(i),
+                    cpu: Some(1.0),
+                    memory: Some(1.0),
+                    read_kbps: spike(READ_SPIKE),
+                    write_kbps: spike(WRITE_SPIKE),
+                    recv_kbps: spike(WRITE_SPIKE),
+                    send_kbps: spike(READ_SPIKE),
+                }));
+            }
+        }
+        for (kind, first, second) in [("io", "read", "write"), ("net", "send", "recv")] {
+            let parsed = assert_json_ok(&get(&cache, &format!("/usages/{}", kind)));
+            let first_times = times_of(&parsed["web"][first]);
+            let second_times = times_of(&parsed["web"][second]);
+            assert_eq!(first_times.len(), 512);
+            assert_eq!(second_times.len(), 512);
+            // それぞれ自分の山を残し、残した時刻の並びは一致しない
+            assert!(first_times.contains(&time_ms_at(READ_SPIKE)));
+            assert!(second_times.contains(&time_ms_at(WRITE_SPIKE)));
+            assert_ne!(first_times, second_times);
+            // 山の値は、その時刻と同じ位置に入っている
+            let at = first_times.iter().position(|t| *t == time_ms_at(READ_SPIKE)).unwrap();
+            assert_eq!(parsed["web"][first]["v"][at], 500.0);
+        }
+    }
+
+    #[test]
+    fn usages_container_names_are_sorted() {
+        // /containers と同じ並び（Stringの順序。大文字は小文字より前）
+        let cache = create_shared_cache();
+        {
+            let mut lock = cache.write().unwrap();
+            for name in ["web", "db", "api2", "Api", "api", "web-2"] {
+                assert!(lock.insert(name, UsagePoint {
+                    time_ms: BASE_MS,
+                    cpu: Some(1.0),
+                    memory: None,
+                    read_kbps: None,
+                    write_kbps: None,
+                    recv_kbps: None,
+                    send_kbps: None,
+                }));
+            }
+        }
+        let expected = ["Api", "api", "api2", "db", "web", "web-2"];
+        let names = json::parse(&body_of(&cache, "/containers")).unwrap();
+        let names: Vec<&str> = names.members().map(|n| n.as_str().unwrap()).collect();
+        assert_eq!(names, expected);
+
+        for (kind, _) in USAGE_KINDS {
+            let body = body_of(&cache, &format!("/usages/{}", kind));
+            let positions: Vec<usize> = expected.iter()
+                .map(|name| body.find(&format!("\"{}\":{{", name)).unwrap())
+                .collect();
+            assert!(positions.windows(2).all(|w| w[0] < w[1]), "{}", body);
+        }
+    }
+
+    #[test]
+    fn usages_of_empty_cache_is_an_empty_object() {
+        let cache = create_shared_cache();
+        for (kind, _) in USAGE_KINDS {
+            assert_eq!(body_of(&cache, &format!("/usages/{}", kind)), "{}");
+        }
+    }
+
+    #[test]
+    fn usages_body_fits_in_the_first_allocation() {
+        // 24時間分 × 8コンテナでも、最初に確保した大きさに収まる
+        let cache = create_shared_cache();
+        {
+            let mut lock = cache.write().unwrap();
+            for c in 0..8 {
+                let name = format!("container-{}", c);
+                for i in 0..crate::log_cache::MAX_LOG_LENGTH {
+                    let v = (i % 13) as f32 * 123.45;
+                    assert!(lock.insert(&name, UsagePoint {
+                        time_ms: time_ms_at(i),
+                        cpu: Some(v),
+                        memory: Some(v),
+                        read_kbps: Some(v),
+                        write_kbps: Some(v),
+                        recv_kbps: Some(v),
+                        send_kbps: None,
+                    }));
+                }
+            }
+        }
+        let lock = cache.read().unwrap();
+        let option = crate::log_cache::DownsampleOption::default();
+        let names = lock.container_names();
+        for kind in ["cpu", "memory", "io", "net"] {
+            let kind = crate::log_cache::UsageKind::from_path(kind).unwrap();
+            let body = usages_json(&lock, kind);
+            let estimated =
+                usages_json_capacity(&lock, &names, kind.series().len(), &option);
+            assert!(body.len() <= estimated, "{} > {}", body.len(), estimated);
+            assert_eq!(body.capacity(), estimated);
+            json::parse(&body).unwrap();
+        }
+    }
+
+    #[test]
+    fn usages_escape_names_and_drop_non_finite_values() {
+        let mut escaped = String::new();
+        push_json_string(&mut escaped, "a\"b\\c\nd");
+        assert_eq!(escaped, r#""a\"b\\c\u000ad""#);
+
+        let cache = create_shared_cache();
+        {
+            let mut lock = cache.write().unwrap();
+            lock.insert("we\"b", UsagePoint {
+                time_ms: BASE_MS,
+                cpu: Some(f32::NAN),
+                memory: Some(f32::INFINITY),
+                read_kbps: None,
+                write_kbps: None,
+                recv_kbps: None,
+                send_kbps: None,
+            });
+        }
+        for kind in ["cpu", "memory"] {
+            let parsed = assert_json_ok(&get(&cache, &format!("/usages/{}", kind)));
+            assert!(parsed["we\"b"]["percentage"]["v"][0].is_null());
+        }
     }
 
     #[test]
@@ -674,6 +1036,14 @@ mod tests {
             "/containers/web/cpu/extra",
             "/containers?limit=1",
             "/containers/web/cpu?nsample=10",
+            "/usages",
+            "/usages/",
+            "/usages/disk",
+            "/usages/CPU",
+            "/usages/io/read",
+            "/usages/cpu/extra",
+            "/usages/cpu?nsample=10",
+            "/usages/web/cpu",
         ] {
             assert_status(&get(&cache, path), "HTTP/1.1 404 Not Found");
         }
@@ -939,7 +1309,7 @@ mod tests {
         poison(&cache);
         assert!(cache.read().is_err());
 
-        for path in ["/containers", "/containers/web/cpu", "/unknown"] {
+        for path in ["/containers", "/containers/web/cpu", "/usages/cpu", "/unknown"] {
             let response = get(&cache, path);
             let (status, headers, body) = split(&response);
             assert_eq!(status, "HTTP/1.1 500 Internal Server Error");
@@ -1086,8 +1456,8 @@ mod tests {
 
     #[test]
     fn burst_over_the_limit_is_all_served() {
-        // webは1回の表示で 6N 本を同時に発射する（Nはコンテナ数）
-        // 上限を超えた分も断られず、全部200になること
+        // コンテナ別のAPIだけで1画面分を取ると 6N 本になる（Nはコンテナ数）
+        // 同時に発射されて上限を超えた分も断られず、全部200になること
         const NCONTAINERS: usize = 10;
         let cache = create_shared_cache();
         {
