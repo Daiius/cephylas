@@ -1,7 +1,6 @@
 import clsx from 'clsx';
 import { cacheLife, cacheTag } from 'next/cache';
 import { Chart, type AppDataset } from '@/components/Chart';
-import { borderColorFor, backgroundColorFor } from '@/lib/colors';
 
 import {
   fetchUsages,
@@ -23,13 +22,12 @@ export const MemoryChart = async ({
   if (!response.ok) return (<div>メモリ使用率取得中...</div>);
   const usages = response.data;
 
+  // 色はここでは付けない (クライアント側で、画面全体の名前の一覧から決める)
   const datasets: AppDataset[] = sortedContainerNames(usages).map(
-    (containerName, i) => ({
+    (containerName) => ({
       containerName,
       label: containerName,
       data: toPoints(usages[containerName].percentage),
-      borderColor: borderColorFor(i),
-      backgroundColor: backgroundColorFor(i),
     }),
   );
 

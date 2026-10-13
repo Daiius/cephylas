@@ -1,5 +1,7 @@
 import z from 'zod';
 
+import { sortContainerNames } from '@/lib/colors';
+
 // dev (host): localhost フォールバック
 // prod (Vercel): API_URL を環境変数で `https://<api-domain>/cephylas` に設定
 const API_URL = process.env.API_URL ?? 'http://localhost:7878';
@@ -63,27 +65,13 @@ export const fetchUsages = async <K extends UsageKind>(
   }
 };
 
-// コードポイント順の比較。core の並び (Rust の String の順序) と同じ結果になる。
-// `<` は UTF-16 のコード単位で比べるので、サロゲートペアを含む名前で順序が変わる。
-// localeCompare はロケール依存で、大文字と小文字の並びも変わるので使わない。
-const compareByCodePoint = (a: string, b: string): number => {
-  const ia = a[Symbol.iterator]();
-  const ib = b[Symbol.iterator]();
-  for (;;) {
-    const ca = ia.next();
-    const cb = ib.next();
-    if (ca.done || cb.done) return (ca.done ? 0 : 1) - (cb.done ? 0 : 1);
-    const diff = ca.value.codePointAt(0)! - cb.value.codePointAt(0)!;
-    if (diff !== 0) return diff;
-  }
-};
-
 /**
- * コンテナ名を表示順に並べる。色はこの並びの位置で決まる (lib/colors.ts)。
- * JSON のキーの順序には依存しない。
+ * 応答に含まれるコンテナ名を表示順に並べる (データセットと凡例の並び)。
+ * JSON のキーの順序には依存しない。色はここでは決めない
+ * (画面全体の名前の一覧からクライアント側で決める。lib/colors.ts)。
  */
 export const sortedContainerNames = (usages: Record<string, unknown>): string[] =>
-  Object.keys(usages).sort(compareByCodePoint);
+  sortContainerNames(Object.keys(usages));
 
 /** 1 系列を Chart.js の点列にする。x はエポックからのミリ秒。 */
 export const toPoints = (

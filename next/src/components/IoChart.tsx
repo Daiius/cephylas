@@ -1,7 +1,6 @@
 import { clsx } from 'clsx';
 import { cacheLife, cacheTag } from 'next/cache';
 import { Chart, type AppDataset } from '@/components/Chart';
-import { borderColorFor, backgroundColorFor } from '@/lib/colors';
 
 import {
   fetchUsages,
@@ -23,26 +22,21 @@ export const IoChart = async ({
   if (!response.ok) return (<div>IO 取得中...</div>);
   const usages = response.data;
 
+  // 色はここでは付けない (クライアント側で、画面全体の名前の一覧から決める)
   const datasets: AppDataset[] = [];
-  for (const [i, containerName] of sortedContainerNames(usages).entries()) {
-    const border = borderColorFor(i);
-    const bg = backgroundColorFor(i);
+  for (const containerName of sortedContainerNames(usages)) {
     const { read, write } = usages[containerName];
 
     datasets.push({
       containerName,
       label: `${containerName} read`,
       data: toPoints(read),
-      borderColor: border,
-      backgroundColor: bg,
       borderDash: [1, 0],
     });
     datasets.push({
       containerName,
       label: `${containerName} write`,
       data: toPoints(write),
-      borderColor: border,
-      backgroundColor: bg,
       borderDash: [5, 5],
     });
   }

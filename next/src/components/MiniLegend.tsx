@@ -4,6 +4,7 @@ import { clsx } from 'clsx';
 import { useCallback, useEffect, useRef } from 'react';
 import { useFilter } from './FilterContext';
 import type { AppDataset } from './Chart';
+import type { ColorOf } from './ContainerColorContext';
 
 const DOUBLE_CLICK_THRESHOLD_MS = 250;
 
@@ -20,7 +21,14 @@ const DOUBLE_CLICK_THRESHOLD_MS = 250;
  *   - 既に単独表示中 → ダブル → 全表示に戻す
  * シングルクリックの toggle は double 検知のため DOUBLE_CLICK_THRESHOLD_MS だけ遅延発火する。
  */
-export const MiniLegend = ({ datasets }: { datasets: AppDataset[] }) => {
+export const MiniLegend = ({
+  datasets,
+  colorOf,
+}: {
+  datasets: AppDataset[];
+  /** Chart が線に当てているのと同じ関数 (ContainerColorContext) */
+  colorOf: ColorOf;
+}) => {
   const { hidden, toggle, isolate, clear } = useFilter();
 
   const seen = new Set<string>();
@@ -29,10 +37,7 @@ export const MiniLegend = ({ datasets }: { datasets: AppDataset[] }) => {
     const name = d.containerName;
     if (!name || seen.has(name)) continue;
     seen.add(name);
-    uniq.push({
-      name,
-      color: typeof d.borderColor === 'string' ? d.borderColor : '#888',
-    });
+    uniq.push({ name, color: colorOf(name).border });
   }
 
   // 直近の単発クリック (まだ toggle が発火していないもの) を覚えておく。

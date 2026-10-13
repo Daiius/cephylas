@@ -1,7 +1,6 @@
 import { clsx } from 'clsx';
 import { cacheLife, cacheTag } from 'next/cache';
 import { Chart, type AppDataset } from '@/components/Chart';
-import { borderColorFor, backgroundColorFor } from '@/lib/colors';
 
 import {
   fetchUsages,
@@ -23,26 +22,21 @@ export const NetChart = async ({
   if (!response.ok) return (<div>Net 取得中...</div>);
   const usages = response.data;
 
+  // 色はここでは付けない (クライアント側で、画面全体の名前の一覧から決める)
   const datasets: AppDataset[] = [];
-  for (const [i, containerName] of sortedContainerNames(usages).entries()) {
-    const border = borderColorFor(i);
-    const bg = backgroundColorFor(i);
+  for (const containerName of sortedContainerNames(usages)) {
     const { recv, send } = usages[containerName];
 
     datasets.push({
       containerName,
       label: `${containerName} recv`,
       data: toPoints(recv),
-      borderColor: border,
-      backgroundColor: bg,
       borderDash: [1, 0],
     });
     datasets.push({
       containerName,
       label: `${containerName} send`,
       data: toPoints(send),
-      borderColor: border,
-      backgroundColor: bg,
       borderDash: [5, 5],
     });
   }
