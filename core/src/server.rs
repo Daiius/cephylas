@@ -69,12 +69,77 @@ impl StatusCode {
     }
 }
 
+/// /usages/{kind} の本文として、同時に保持してよいバイト数の合計
+///
+/// 全コンテナ分の本文は1本で数百kB〜数MBになり、送り終えるまで接続ごとに持ち続ける
+/// 同時接続の上限（16本）まで並ぶとメモリの上限を超えうるので、合計で抑える
+/// 超える分は断らず、先の応答が送り終わるまで待たせる
+const MAX_BULK_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// プロセス全体で1つの、/usages/{kind} の本文の枠
+static BULK_BODY_BUDGET: BodyBudget = BodyBudget::new(MAX_BULK_BODY_BYTES);
+
+/// 同時に保持する本文のバイト数を数えるセマフォ
+struct BodyBudget {
+    used: Mutex<usize>,
+    released: Condvar,
+    max: usize,
+}
+
+impl BodyBudget {
+    const fn new(max: usize) -> Self {
+        BodyBudget {
+            used: Mutex::new(0),
+            released: Condvar::new(),
+            max,
+        }
+    }
+
+    /// bytes 分の枠を取ります。合計が上限を超えるなら、空くまで待ちます
+    ///
+    /// ほかに誰も枠を持っていなければ、上限より大きくても通します
+    /// (1本で上限を超える本文を、永久に返せなくならないようにするため)
+    /// 待つことがあるので、キャッシュのlockを持ったまま呼ばないこと
+    fn reserve(&'static self, bytes: usize) -> BodyReservation {
+        // lockを持ったままpanicする箇所は無いが、poisonされていても止まらない
+        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        while *used > 0 && used.saturating_add(bytes) > self.max {
+            used = self.released.wait(used)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        *used = used.saturating_add(bytes);
+
+        BodyReservation { budget: self, bytes }
+    }
+}
+
+/// 本文の枠。Dropで必ず返すので、ハンドラがpanicしても枠は戻る
+struct BodyReservation {
+    budget: &'static BodyBudget,
+    bytes: usize,
+}
+
+// 取った枠の大きさは変えられない（増やす操作を持たせない）
+// 枠を使う側は、取った大きさを超えない本文しか作らないこと
+
+impl Drop for BodyReservation {
+    fn drop(&mut self) {
+        let mut used = self.budget.used.lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *used = used.saturating_sub(self.bytes);
+        // 待っている側の大きさはまちまちなので、全員を起こして判定し直させる
+        self.budget.released.notify_all();
+    }
+}
+
 /// 書き出す前の応答。経路の判定はこれを返すだけにして、
 /// ストリームへの書き込みは write_response の1箇所に集める
 struct Response {
     status: StatusCode,
     content_type: &'static str,
     body: String,
+    /// 本文の枠。応答を送り終えて破棄するまで持ち続ける
+    _reservation: Option<BodyReservation>,
 }
 
 impl Response {
@@ -83,6 +148,14 @@ impl Response {
             status: StatusCode::Ok,
             content_type: "application/json",
             body,
+            _reservation: None,
+        }
+    }
+    /// 本文の枠を持ったままのjson応答
+    fn reserved_json(body: String, reservation: BodyReservation) -> Self {
+        Response {
+            _reservation: Some(reservation),
+            ..Response::json(body)
         }
     }
     /// 本文を持たないエラー応答
@@ -91,6 +164,7 @@ impl Response {
             status,
             content_type: "text/plain; charset=utf-8",
             body: String::new(),
+            _reservation: None,
         }
     }
     /// 500応答。本文は固定の文言で、内部の情報を載せない
@@ -107,14 +181,16 @@ fn write_response<W: Write>(
     response: &Response,
 ) -> Result<(), error::Error> {
     let body_bytes = response.body.as_bytes();
-    let mut bytes = format!(
+    let head = format!(
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         response.status.status_line(),
         response.content_type,
         body_bytes.len(),
-    ).into_bytes();
-    bytes.extend_from_slice(body_bytes);
-    stream.write_all(&bytes)?;
+    );
+    // ヘッダと本文を1つのバッファにまとめない
+    // (本文が数MBになる応答で、送る間だけ本文の複製を持つことになるため)
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body_bytes)?;
     stream.flush()?;
 
     Ok(())
@@ -153,6 +229,161 @@ fn container_names_json(cache: &log_cache::UsageCache) -> String {
     format!("[{}]", data)
 }
 
+/// 枠を取り直して本文を組み立てる回数の上限
+/// (枠を待つ間にキャッシュが伸びると取り直す。それが続いたら500にして終わる)
+const MAX_BULK_BUILD_ATTEMPTS: usize = 8;
+
+/// 書き込まれたバイト数だけを数える書き出し先
+struct ByteCounter(usize);
+
+impl std::fmt::Write for ByteCounter {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0 += s.len();
+        Ok(())
+    }
+}
+
+/// 決めた長さを超える書き込みを受け付けない String
+///
+/// 最初に limit バイトを確保し、それを超える書き込みは失敗させます
+/// 確保した領域が伸びることはありません
+struct CappedString {
+    out: String,
+    limit: usize,
+}
+
+impl CappedString {
+    fn new(limit: usize) -> Self {
+        CappedString { out: String::with_capacity(limit), limit }
+    }
+}
+
+impl std::fmt::Write for CappedString {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        if s.len() > self.limit - self.out.len() {
+            return Err(std::fmt::Error);
+        }
+        self.out.push_str(s);
+        Ok(())
+    }
+}
+
+/// jsonの文字列として書き出します（引用符つき）
+/// Dockerのコンテナ名は英数字と _ . - だけだが、ログから復元した名前も通るので
+/// 本文全体が壊れないようエスケープする
+fn write_json_string<W: std::fmt::Write>(
+    out: &mut W,
+    value: &str,
+) -> std::fmt::Result {
+    out.write_char('"')?;
+    for c in value.chars() {
+        match c {
+            '"' => out.write_str(r#"\""#)?,
+            '\\' => out.write_str(r"\\")?,
+            c if (c as u32) < 0x20 => write!(out, "\\u{:04x}", c as u32)?,
+            c => out.write_char(c)?,
+        }
+    }
+    out.write_char('"')
+}
+
+/// 全コンテナ分の系列を、種別ごとに1つのjsonオブジェクトとして書き出します
+///
+/// 形は コンテナ名 → 系列名 → { "t": [ミリ秒, ...], "v": [値, ...] } です
+/// コンテナ名はアルファベット順に並べます
+/// 間引きは系列ごとに独立して行うので、同じコンテナでも系列によって t が変わります
+/// 書き出し先を差し替えられるので、長さだけを数えることも、本文を作ることもできます
+/// (同じキャッシュに対しては、どちらも同じバイト列になる)
+fn write_usages_json<W: std::fmt::Write>(
+    out: &mut W,
+    cache: &log_cache::UsageCache,
+    kind: log_cache::UsageKind,
+) -> std::fmt::Result {
+    let option = log_cache::DownsampleOption::default();
+
+    out.write_char('{')?;
+    for (i, name) in cache.container_names().iter().enumerate() {
+        if i > 0 { out.write_char(',')?; }
+        write_json_string(out, name)?;
+        out.write_str(":{")?;
+        for (j, (key, series)) in kind.series().iter().enumerate() {
+            // 名前は直前に一覧から取ったものなので、必ず見つかる
+            let points = cache.downsample(name, &option, *series)
+                .unwrap_or_default();
+            if j > 0 { out.write_char(',')?; }
+            write!(out, "\"{}\":{{\"t\":[", key)?;
+            for (k, point) in points.iter().enumerate() {
+                if k > 0 { out.write_char(',')?; }
+                write!(out, "{}", point.time_ms)?;
+            }
+            out.write_str("],\"v\":[")?;
+            for (k, point) in points.iter().enumerate() {
+                if k > 0 { out.write_char(',')?; }
+                match series.raw_value(point) {
+                    // NaN や無限大はjsonに書けない。1つで本文全体が壊れるので欠損にする
+                    Some(v) if v.is_finite() => write!(out, "{:.2}", v)?,
+                    _ => out.write_str("null")?,
+                }
+            }
+            out.write_str("]}")?;
+        }
+        out.write_char('}')?;
+    }
+    out.write_char('}')
+}
+
+/// /usages/{kind} の本文の正確な長さ（バイト数）。本文は作りません
+fn usages_json_len(
+    cache: &log_cache::UsageCache,
+    kind: log_cache::UsageKind,
+) -> usize {
+    let mut counter = ByteCounter(0);
+    // ByteCounter への書き込みは失敗しない
+    let _ = write_usages_json(&mut counter, cache, kind);
+
+    counter.0
+}
+
+/// /usages/{kind} の本文を、limit バイトちょうどの領域に組み立てます
+/// limit に収まらなければ None を返します（領域は伸ばさずに破棄する）
+fn usages_json_within(
+    cache: &log_cache::UsageCache,
+    kind: log_cache::UsageKind,
+    limit: usize,
+) -> Option<String> {
+    let mut capped = CappedString::new(limit);
+    write_usages_json(&mut capped, cache, kind).ok()?;
+
+    Some(capped.out)
+}
+
+/// /usages/{kind} の応答を、本文の枠を取ってから組み立てます
+///
+/// needed は呼び出し側がlockを持っている間に数えた、本文の正確な長さです
+/// その長さの枠を取り、その長さを超えない領域にだけ本文を書きます
+/// 枠を待つ間はキャッシュのlockを持ちません（loggerのwrite lockを待たせないため）
+/// 待つ間にキャッシュが変わって本文が長くなっていたら、領域は伸ばさず、
+/// 枠を返してから、数え直した長さで取り直します
+/// 枠は応答に持たせ、送り終えて破棄されるまで返しません
+fn usages_response(
+    log_cache: &log_cache::SharedUsageCache,
+    kind: log_cache::UsageKind,
+    mut needed: usize,
+    budget: &'static BodyBudget,
+) -> Result<Response, error::Error> {
+    for _ in 0..MAX_BULK_BUILD_ATTEMPTS {
+        let reservation = budget.reserve(needed);
+        let cache = log_cache.read().map_err(|e| e.to_string())?;
+        if let Some(body) = usages_json_within(&cache, kind, needed) {
+            return Ok(Response::reserved_json(body, reservation));
+        }
+        needed = usages_json_len(&cache, kind);
+        // ここで cache（lock）と reservation（枠）を手放してから、取り直す
+    }
+
+    Err("the cache kept growing while waiting for the body budget".into())
+}
+
 /// パスから応答を決めます。ストリームには触りません
 /// 経路・コンテナ名・種別のどれかに一致しなければ404、
 /// 処理に失敗すればError型を返します（呼び出し側で500にします）
@@ -181,6 +412,15 @@ fn route(
             series_json(&cache, name, log_cache::Series::NetRecv),
         ["containers", name, "net", "send"] =>
             series_json(&cache, name, log_cache::Series::NetSend),
+        ["usages", kind] => match log_cache::UsageKind::from_path(kind) {
+            Some(kind) => {
+                let needed = usages_json_len(&cache, kind);
+                // 本文の枠を待つことがあるので、lockを手放してから取りにいく
+                drop(cache);
+                return usages_response(log_cache, kind, needed, &BULK_BODY_BUDGET);
+            }
+            None => None,
+        },
         _ => None,
     };
 
@@ -589,11 +829,7 @@ mod tests {
                 send_kbps: None,
             });
         }
-        let body_of = |path: &str| {
-            let response = get(&cache, path);
-            assert_json_ok(&response);
-            split(&response).2.to_string()
-        };
+        let body_of = |path: &str| body_of(&cache, path);
         assert_eq!(
             body_of("/containers/web/cpu"),
             concat!(
@@ -621,6 +857,618 @@ mod tests {
         assert_eq!(body_of("/containers/web/net/recv"), net);
         assert_eq!(body_of("/containers/web/net/send"), net);
         assert_eq!(body_of("/containers"), r#"["web"]"#);
+    }
+
+    // ---- /usages/{kind}（全コンテナ分をまとめて返す） ----
+
+    const USAGE_KINDS: [(&str, &[&str]); 4] = [
+        ("cpu", &["percentage"]),
+        ("memory", &["percentage"]),
+        ("io", &["read", "write"]),
+        ("net", &["recv", "send"]),
+    ];
+
+    fn body_of(cache: &SharedUsageCache, path: &str) -> String {
+        let response = get(cache, path);
+        assert_json_ok(&response);
+        split(&response).2.to_string()
+    }
+
+    fn times_of(series: &json::JsonValue) -> Vec<i64> {
+        series["t"].members().map(|t| t.as_i64().unwrap()).collect()
+    }
+
+    #[test]
+    fn usages_bodies_keep_their_exact_shape() {
+        // 時刻はエポックからのミリ秒の整数、値は小数2桁、欠損は null
+        // キャッシュには web を先に入れるが、出力は名前の順（db が先）
+        let cache = create_shared_cache();
+        {
+            let mut lock = cache.write().unwrap();
+            lock.insert("web", UsagePoint {
+                time_ms: BASE_MS + 10_023,
+                cpu: Some(0.125),
+                memory: Some(3.64),
+                read_kbps: Some(0.0),
+                write_kbps: Some(1234.0),
+                recv_kbps: None,
+                send_kbps: Some(0.35),
+            });
+            lock.insert("web", UsagePoint {
+                time_ms: BASE_MS + 20_000,
+                cpu: None,
+                memory: Some(100.0),
+                read_kbps: None,
+                write_kbps: None,
+                recv_kbps: Some(12.345),
+                send_kbps: None,
+            });
+            lock.insert("db", UsagePoint {
+                time_ms: BASE_MS + 10_031,
+                cpu: Some(0.03),
+                memory: None,
+                read_kbps: Some(1.0),
+                write_kbps: Some(0.004),
+                recv_kbps: Some(2.5),
+                send_kbps: None,
+            });
+        }
+        assert_eq!(
+            body_of(&cache, "/usages/cpu"),
+            concat!(
+                r#"{"db":{"percentage":{"t":[1767225610031],"v":[0.03]}},"#,
+                r#""web":{"percentage":{"t":[1767225610023,1767225620000],"v":[0.12,null]}}}"#,
+            ),
+        );
+        assert_eq!(
+            body_of(&cache, "/usages/memory"),
+            concat!(
+                r#"{"db":{"percentage":{"t":[1767225610031],"v":[null]}},"#,
+                r#""web":{"percentage":{"t":[1767225610023,1767225620000],"v":[3.64,100.00]}}}"#,
+            ),
+        );
+        assert_eq!(
+            body_of(&cache, "/usages/io"),
+            concat!(
+                r#"{"db":{"read":{"t":[1767225610031],"v":[1.00]},"#,
+                r#""write":{"t":[1767225610031],"v":[0.00]}},"#,
+                r#""web":{"read":{"t":[1767225610023,1767225620000],"v":[0.00,null]},"#,
+                r#""write":{"t":[1767225610023,1767225620000],"v":[1234.00,null]}}}"#,
+            ),
+        );
+        assert_eq!(
+            body_of(&cache, "/usages/net"),
+            concat!(
+                r#"{"db":{"recv":{"t":[1767225610031],"v":[2.50]},"#,
+                r#""send":{"t":[1767225610031],"v":[null]}},"#,
+                r#""web":{"recv":{"t":[1767225610023,1767225620000],"v":[null,12.35]},"#,
+                r#""send":{"t":[1767225610023,1767225620000],"v":[0.35,null]}}}"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn usages_series_have_matching_lengths_and_are_downsampled() {
+        // 3点（間引かない）と 2000点（512点に間引く）
+        for (npoints, expected) in [(3, 3), (2000, 512)] {
+            let cache = cache_with(npoints, time_ms_at);
+            for (kind, series_names) in USAGE_KINDS {
+                let parsed = assert_json_ok(&get(&cache, &format!("/usages/{}", kind)));
+                // コンテナは web と db だけ
+                assert_eq!(parsed.len(), 2);
+                for name in ["web", "db"] {
+                    // 系列はその種別のものだけ
+                    assert_eq!(parsed[name].len(), series_names.len());
+                    for series_name in series_names {
+                        let series = &parsed[name][*series_name];
+                        // 系列が持つのは t と v だけ
+                        assert_eq!(series.len(), 2);
+                        assert_eq!(series["t"].len(), expected, "{} {}", kind, series_name);
+                        assert_eq!(series["v"].len(), expected, "{} {}", kind, series_name);
+                        let times = times_of(series);
+                        assert_eq!(times[0], time_ms_at(0));
+                        assert_eq!(times[expected - 1], time_ms_at(npoints - 1));
+                        assert!(times.windows(2).all(|w| w[0] < w[1]));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn usages_values_match_the_per_container_api() {
+        // 同じキャッシュなら、選ばれる点も値もコンテナ別のAPIと同じ
+        let cache = cache_with(2000, time_ms_at);
+        let bulk = assert_json_ok(&get(&cache, "/usages/io"));
+        let single = assert_json_ok(&get(&cache, "/containers/web/io/read"));
+        let read = &bulk["web"]["read"];
+        assert_eq!(read["t"].len(), single.len());
+        for (i, point) in single.members().enumerate() {
+            let time = crate::time::millis_to_iso8601(read["t"][i].as_i64().unwrap());
+            assert_eq!(point["time"], time.as_str());
+            assert_eq!(point["readkBps"], read["v"][i]);
+        }
+        // write は全点が欠損
+        assert!(bulk["web"]["write"]["v"].members().all(|v| v.is_null()));
+    }
+
+    #[test]
+    fn usages_read_and_write_are_downsampled_independently() {
+        // read と write で山の位置が違う系列
+        const READ_SPIKE: usize = 700;
+        const WRITE_SPIKE: usize = 1300;
+        let cache = create_shared_cache();
+        {
+            let mut lock = cache.write().unwrap();
+            for i in 0..2000 {
+                let spike = |at: usize| Some(if i == at { 500.0 } else { 1.0 });
+                assert!(lock.insert("web", UsagePoint {
+                    time_ms: time_ms_at(i),
+                    cpu: Some(1.0),
+                    memory: Some(1.0),
+                    read_kbps: spike(READ_SPIKE),
+                    write_kbps: spike(WRITE_SPIKE),
+                    recv_kbps: spike(WRITE_SPIKE),
+                    send_kbps: spike(READ_SPIKE),
+                }));
+            }
+        }
+        for (kind, first, second) in [("io", "read", "write"), ("net", "send", "recv")] {
+            let parsed = assert_json_ok(&get(&cache, &format!("/usages/{}", kind)));
+            let first_times = times_of(&parsed["web"][first]);
+            let second_times = times_of(&parsed["web"][second]);
+            assert_eq!(first_times.len(), 512);
+            assert_eq!(second_times.len(), 512);
+            // それぞれ自分の山を残し、残した時刻の並びは一致しない
+            assert!(first_times.contains(&time_ms_at(READ_SPIKE)));
+            assert!(second_times.contains(&time_ms_at(WRITE_SPIKE)));
+            assert_ne!(first_times, second_times);
+            // 山の値は、その時刻と同じ位置に入っている
+            let at = first_times.iter().position(|t| *t == time_ms_at(READ_SPIKE)).unwrap();
+            assert_eq!(parsed["web"][first]["v"][at], 500.0);
+        }
+    }
+
+    #[test]
+    fn usages_container_names_are_sorted() {
+        // /containers と同じ並び（Stringの順序。大文字は小文字より前）
+        let cache = create_shared_cache();
+        {
+            let mut lock = cache.write().unwrap();
+            for name in ["web", "db", "api2", "Api", "api", "web-2"] {
+                assert!(lock.insert(name, UsagePoint {
+                    time_ms: BASE_MS,
+                    cpu: Some(1.0),
+                    memory: None,
+                    read_kbps: None,
+                    write_kbps: None,
+                    recv_kbps: None,
+                    send_kbps: None,
+                }));
+            }
+        }
+        let expected = ["Api", "api", "api2", "db", "web", "web-2"];
+        let names = json::parse(&body_of(&cache, "/containers")).unwrap();
+        let names: Vec<&str> = names.members().map(|n| n.as_str().unwrap()).collect();
+        assert_eq!(names, expected);
+
+        for (kind, _) in USAGE_KINDS {
+            let body = body_of(&cache, &format!("/usages/{}", kind));
+            let positions: Vec<usize> = expected.iter()
+                .map(|name| body.find(&format!("\"{}\":{{", name)).unwrap())
+                .collect();
+            assert!(positions.windows(2).all(|w| w[0] < w[1]), "{}", body);
+        }
+    }
+
+    #[test]
+    fn usages_of_empty_cache_is_an_empty_object() {
+        let cache = create_shared_cache();
+        for (kind, _) in USAGE_KINDS {
+            assert_eq!(body_of(&cache, &format!("/usages/{}", kind)), "{}");
+        }
+    }
+
+    #[test]
+    fn usages_body_is_built_in_exactly_its_counted_length() {
+        // 数えた長さは本文の長さと一致し、領域はその長さで1回だけ確保される
+        let cache = full_cache(8);
+        let lock = cache.read().unwrap();
+        for kind in ["cpu", "memory", "io", "net"] {
+            let kind = crate::log_cache::UsageKind::from_path(kind).unwrap();
+            let len = usages_json_len(&lock, kind);
+            let body = usages_json_within(&lock, kind, len).unwrap();
+            assert_eq!(body.len(), len);
+            assert_eq!(body.capacity(), len);
+            json::parse(&body).unwrap();
+            // 1バイトでも足りなければ作らない。余っていても伸ばさない
+            assert!(usages_json_within(&lock, kind, len - 1).is_none());
+            assert!(usages_json_within(&lock, kind, 0).is_none());
+            let roomy = usages_json_within(&lock, kind, len + 100).unwrap();
+            assert_eq!(roomy.len(), len);
+            assert_eq!(roomy.capacity(), len + 100);
+        }
+    }
+
+    #[test]
+    fn capped_string_never_grows() {
+        use std::fmt::Write as _;
+
+        let mut capped = CappedString::new(5);
+        assert!(capped.write_str("abc").is_ok());
+        // 収まらない書き込みは、一部も書かずに失敗する
+        assert!(capped.write_str("def").is_err());
+        assert!(write!(capped, "{:.2}", f32::MAX).is_err());
+        assert!(capped.write_char('あ').is_err());
+        assert!(capped.write_str("de").is_ok());
+        assert!(capped.write_str("f").is_err());
+        assert!(capped.write_str("").is_ok());
+        assert_eq!(capped.out, "abcde");
+        assert_eq!(capped.out.capacity(), 5);
+    }
+
+    /// 本文が長くなる値と名前を持つキャッシュ
+    /// 値は f32 の最大・最小（小数2桁で42〜43文字）、名前はエスケープで6倍になる
+    fn widest_cache(ncontainers: usize, npoints: usize) -> SharedUsageCache {
+        let cache = create_shared_cache();
+        {
+            let mut lock = cache.write().unwrap();
+            for c in 0..ncontainers {
+                let name = format!("{}{}", "\u{1}\"\\".repeat(100), c);
+                for i in 0..npoints {
+                    let v = if i % 2 == 0 { f32::MAX } else { f32::MIN };
+                    assert!(lock.insert(&name, UsagePoint {
+                        time_ms: time_ms_at(i),
+                        cpu: Some(v),
+                        memory: Some(v),
+                        read_kbps: Some(v),
+                        write_kbps: Some(v),
+                        recv_kbps: Some(v),
+                        send_kbps: Some(v),
+                    }));
+                }
+            }
+        }
+        cache
+    }
+
+    #[test]
+    fn widest_values_and_names_are_counted_exactly() {
+        assert_eq!(format!("{:.2}", f32::MAX).len(), 42);
+        assert_eq!(format!("{:.2}", f32::MIN).len(), 43);
+
+        let cache = widest_cache(2, 600);
+        let lock = cache.read().unwrap();
+        let kind = crate::log_cache::UsageKind::Io;
+        let len = usages_json_len(&lock, kind);
+        // 1点あたり 13桁 + 42〜43文字 + 区切り2。通常の値（約20バイト）の3倍近い
+        assert!(len > 2 * 2 * 512 * 57, "{}", len);
+        let body = usages_json_within(&lock, kind, len).unwrap();
+        assert_eq!(body.len(), len);
+        assert_eq!(body.capacity(), len);
+        // 名前は制御文字・引用符・バックスラッシュをエスケープしたうえで、元に戻せる
+        let parsed = json::parse(&body).unwrap();
+        assert_eq!(parsed.len(), 2);
+        for (name, _) in parsed.entries() {
+            assert!(name.starts_with("\u{1}\"\\\u{1}\"\\"), "{:?}", name);
+        }
+    }
+
+    // ---- /usages/{kind} の本文の枠 ----
+
+    /// 試験ごとに独立した枠（プロセス全体の枠は他の試験と共有されるので使わない）
+    fn leaked_budget(max: usize) -> &'static BodyBudget {
+        Box::leak(Box::new(BodyBudget::new(max)))
+    }
+
+    fn used_bytes(budget: &BodyBudget) -> usize {
+        *budget.used.lock().unwrap()
+    }
+
+    /// 24時間分のコンテナを ncontainers 個入れたキャッシュ
+    fn full_cache(ncontainers: usize) -> SharedUsageCache {
+        let cache = create_shared_cache();
+        {
+            let mut lock = cache.write().unwrap();
+            for c in 0..ncontainers {
+                let name = format!("container-{:02}", c);
+                for i in 0..crate::log_cache::MAX_LOG_LENGTH {
+                    let v = (i % 13) as f32 * 123.45;
+                    assert!(lock.insert(&name, UsagePoint {
+                        time_ms: time_ms_at(i),
+                        cpu: Some(v),
+                        memory: Some(v),
+                        read_kbps: Some(v),
+                        write_kbps: Some(v),
+                        recv_kbps: Some(v),
+                        send_kbps: Some(v),
+                    }));
+                }
+            }
+        }
+        cache
+    }
+
+    fn io_len(cache: &SharedUsageCache) -> usize {
+        usages_json_len(&cache.read().unwrap(), crate::log_cache::UsageKind::Io)
+    }
+
+    #[test]
+    fn body_budget_is_returned_on_drop_and_on_panic() {
+        let budget = leaked_budget(100);
+        let first = budget.reserve(40);
+        let second = budget.reserve(60);
+        assert_eq!(used_bytes(budget), 100);
+
+        let _ = std::thread::spawn(move || {
+            let _held = second;
+            panic!("panicking while holding a reservation (expected in this test)");
+        }).join();
+        assert_eq!(used_bytes(budget), 40);
+
+        drop(first);
+        assert_eq!(used_bytes(budget), 0);
+    }
+
+    #[test]
+    fn body_budget_admits_one_oversized_body_alone() {
+        let budget = leaked_budget(100);
+        // 誰も持っていなければ、上限より大きくても待たずに通る
+        let oversized = budget.reserve(1000);
+        assert_eq!(used_bytes(budget), 1000);
+
+        // その間は、小さな本文も待たされる
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _held = budget.reserve(1);
+            sender.send(()).unwrap();
+        });
+        assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(oversized);
+        receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        waiter.join().unwrap();
+        assert_eq!(used_bytes(budget), 0);
+    }
+
+    #[test]
+    fn body_budget_never_exceeds_max_and_wakes_waiters() {
+        use std::sync::atomic::{ AtomicUsize, Ordering };
+
+        // 大きさの違う要求が混ざっても、合計は上限を超えず、全員が通る
+        const MAX: usize = 100;
+        let budget = leaked_budget(MAX);
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let workers: Vec<_> = (0..40).map(|i| {
+            let peak = Arc::clone(&peak);
+            std::thread::spawn(move || {
+                let _held = budget.reserve(10 + (i % 4) * 20);
+                peak.fetch_max(used_bytes(budget), Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(5));
+            })
+        }).collect();
+        // 起こし損ねがあればここで止まる
+        for worker in workers { worker.join().unwrap(); }
+
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak <= MAX, "{}", peak);
+        assert!(peak > 70, "{}", peak);
+        assert_eq!(used_bytes(budget), 0);
+    }
+
+    #[test]
+    fn usages_response_holds_exactly_its_body_size_until_dropped() {
+        let cache = cache_with(2000, time_ms_at);
+        let budget = leaked_budget(MAX_BULK_BODY_BYTES);
+        let kind = crate::log_cache::UsageKind::Io;
+        let len = io_len(&cache);
+
+        let response = usages_response(&cache, kind, len, budget).unwrap();
+        assert_eq!(response.status, StatusCode::Ok);
+        // 取った枠・確保した領域・本文の長さが一致する
+        assert_eq!(response.body.len(), len);
+        assert_eq!(response.body.capacity(), len);
+        assert_eq!(used_bytes(budget), len);
+
+        // 応答を書き出しても、破棄するまでは枠を持ち続ける
+        let mut output = Vec::new();
+        write_response(&mut output, &response).unwrap();
+        assert_eq!(used_bytes(budget), len);
+        drop(response);
+        assert_eq!(used_bytes(budget), 0);
+
+        // 数えたあとでキャッシュが伸びていた場合（渡された長さでは足りない）は、
+        // 小さい枠のまま書かずに、数え直した長さで枠を取り直す
+        for stale in [0, 1, len - 1] {
+            let response = usages_response(&cache, kind, stale, budget).unwrap();
+            assert_eq!(response.body.capacity(), len);
+            assert_eq!(used_bytes(budget), len);
+            drop(response);
+            assert_eq!(used_bytes(budget), 0);
+        }
+        // 縮んでいた場合は、取った枠の中に収める（枠は取った大きさのまま）
+        let response = usages_response(&cache, kind, len + 10, budget).unwrap();
+        assert_eq!(response.body.len(), len);
+        assert_eq!(response.body.capacity(), len + 10);
+        assert_eq!(used_bytes(budget), len + 10);
+        drop(response);
+
+        // 失敗したときは枠を残さない
+        poison(&cache);
+        assert!(usages_response(&cache, kind, 1000, budget).is_err());
+        assert_eq!(used_bytes(budget), 0);
+    }
+
+    /// 同じ本文を nthreads 本並列に要求し、
+    /// (枠の使用量の最大, 保持した領域の合計の最大) を返す
+    /// stale_needed を渡すと、半数はその長さ（数えたあとで伸びた想定）で要求する
+    fn request_bulk_bodies_in_parallel(
+        cache: &SharedUsageCache,
+        budget: &'static BodyBudget,
+        nthreads: usize,
+        stale_needed: Option<usize>,
+    ) -> (usize, usize) {
+        use std::sync::atomic::{ AtomicUsize, Ordering };
+
+        let len = io_len(cache);
+        let peak_used = Arc::new(AtomicUsize::new(0));
+        let held_bytes = Arc::new(AtomicUsize::new(0));
+        let peak_held = Arc::new(AtomicUsize::new(0));
+
+        let workers: Vec<_> = (0..nthreads).map(|i| {
+            let cache = Arc::clone(cache);
+            let peak_used = Arc::clone(&peak_used);
+            let held_bytes = Arc::clone(&held_bytes);
+            let peak_held = Arc::clone(&peak_held);
+            let needed = match stale_needed {
+                Some(stale) if i % 2 == 0 => stale,
+                _ => len,
+            };
+            std::thread::spawn(move || {
+                let kind = crate::log_cache::UsageKind::Io;
+                let response = usages_response(&cache, kind, needed, budget).unwrap();
+                // 実際に確保されている領域の合計を、枠とは別に数える
+                let capacity = response.body.capacity();
+                assert_eq!(capacity, len);
+                let now = held_bytes.fetch_add(capacity, Ordering::SeqCst) + capacity;
+                peak_held.fetch_max(now, Ordering::SeqCst);
+                peak_used.fetch_max(used_bytes(budget), Ordering::SeqCst);
+                // 送っている間にあたる時間
+                std::thread::sleep(Duration::from_millis(5));
+                held_bytes.fetch_sub(capacity, Ordering::SeqCst);
+                drop(response);
+            })
+        }).collect();
+        for worker in workers { worker.join().unwrap(); }
+        assert_eq!(used_bytes(budget), 0);
+
+        (peak_used.load(Ordering::SeqCst), peak_held.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn concurrent_bulk_bodies_stay_within_the_budget() {
+        // 24時間分 × 40コンテナ。io の本文は1本で 1MB 近くになる
+        let cache = full_cache(40);
+        let len = io_len(&cache);
+        assert!(len > 800_000, "{}", len);
+        // 同時接続の上限まで並ぶと、枠が無ければ上限を超える
+        assert!(len * MAX_CONNECTIONS > MAX_BULK_BODY_BYTES);
+
+        let budget = leaked_budget(MAX_BULK_BODY_BYTES);
+        let (peak_used, peak_held) = request_bulk_bodies_in_parallel(
+            &cache, budget, MAX_CONNECTIONS * 2, None,
+        );
+        assert!(peak_used <= MAX_BULK_BODY_BYTES, "{}", peak_used);
+        assert!(peak_held <= MAX_BULK_BODY_BYTES, "{}", peak_held);
+        // 1本ずつに絞っているわけではない（収まる範囲では並行に処理する）
+        assert!(peak_held >= len * 2, "{}", peak_held);
+    }
+
+    #[test]
+    fn widest_bodies_stay_within_the_budget_even_when_the_count_is_stale() {
+        // 桁数の多い値と、エスケープで伸びる長い名前。通常の値の3倍近い本文になる
+        let cache = widest_cache(8, 2000);
+        let len = io_len(&cache);
+        assert!(len > 8 * 2 * 512 * 57, "{}", len);
+
+        // 3本と半分が入る枠。半数は、実際の約 1/3 の長さ（通常の値なら足りた長さ）で要求する
+        let max = len * 3 + len / 2;
+        let budget = leaked_budget(max);
+        let (peak_used, peak_held) = request_bulk_bodies_in_parallel(
+            &cache, budget, MAX_CONNECTIONS * 2, Some(len / 3),
+        );
+        assert!(peak_used <= max, "{} > {}", peak_used, max);
+        assert!(peak_held <= len * 3, "{} > {}", peak_held, len * 3);
+        assert!(peak_held >= len * 2, "{}", peak_held);
+    }
+
+    #[test]
+    fn oversized_body_is_served_only_while_nothing_else_is_held() {
+        // 1本で上限を超える本文は、ほかに保持中の本文が無いときに1本ずつ通る
+        let cache = widest_cache(2, 600);
+        let len = io_len(&cache);
+        let max = len / 2;
+        let budget = leaked_budget(max);
+        let (peak_used, peak_held) = request_bulk_bodies_in_parallel(
+            &cache, budget, 8, Some(len / 3),
+        );
+        assert_eq!(peak_held, len);
+        assert!(peak_used <= len, "{} > {}", peak_used, len);
+    }
+
+    #[test]
+    fn waiting_for_the_budget_does_not_hold_the_cache_lock() {
+        // 枠が空くのを待っている間も、loggerはwrite lockを取れる
+        let cache = small_cache();
+        let budget = leaked_budget(100);
+        let blocker = budget.reserve(100);
+
+        let waiting_cache = Arc::clone(&cache);
+        let waiter = std::thread::spawn(move || {
+            let kind = crate::log_cache::UsageKind::Cpu;
+            usages_response(&waiting_cache, kind, 50, budget).unwrap().body
+        });
+        // 待ちに入るまで待つ（待っている間、使用量は変わらない）
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(used_bytes(budget), 100);
+        assert!(!waiter.is_finished());
+
+        // 待たされている間に追加した点も、応答に入る
+        assert!(cache.try_write().is_ok());
+        assert!(cache.write().unwrap().insert("web", UsagePoint {
+            time_ms: time_ms_at(100),
+            cpu: Some(42.0),
+            memory: None,
+            read_kbps: None,
+            write_kbps: None,
+            recv_kbps: None,
+            send_kbps: None,
+        }));
+        drop(blocker);
+        let body = waiter.join().unwrap();
+        assert!(body.contains("42.00"), "{}", body);
+        assert_eq!(used_bytes(budget), 0);
+    }
+
+    #[test]
+    fn response_is_written_without_changing_its_bytes() {
+        // ヘッダと本文を分けて書いても、届くバイト列は同じ
+        let response = Response::json(r#"{"a":1}"#.to_string());
+        let mut output = Vec::new();
+        write_response(&mut output, &response).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            concat!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+                "Content-Length: 7\r\nConnection: close\r\n\r\n",
+                r#"{"a":1}"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn usages_escape_names_and_drop_non_finite_values() {
+        let mut escaped = String::new();
+        write_json_string(&mut escaped, "a\"b\\c\nd").unwrap();
+        assert_eq!(escaped, r#""a\"b\\c\u000ad""#);
+
+        let cache = create_shared_cache();
+        {
+            let mut lock = cache.write().unwrap();
+            lock.insert("we\"b", UsagePoint {
+                time_ms: BASE_MS,
+                cpu: Some(f32::NAN),
+                memory: Some(f32::INFINITY),
+                read_kbps: None,
+                write_kbps: None,
+                recv_kbps: None,
+                send_kbps: None,
+            });
+        }
+        for kind in ["cpu", "memory"] {
+            let parsed = assert_json_ok(&get(&cache, &format!("/usages/{}", kind)));
+            assert!(parsed["we\"b"]["percentage"]["v"][0].is_null());
+        }
     }
 
     #[test]
@@ -674,6 +1522,14 @@ mod tests {
             "/containers/web/cpu/extra",
             "/containers?limit=1",
             "/containers/web/cpu?nsample=10",
+            "/usages",
+            "/usages/",
+            "/usages/disk",
+            "/usages/CPU",
+            "/usages/io/read",
+            "/usages/cpu/extra",
+            "/usages/cpu?nsample=10",
+            "/usages/web/cpu",
         ] {
             assert_status(&get(&cache, path), "HTTP/1.1 404 Not Found");
         }
@@ -939,7 +1795,7 @@ mod tests {
         poison(&cache);
         assert!(cache.read().is_err());
 
-        for path in ["/containers", "/containers/web/cpu", "/unknown"] {
+        for path in ["/containers", "/containers/web/cpu", "/usages/cpu", "/unknown"] {
             let response = get(&cache, path);
             let (status, headers, body) = split(&response);
             assert_eq!(status, "HTTP/1.1 500 Internal Server Error");
@@ -1086,8 +1942,8 @@ mod tests {
 
     #[test]
     fn burst_over_the_limit_is_all_served() {
-        // webは1回の表示で 6N 本を同時に発射する（Nはコンテナ数）
-        // 上限を超えた分も断られず、全部200になること
+        // コンテナ別のAPIだけで1画面分を取ると 6N 本になる（Nはコンテナ数）
+        // 同時に発射されて上限を超えた分も断られず、全部200になること
         const NCONTAINERS: usize = 10;
         let cache = create_shared_cache();
         {

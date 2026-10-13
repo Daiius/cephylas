@@ -39,16 +39,21 @@ pub enum Series {
 }
 
 impl Series {
+    /// この系列の値。欠損は None です
+    pub fn raw_value(self, point: &UsagePoint) -> Option<f32> {
+        match self {
+            Series::Cpu => point.cpu,
+            Series::Memory => point.memory,
+            Series::IoRead => point.read_kbps,
+            Series::IoWrite => point.write_kbps,
+            Series::NetRecv => point.recv_kbps,
+            Series::NetSend => point.send_kbps,
+        }
+    }
+
     /// ダウンサンプリングの縦軸に使う値。欠損は0として扱います
     fn value(self, point: &UsagePoint) -> f64 {
-        match self {
-            Series::Cpu => point.cpu.unwrap_or_default() as f64,
-            Series::Memory => point.memory.unwrap_or_default() as f64,
-            Series::IoRead => point.read_kbps.unwrap_or_default() as f64,
-            Series::IoWrite => point.write_kbps.unwrap_or_default() as f64,
-            Series::NetRecv => point.recv_kbps.unwrap_or_default() as f64,
-            Series::NetSend => point.send_kbps.unwrap_or_default() as f64,
-        }
+        self.raw_value(point).unwrap_or_default() as f64
     }
 
     /// 1点をAPIの要素（jsonのオブジェクト）にします
@@ -78,6 +83,38 @@ impl Series {
                 option_to_string(point.recv_kbps),
                 option_to_string(point.send_kbps),
             ),
+        }
+    }
+}
+
+/// 全コンテナ分をまとめて返すAPI（/usages/{kind}）の種別
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum UsageKind {
+    Cpu,
+    Memory,
+    Io,
+    Net,
+}
+
+impl UsageKind {
+    /// パスの要素から種別を決めます。知らない名前なら None を返します
+    pub fn from_path(segment: &str) -> Option<Self> {
+        match segment {
+            "cpu" => Some(UsageKind::Cpu),
+            "memory" => Some(UsageKind::Memory),
+            "io" => Some(UsageKind::Io),
+            "net" => Some(UsageKind::Net),
+            _ => None,
+        }
+    }
+
+    /// この種別が返す系列。(jsonのキー, 系列) を出力する順に並べたものです
+    pub fn series(self) -> &'static [(&'static str, Series)] {
+        match self {
+            UsageKind::Cpu => &[("percentage", Series::Cpu)],
+            UsageKind::Memory => &[("percentage", Series::Memory)],
+            UsageKind::Io => &[("read", Series::IoRead), ("write", Series::IoWrite)],
+            UsageKind::Net => &[("recv", Series::NetRecv), ("send", Series::NetSend)],
         }
     }
 }
