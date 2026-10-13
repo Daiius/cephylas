@@ -59,7 +59,7 @@ sequenceDiagram
     participant server as server thread
     participant web as Next.js
 
-    note over logger,cache : 起動時: ログ末尾 8640 行からキャッシュを復元
+    note over logger,cache : 起動時: ログ末尾 8640 行からキャッシュを復元（ログが無ければ空）
 
     loop 10 秒ごと
         logger ->> docker : GET /containers/json
