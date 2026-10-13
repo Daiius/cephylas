@@ -23,7 +23,9 @@ const ZERO_TIME: &str = "0001-01-01T00:00:00Z";
 //
 #[derive(Debug)]
 pub struct CpuStats {
+    /// 積算値（ns）。丸めずに持つ
     total: Option<u64>,
+    /// 積算値（ns）。丸めずに持つ
     system: Option<u64>,
     ncpu: Option<u8>, // more than 256 cores??
 }
@@ -34,13 +36,21 @@ pub struct MemoryStats {
 }
 #[derive(Debug)]
 pub struct IoStats {
+    /// 全デバイスの合計
     read: Option<u64>,
     write: Option<u64>,
+    /// デバイス（major:minor）ごとの積算値。差分はデバイスごとに取る
+    read_by_device: Vec<(String, u64)>,
+    write_by_device: Vec<(String, u64)>,
 }
 #[derive(Debug)]
 pub struct NetStats {
+    /// 全インターフェースの合計
     send: Option<u64>,
     recv: Option<u64>,
+    /// インターフェースごとの積算値。差分はインターフェースごとに取る
+    send_by_interface: Vec<(String, u64)>,
+    recv_by_interface: Vec<(String, u64)>,
 }
 #[derive(Debug)]
 pub struct Stats {
@@ -56,8 +66,14 @@ impl Default for Stats {
             time: None,
             cpu: CpuStats { total: None, system: None, ncpu: None, },
             memory: MemoryStats { used: None, available: None, },
-            io: IoStats { read: None, write: None },
-            net: NetStats { recv: None, send: None },
+            io: IoStats {
+                read: None, write: None,
+                read_by_device: Vec::new(), write_by_device: Vec::new(),
+            },
+            net: NetStats {
+                recv: None, send: None,
+                recv_by_interface: Vec::new(), send_by_interface: Vec::new(),
+            },
         }
     }
 }
@@ -68,6 +84,8 @@ pub struct CpuUsage {
     system: Option<u64>,
     ncpu: Option<u8>,
 }
+/// 値を json の数値にします。小数は2桁に丸め、整数はそのまま出します
+/// (整数型では精度の指定が無視される)。値が無ければ null です
 pub fn option_to_string<T>(value: Option<T>) -> String 
 where
     T: ToString + std::fmt::Display
@@ -123,8 +141,8 @@ impl Default for MemoryUsage {
 pub struct IoUsage {
     readkB: Option<u64>,
     writekB: Option<u64>,
-    readkBps: Option<u32>,
-    writekBps: Option<u32>,
+    readkBps: Option<f32>,
+    writekBps: Option<f32>,
 }
 impl std::fmt::Display for IoUsage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -148,8 +166,8 @@ impl Default for IoUsage {
 pub struct NetUsage {
     recvkB: Option<u64>,
     sendkB: Option<u64>,
-    recvkBps: Option<u32>,
-    sendkBps: Option<u32>,
+    recvkBps: Option<f32>,
+    sendkBps: Option<f32>,
 }
 impl std::fmt::Display for NetUsage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -300,47 +318,115 @@ fn parse_stats_response(response: &str) -> Result<Stats, error::Error> {
     Ok(reshape_json(&stats))
 }
 
+/// メモリの使用量（バイト）を、docker stats と同じ判定で求めます
+///
+/// usage からページキャッシュのうち回収しやすい分（inactive file）を引きます
+/// - cgroup v1: stats.total_inactive_file
+/// - cgroup v2: stats.inactive_file
+/// 引く値が無い、または usage 以上なら、その値は使いません
+fn used_memory(memory_stats: &json::JsonValue) -> Option<u64> {
+    let usage = memory_stats["usage"].as_u64()?;
+    let inactive_file = ["total_inactive_file", "inactive_file"].iter()
+        .filter_map(|key| memory_stats["stats"][*key].as_u64())
+        .find(|v| *v < usage);
+
+    Some(usage - inactive_file.unwrap_or(0))
+}
+
+/// 内訳（名前ごとの積算値）の合計を返します。内訳が無ければ None です
+fn total_of(parts: &[(String, u64)]) -> Option<u64> {
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.iter().map(|(_, v)| *v).fold(0_u64, u64::saturating_add))
+}
+
+/// インターフェースごとの積算値（バイト）を取り出します
+/// networks が無ければ（ホストネットワークなど）空です
+fn network_counters(networks: &json::JsonValue, key: &str) -> Vec<(String, u64)> {
+    networks.entries()
+        .filter_map(|(name, interface)|
+            interface[key].as_u64().map(|v| (name.to_string(), v))
+        )
+        .collect()
+}
+
+/// デバイス（major:minor）ごとの積算値（バイト）のうち、op が一致するものを取り出します
+/// op は大文字小文字を区別しません（cgroup v1 は Read / Write、v2 は read / write）
+/// 一致する要素が1つも無ければ（配列が無い・null・空の場合を含む）空です
+fn blkio_counters(entries: &json::JsonValue, op: &str) -> Vec<(String, u64)> {
+    let mut counters: Vec<(String, u64)> = Vec::new();
+    for entry in entries.members() {
+        if !entry["op"].as_str().is_some_and(|v| v.eq_ignore_ascii_case(op)) {
+            continue;
+        }
+        let Some(value) = entry["value"].as_u64() else { continue; };
+        let device = format!("{}:{}", entry["major"], entry["minor"]);
+        // 同じデバイスの要素が複数あれば足す
+        match counters.iter_mut().find(|(name, _)| *name == device) {
+            Some((_, sum)) => *sum = sum.saturating_add(value),
+            None => counters.push((device, value)),
+        }
+    }
+
+    counters
+}
+
+/// 内訳ごとの差分を合算して、前回からの増分（バイト）を求めます
+///
+/// 合計同士の差ではなく、名前（インターフェース・デバイス）ごとの差を足します
+/// 合計の差だと、大きな積算値を持つものが外れた tick で合計が減り、
+/// 残ったものの増分まで 0 になってしまうためです
+/// - 両方にあるもの: 差分を足す（積算値が戻っていたら、そのものの差分だけを 0 とする）
+/// - 今回だけにあるもの（追加された）: 0 から数え始めるので、今回の値を足す
+/// - 前回だけにあるもの（外された）: 数えない
+///
+/// 今回の内訳が無ければ None です（値そのものが無い）
+/// 前回の内訳が無いだけなら、今回のものはすべて「追加された」ものとして数えます
+/// (まだ一度も読み書きしていないコンテナは、IO の要素を1つも返さない。
+///  前回の統計そのものが無いコンテナは、呼び出し側が先に飛ばしている)
+fn increase_of(
+    current: &[(String, u64)],
+    previous: &[(String, u64)],
+) -> Option<u64> {
+    if current.is_empty() {
+        return None;
+    }
+    Some(
+        current.iter()
+            .map(|(name, value)| {
+                let before = previous.iter()
+                    .find(|(prev_name, _)| prev_name == name)
+                    .map_or(0, |(_, prev_value)| *prev_value);
+                value.saturating_sub(before)
+            })
+            .fold(0_u64, u64::saturating_add)
+    )
+}
+
 fn reshape_json(
     json: &json::JsonValue,
 ) -> Stats {
-    let total = 
+    // ns のまま持つ（ms に丸めると、1 tick の差分が 1ms 未満のときに 0 になる）
+    let total =
         json["cpu_stats"]["cpu_usage"]["total_usage"]
-        .as_u64()
-        .map(|v| v / 1_000_000); // ns -> ms
+        .as_u64();
     let system =
         json["cpu_stats"]["system_cpu_usage"]
-        .as_u64()
-        .map(|v| v / 1_000_000); // ns -> ms
+        .as_u64();
     let number_cpus =
         json["cpu_stats"]["online_cpus"]
         .as_u16()
         .map(|n| n as u8);
-    let used_memory =
-        json["memory_stats"]["usage"].as_u64()
-        .zip(
-            json["memory_stats"]["stats"]["cache"]
-                .as_u64()
-                .or(Some(0_u64)) // cache entry might not exist
-        ).map(|(a, b)| a.saturating_sub(b));
+    let used_memory = used_memory(&json["memory_stats"]);
     let available_memory =
         json["memory_stats"]["limit"]
         .as_u64();
-    let net_rx =
-        json["networks"]["eth0"]["rx_bytes"]
-        .as_u64();
-    let net_tx =
-        json["networks"]["eth0"]["tx_bytes"]
-        .as_u64();
-    let blkio_read =
-        json["blkio_stats"]["io_service_bytes_recursive"]
-        .members()
-        .find(|ref m| m["op"] == "read")
-        .and_then(|v| v["value"].as_u64());
-    let blkio_write =
-        json["blkio_stats"]["io_service_bytes_recursive"]
-        .members()
-        .find(|ref m| m["op"] == "write")
-        .and_then(|v| v["value"].as_u64());
+    let net_rx = network_counters(&json["networks"], "rx_bytes");
+    let net_tx = network_counters(&json["networks"], "tx_bytes");
+    let blkio = &json["blkio_stats"]["io_service_bytes_recursive"];
+    let blkio_read = blkio_counters(blkio, "read");
+    let blkio_write = blkio_counters(blkio, "write");
     let time = json["read"].as_str();
 
     Stats {
@@ -354,12 +440,16 @@ fn reshape_json(
             available: available_memory
         },
         io: IoStats {
-            read: blkio_read,
-            write: blkio_write, 
+            read: total_of(&blkio_read),
+            write: total_of(&blkio_write),
+            read_by_device: blkio_read,
+            write_by_device: blkio_write,
         },
         net: NetStats {
-            send: net_tx,
-            recv: net_rx,
+            send: total_of(&net_tx),
+            recv: total_of(&net_rx),
+            send_by_interface: net_tx,
+            recv_by_interface: net_rx,
         }
     }
 }
@@ -604,17 +694,17 @@ fn valid_time_millis(time_str: &str) -> Option<i64> {
     time::iso8601_to_millis(time_str).ok().filter(|millis| *millis > 0)
 }
 
-/// 積算値（バイト）の差分を、実測の経過時間で割って kB/s にします
-/// bytes / ms = kB / s
+/// 増分（バイト）を、実測の経過時間で割って kB/s にします
+/// bytes / ms = kB / s（1 kB = 1000 バイト）
+/// 切り捨てずに小数で返します（整数にすると 1 kB/s 未満が 0 になる）
 fn rate_kb_per_s(
-    current: Option<u64>,
-    previous: Option<u64>,
+    current: &[(String, u64)],
+    previous: &[(String, u64)],
     elapsed_millis: u64,
-) -> Option<u32> {
-    current.zip(previous).map(|(a, b)|
-        u32::try_from(a.saturating_sub(b) / elapsed_millis)
-            .unwrap_or(u32::MAX)
-    )
+) -> Option<f32> {
+    increase_of(current, previous)
+        .map(|bytes| (bytes as f64 / elapsed_millis as f64) as f32)
+        .filter(|rate| rate.is_finite())
 }
 
 /// 前回の tick との差分から、1 tick 分の使用率を求めます
@@ -680,6 +770,7 @@ fn calc_usages_with(
         }
 
         // CPU calculations
+        // 差分とその比は ns のまま計算する
         let cpu_delta = stats.cpu.total
            .zip(prev_stats.cpu.total)
            .map(|(a, b)| a.saturating_sub(b));
@@ -690,7 +781,7 @@ fn calc_usages_with(
             .zip(system_cpu_delta)
             .zip(stats.cpu.ncpu)
             .map(|((a, b), c)|
-                 (a as f32) / (b as f32) * (c as f32) * 100_f32
+                 ((a as f64) / (b as f64) * (c as f64) * 100_f64) as f32
             )
             // 分母が0だと NaN / inf になり、jsonとして書けない
             .filter(|p| p.is_finite());
@@ -698,23 +789,23 @@ fn calc_usages_with(
         // Memory calculations
         let memory_percentage = stats.memory.used
             .zip(stats.memory.available)
-            .map(|(a,b)| (a as f32) / (b as f32) * 100_f32)
+            .map(|(a,b)| ((a as f64) / (b as f64) * 100_f64) as f32)
             .filter(|p| p.is_finite());
 
         // IO calculations
         let io_read_kb_per_s = rate_kb_per_s(
-            stats.io.read, prev_stats.io.read, elapsed_millis,
+            &stats.io.read_by_device, &prev_stats.io.read_by_device, elapsed_millis,
         );
         let io_write_kb_per_s = rate_kb_per_s(
-            stats.io.write, prev_stats.io.write, elapsed_millis,
+            &stats.io.write_by_device, &prev_stats.io.write_by_device, elapsed_millis,
         );
 
         // Net calculations
         let net_send_kb_per_s = rate_kb_per_s(
-            stats.net.send, prev_stats.net.send, elapsed_millis,
+            &stats.net.send_by_interface, &prev_stats.net.send_by_interface, elapsed_millis,
         );
         let net_recv_kb_per_s = rate_kb_per_s(
-            stats.net.recv, prev_stats.net.recv, elapsed_millis,
+            &stats.net.recv_by_interface, &prev_stats.net.recv_by_interface, elapsed_millis,
         );
 
         usages.insert(
@@ -722,8 +813,9 @@ fn calc_usages_with(
             Usage {
                 cpu: CpuUsage {
                     percentage: cpu_percentage,
-                    total: cpu_delta,
-                    system: system_cpu_delta,
+                    // ログには、差分を ms に丸めた整数で出す
+                    total: cpu_delta.map(|ns| ns / 1_000_000),
+                    system: system_cpu_delta.map(|ns| ns / 1_000_000),
                     ncpu: stats.cpu.ncpu,
                 },
                 memory: MemoryUsage {
@@ -883,6 +975,8 @@ pub fn log_json(
     }
 }
 
+/// ログの1行を読みます
+/// 速度（kBps）は、整数で書かれた古い行も、小数で書かれた行も読めます
 fn json_to_usage(
     json: &json::JsonValue
 ) -> Result<Usages, error::Error> {
@@ -912,14 +1006,14 @@ fn json_to_usage(
                     io: IoUsage {
                         readkB: v["io"]["readkB"].as_u64(),
                         writekB: v["io"]["writekB"].as_u64(),
-                        readkBps: v["io"]["readkBps"].as_u32(),
-                        writekBps: v["io"]["writekBps"].as_u32(),
+                        readkBps: v["io"]["readkBps"].as_f32(),
+                        writekBps: v["io"]["writekBps"].as_f32(),
                     },
                     net: NetUsage {
                         recvkB: v["net"]["recvkB"].as_u64(),
                         sendkB: v["net"]["sendkB"].as_u64(),
-                        recvkBps: v["net"]["recvkBps"].as_u32(),
-                        sendkBps: v["net"]["sendkBps"].as_u32(),
+                        recvkBps: v["net"]["recvkBps"].as_f32(),
+                        sendkBps: v["net"]["sendkBps"].as_f32(),
                     }
                 }))
                 .collect(),
@@ -1060,6 +1154,7 @@ mod tests {
 
     /// Docker の stats API が返す応答（ヘッダ込み）を組み立てる
     /// 値はすべて積算値。cpu と system は ns、ほかはバイト
+    /// デバイスとインターフェースは1つずつ、メモリは cgroup v2 の形
     fn stats_response(
         read: &str,
         cpu_total_ns: u64,
@@ -1075,13 +1170,11 @@ mod tests {
                 r#"{{"read":"{read}","preread":"0001-01-01T00:00:00Z","#,
                 r#""blkio_stats":{{"io_service_bytes_recursive":["#,
                 r#"{{"major":8,"minor":0,"op":"read","value":{io_read}}},"#,
-                r#"{{"major":8,"minor":0,"op":"write","value":{io_write}}},"#,
-                r#"{{"major":8,"minor":16,"op":"read","value":999999999}}]}},"#,
+                r#"{{"major":8,"minor":0,"op":"write","value":{io_write}}}]}},"#,
                 r#""cpu_stats":{{"cpu_usage":{{"total_usage":{cpu}}},"#,
                 r#""system_cpu_usage":{system},"online_cpus":2}},"#,
-                r#""memory_stats":{{"usage":300000,"stats":{{"cache":100000}},"limit":1000000}},"#,
-                r#""networks":{{"eth0":{{"rx_bytes":{rx},"tx_bytes":{tx}}},"#,
-                r#""eth1":{{"rx_bytes":777777777,"tx_bytes":777777777}}}}}}"#,
+                r#""memory_stats":{{"usage":300000,"stats":{{"anon":50000,"file":150000,"inactive_file":100000}},"limit":1000000}},"#,
+                r#""networks":{{"eth0":{{"rx_bytes":{rx},"tx_bytes":{tx}}}}}}}"#,
                 "\n",
             ),
             read = read,
@@ -1123,14 +1216,13 @@ mod tests {
             (1000, 2000), (3000, 4000),
         );
         assert_eq!(stats.time.as_deref(), Some("2026-01-01T00:00:10.023034093Z"));
-        // ns -> ms
-        assert_eq!(stats.cpu.total, Some(5000));
-        assert_eq!(stats.cpu.system, Some(70_000));
+        // ns のまま持つ（ms に丸めない）
+        assert_eq!(stats.cpu.total, Some(5_000_000_000));
+        assert_eq!(stats.cpu.system, Some(70_000_000_000));
         assert_eq!(stats.cpu.ncpu, Some(2));
-        // usage - stats.cache
+        // usage - stats.inactive_file
         assert_eq!(stats.memory.used, Some(200_000));
         assert_eq!(stats.memory.available, Some(1_000_000));
-        // 最初の read / write、eth0 だけ
         assert_eq!(stats.io.read, Some(1000));
         assert_eq!(stats.io.write, Some(2000));
         assert_eq!(stats.net.recv, Some(3000));
@@ -1225,7 +1317,7 @@ mod tests {
                 &self.cache,
             )
         }
-        fn writes(&self, name: &str) -> Vec<(String, Option<u32>)> {
+        fn writes(&self, name: &str) -> Vec<(String, Option<f32>)> {
             self.cache.read().unwrap().get(name).unwrap().iter()
                 .map(|p| (time::millis_to_iso8601(p.time_ms), p.write_kbps))
                 .collect()
@@ -1261,14 +1353,14 @@ mod tests {
         ]))).unwrap());
 
         assert_eq!(logger.writes("web"), vec![
-            ("2026-01-01T00:00:10.000Z".to_string(), Some(100)),
-            ("2026-01-01T00:00:20.000Z".to_string(), Some(100)),
-            ("2026-01-01T00:00:30.000Z".to_string(), Some(100)),
+            ("2026-01-01T00:00:10.000Z".to_string(), Some(100.0)),
+            ("2026-01-01T00:00:20.000Z".to_string(), Some(100.0)),
+            ("2026-01-01T00:00:30.000Z".to_string(), Some(100.0)),
         ]);
         // 欠けるのは1点だけ。戻った点は 20秒で割った 300 kB/s（10秒で割った 600 ではない）
         assert_eq!(logger.writes("db"), vec![
-            ("2026-01-01T00:00:10.000Z".to_string(), Some(100)),
-            ("2026-01-01T00:00:30.000Z".to_string(), Some(300)),
+            ("2026-01-01T00:00:10.000Z".to_string(), Some(100.0)),
+            ("2026-01-01T00:00:30.000Z".to_string(), Some(300.0)),
         ]);
         assert_eq!(logger.lines.len(), 3);
     }
@@ -1290,7 +1382,7 @@ mod tests {
                 ("db", written("2026-01-01T00:00:20Z", 4_000_000)),
             ]))).unwrap();
             assert_eq!(logger.writes("db"), vec![
-                ("2026-01-01T00:00:20.000Z".to_string(), Some(200)),
+                ("2026-01-01T00:00:20.000Z".to_string(), Some(200.0)),
             ], "{}", bad_time);
         }
     }
@@ -1322,7 +1414,7 @@ mod tests {
             ("db", written("2026-01-01T01:00:10Z", 51_000_000)),
         ]))).unwrap();
         assert_eq!(logger.writes("db"), vec![
-            ("2026-01-01T01:00:10.000Z".to_string(), Some(100)),
+            ("2026-01-01T01:00:10.000Z".to_string(), Some(100.0)),
         ]);
 
         // コンテナが1つも無い tick では、全部消える
@@ -1347,8 +1439,8 @@ mod tests {
         // 前回の統計は残っているので、次に採れた tick で30秒分を30秒で割って記録する
         assert!(logger.tick(tick(40, 4_000_000)).unwrap());
         assert_eq!(logger.writes("web"), vec![
-            ("2026-01-01T00:00:10.000Z".to_string(), Some(100)),
-            ("2026-01-01T00:00:40.000Z".to_string(), Some(100)),
+            ("2026-01-01T00:00:10.000Z".to_string(), Some(100.0)),
+            ("2026-01-01T00:00:40.000Z".to_string(), Some(100.0)),
         ]);
 
         // ログへの追記に失敗した tick。キャッシュにも入れず、前回の統計も進めない
@@ -1368,7 +1460,7 @@ mod tests {
         assert!(logger.tick(tick(55, 6_400_000)).unwrap());
         assert_eq!(
             logger.writes("web").last().unwrap(),
-            &("2026-01-01T00:00:55.000Z".to_string(), Some(160)),
+            &("2026-01-01T00:00:55.000Z".to_string(), Some(160.0)),
         );
         assert_eq!(logger.lines.len(), 3);
     }
@@ -1388,8 +1480,8 @@ mod tests {
         // 前回値を置き換えていると 1,000,000 バイト分が落ちて 100 kB/s になる
         assert!(logger.tick(tick("2026-01-01T00:00:20Z", 3_000_000)).unwrap());
         assert_eq!(logger.writes("web"), vec![
-            ("2026-01-01T00:00:10.000Z".to_string(), Some(100)),
-            ("2026-01-01T00:00:20.000Z".to_string(), Some(200)),
+            ("2026-01-01T00:00:10.000Z".to_string(), Some(100.0)),
+            ("2026-01-01T00:00:20.000Z".to_string(), Some(200.0)),
         ]);
 
     }
@@ -1400,12 +1492,12 @@ mod tests {
     }
 
     /// ログに書かれた行の (time, web の writekBps)
-    fn logged(logger: &Logger) -> Vec<(String, Option<u32>)> {
+    fn logged(logger: &Logger) -> Vec<(String, Option<f32>)> {
         logger.lines.iter().map(|line| {
             let json = json::parse(line).unwrap();
             (
                 json["time"].as_str().unwrap().to_string(),
-                json["stats"]["web"]["io"]["writekBps"].as_u32(),
+                json["stats"]["web"]["io"]["writekBps"].as_f32(),
             )
         }).collect()
     }
@@ -1426,8 +1518,8 @@ mod tests {
         // (4,000,000 バイト / 20秒) になり、戻っていた間の増分も含む
         assert!(logger.tick(web_tick("2026-01-01T00:00:30Z", 5_000_000)).unwrap());
         assert_eq!(logger.writes("web"), vec![
-            ("2026-01-01T00:00:10.000Z".to_string(), Some(100)),
-            ("2026-01-01T00:00:30.000Z".to_string(), Some(200)),
+            ("2026-01-01T00:00:10.000Z".to_string(), Some(100.0)),
+            ("2026-01-01T00:00:30.000Z".to_string(), Some(200.0)),
         ]);
         // 記録できたので、回数は戻る
         assert!(!logger.state.stalled_ticks.contains_key("web"));
@@ -1470,16 +1562,16 @@ mod tests {
 
         let points = logged(&logger);
         assert_eq!(points, vec![
-            ("2026-01-01T01:00:10Z".to_string(), Some(100)),
-            ("2026-01-01T00:00:40Z".to_string(), Some(100)),
-            ("2026-01-01T00:00:50Z".to_string(), Some(200)),
+            ("2026-01-01T01:00:10Z".to_string(), Some(100.0)),
+            ("2026-01-01T00:00:40Z".to_string(), Some(100.0)),
+            ("2026-01-01T00:00:50Z".to_string(), Some(200.0)),
         ]);
         // 増分が落ちていない: 速度 × 経過時間 の合計が、積算値の増分（7,500,000 バイト）に一致する
         let elapsed_seconds = [10, 45, 10];
-        let total_kb: u32 = points.iter().zip(elapsed_seconds)
-            .map(|((_, rate), seconds)| rate.unwrap() * seconds)
+        let total_kb: f32 = points.iter().zip(elapsed_seconds)
+            .map(|((_, rate), seconds)| rate.unwrap() * seconds as f32)
             .sum();
-        assert_eq!(total_kb, 7_500);
+        assert_eq!(total_kb, 7_500.0);
 
         // 同じ統計が返り続ける場合も、3回目で記録して数え直す
         let mut logger = Logger::new();
@@ -1514,8 +1606,8 @@ mod tests {
         assert_eq!(logger.writes("web").len(), 4);
         // db は3回目で、core が測った 30秒で割った1点が入る
         assert_eq!(logger.writes("db"), vec![
-            ("2026-01-01T00:00:10.000Z".to_string(), Some(100)),
-            ("2026-01-01T00:00:40.000Z".to_string(), Some(100)),
+            ("2026-01-01T00:00:10.000Z".to_string(), Some(100.0)),
+            ("2026-01-01T00:00:40.000Z".to_string(), Some(100.0)),
         ]);
     }
 
@@ -1684,18 +1776,18 @@ mod tests {
         let usages = calc_usages(TICK_MILLIS, &now, &prev).unwrap();
 
         let ten = &usages.usages["ten"];
-        assert_eq!(ten.io.readkBps, Some(200));
-        assert_eq!(ten.io.writekBps, Some(400));
-        assert_eq!(ten.net.recvkBps, Some(600));
-        assert_eq!(ten.net.sendkBps, Some(800));
+        assert_eq!(ten.io.readkBps, Some(200.0));
+        assert_eq!(ten.io.writekBps, Some(400.0));
+        assert_eq!(ten.net.recvkBps, Some(600.0));
+        assert_eq!(ten.net.sendkBps, Some(800.0));
 
         let twenty = &usages.usages["twenty"];
-        assert_eq!(twenty.io.readkBps, Some(100));
-        assert_eq!(twenty.io.writekBps, Some(200));
-        assert_eq!(twenty.net.recvkBps, Some(300));
-        assert_eq!(twenty.net.sendkBps, Some(400));
+        assert_eq!(twenty.io.readkBps, Some(100.0));
+        assert_eq!(twenty.io.writekBps, Some(200.0));
+        assert_eq!(twenty.net.recvkBps, Some(300.0));
+        assert_eq!(twenty.net.sendkBps, Some(400.0));
 
-        assert_eq!(usages.usages["uneven"].io.readkBps, Some(160));
+        assert_eq!(usages.usages["uneven"].io.readkBps, Some(160.0));
 
         // 積算値（kB）は経過時間に関係しない
         assert_eq!(twenty.io.readkB, Some(2001));
@@ -1722,9 +1814,10 @@ mod tests {
         for name in ["ten", "twenty"] {
             let usage = &usages.usages[name];
             assert_eq!(usage.cpu.percentage, Some(20.0));
+            // ログに出す差分は ms
             assert_eq!(usage.cpu.total, Some(1000));
             assert_eq!(usage.cpu.system, Some(10_000));
-            // (300000 - 100000) / 1000000 × 100
+            // (usage 300000 - inactive_file 100000) / limit 1000000 × 100
             assert_eq!(usage.memory.percentage, Some(20.0));
         }
     }
@@ -1810,6 +1903,7 @@ mod tests {
 
     #[test]
     fn log_line_format_is_unchanged() {
+        // キー名・構造・並びは変えない。速度（kBps）だけが小数2桁になる
         let prev = stats_map(vec![
             ("web", stats_at(
                 "2026-01-01T00:00:00.023034093Z",
@@ -1830,8 +1924,8 @@ mod tests {
                 r#"{"time":"2026-01-01T00:00:10.023034093Z","millis":10000,"stats":{"#,
                 r#""web":{"cpu":{"percentage":0.03,"total":3,"system":19860,"ncpu":2},"#,
                 r#""memory":{"percentage":20.00,"used":200000,"available":1000000},"#,
-                r#""io":{"readkB":4161,"writekB":48689,"readkBps":416,"writekBps":4868},"#,
-                r#""net":{"recvkB":40004,"sendkB":14,"recvkBps":4000,"sendkBps":1}}}}"#,
+                r#""io":{"readkB":4161,"writekB":48689,"readkBps":416.00,"writekBps":4868.70},"#,
+                r#""net":{"recvkB":40004,"sendkB":14,"recvkBps":4000.10,"sendkBps":1.00}}}}"#,
             ),
         );
     }
@@ -1842,22 +1936,65 @@ mod tests {
             r#"{"time":"2026-01-01T00:00:10.023034093Z","millis":10000,"stats":{"#,
             r#""web":{"cpu":{"percentage":0.03,"total":3,"system":19860,"ncpu":2},"#,
             r#""memory":{"percentage":3.64,"used":36696064,"available":1007222784},"#,
-            r#""io":{"readkB":4161,"writekB":48689,"readkBps":11,"writekBps":22},"#,
-            r#""net":{"recvkB":4,"sendkB":9,"recvkBps":33,"sendkBps":44}}}}"#,
+            r#""io":{"readkB":4161,"writekB":48689,"readkBps":11.50,"writekBps":0.35},"#,
+            r#""net":{"recvkB":4,"sendkB":9,"recvkBps":33.00,"sendkBps":0.00}}}}"#,
         );
         let usages = json_to_usage(&json::parse(line).unwrap()).unwrap();
         let web = &usages.usages["web"];
         assert_eq!(web.io.readkB, Some(4161));
         assert_eq!(web.io.writekB, Some(48689));
-        assert_eq!(web.io.readkBps, Some(11));
-        assert_eq!(web.io.writekBps, Some(22));
-        assert_eq!(web.net.recvkBps, Some(33));
-        assert_eq!(web.net.sendkBps, Some(44));
+        assert_eq!(web.io.readkBps, Some(11.5));
+        assert_eq!(web.io.writekBps, Some(0.35));
+        assert_eq!(web.net.recvkBps, Some(33.0));
+        assert_eq!(web.net.sendkBps, Some(0.0));
         // 読んだものを書き出すと元の行に戻る
         assert_eq!(usages.to_string(), line);
     }
 
+    #[test]
+    fn line_with_integer_rates_is_still_restored() {
+        // 速度を整数で書いていた頃の行
+        let old_line = concat!(
+            r#"{"time":"2026-01-01T00:00:10.023034093Z","millis":10000,"stats":{"#,
+            r#""web":{"cpu":{"percentage":0.03,"total":3,"system":19860,"ncpu":2},"#,
+            r#""memory":{"percentage":3.64,"used":36696064,"available":1007222784},"#,
+            r#""io":{"readkB":4161,"writekB":48689,"readkBps":11,"writekBps":0},"#,
+            r#""net":{"recvkB":4,"sendkB":9,"recvkBps":null,"sendkBps":4294967295}}}}"#,
+        );
+        let usages = json_to_usage(&json::parse(old_line).unwrap()).unwrap();
+        let web = &usages.usages["web"];
+        assert_eq!(web.io.readkBps, Some(11.0));
+        assert_eq!(web.io.writekBps, Some(0.0));
+        assert_eq!(web.net.recvkBps, None);
+        // 上限に張り付いた値（u32::MAX）も読める
+        assert_eq!(web.net.sendkBps, Some(u32::MAX as f32));
+        // 積算値は整数のまま
+        assert_eq!(web.io.readkB, Some(4161));
+        assert_eq!(web.net.sendkB, Some(9));
+
+        // 整数の行と小数の行が混じったログを、どちらも復元できる
+        let new_line = old_line
+            .replace("2026-01-01T00:00:10.023034093Z", "2026-01-01T00:00:20.023034093Z")
+            .replace(r#""readkBps":11,"writekBps":0}"#, r#""readkBps":11.25,"writekBps":0.35}"#)
+            .replace(r#""recvkBps":null,"sendkBps":4294967295}"#, r#""recvkBps":0.07,"sendkBps":1234.50}"#);
+        assert!(new_line.contains(r#""writekBps":0.35}"#) && new_line.contains(r#""recvkBps":0.07,"#));
+        let log = format!("{}\r\n{}\r\n", old_line, new_line);
+        let (summary, cache) = restore(log.as_bytes(), 0);
+        assert_eq!(summary, RestoreSummary { lines: 2, restored: 2 });
+        let lock = cache.read().unwrap();
+        let web: Vec<_> = lock.get("web").unwrap().iter().collect();
+        assert_eq!(
+            (web[0].read_kbps, web[0].write_kbps, web[0].recv_kbps),
+            (Some(11.0), Some(0.0), None),
+        );
+        assert_eq!(
+            (web[1].read_kbps, web[1].write_kbps, web[1].recv_kbps, web[1].send_kbps),
+            (Some(11.25), Some(0.35), Some(0.07), Some(1234.5)),
+        );
+    }
+
     /// ログの1行（行末の \r\n 込み）。値は cpu と io write だけ変える
+    /// 速度は整数で書く（小数にする前の形式。復元できることを保つ）
     fn log_line(time: &str, containers: &[(&str, f32, u32)]) -> String {
         let stats = containers.iter()
             .map(|(name, cpu, write)| format!(
@@ -1937,14 +2074,14 @@ mod tests {
         let web: Vec<_> = lock.get("web").unwrap().iter().collect();
         assert_eq!(
             web.iter().map(|p| p.write_kbps).collect::<Vec<_>>(),
-            vec![Some(11), Some(13), Some(15)],
+            vec![Some(11.0), Some(13.0), Some(15.0)],
         );
         assert_eq!(web[2].cpu, Some(5.0));
         assert_eq!(web[2].memory, Some(3.64));
-        assert_eq!(web[2].read_kbps, Some(5));
-        assert_eq!(web[2].recv_kbps, Some(6));
-        assert_eq!(web[2].send_kbps, Some(7));
-        assert_eq!(lock.get("db").unwrap()[0].write_kbps, Some(16));
+        assert_eq!(web[2].read_kbps, Some(5.0));
+        assert_eq!(web[2].recv_kbps, Some(6.0));
+        assert_eq!(web[2].send_kbps, Some(7.0));
+        assert_eq!(lock.get("db").unwrap()[0].write_kbps, Some(16.0));
     }
 
     #[test]
@@ -2021,14 +2158,14 @@ mod tests {
         let lock = cache.read().unwrap();
         let web = lock.get("web").unwrap();
         assert_eq!(web.len(), log_cache::MAX_LOG_LENGTH);
-        assert_eq!(web.back().unwrap().write_kbps, Some(8999));
-        assert_eq!(web.front().unwrap().write_kbps, Some(360));
+        assert_eq!(web.back().unwrap().write_kbps, Some(8999.0));
+        assert_eq!(web.front().unwrap().write_kbps, Some(360.0));
         // 復元した系列は、write を基準にしたダウンサンプリングでも末尾まで返る
         let sampled = lock
             .downsample("web", &DownsampleOption::default(), Series::IoWrite)
             .unwrap();
         assert_eq!(sampled.len(), 512);
-        assert_eq!(sampled[511].write_kbps, Some(8999));
+        assert_eq!(sampled[511].write_kbps, Some(8999.0));
     }
 
     #[test]
@@ -2063,8 +2200,585 @@ mod tests {
                 "2026-01-01T00:00:30.500Z",
             );
             // どちらの tick も 100 kB/s（飛んだ tick で2倍にならない）
-            assert_eq!(web[0].write_kbps, Some(100));
-            assert_eq!(web[1].write_kbps, Some(100));
+            assert_eq!(web[0].write_kbps, Some(100.0));
+            assert_eq!(web[1].write_kbps, Some(100.0));
         }
+    }
+
+    /// 統計の本文（json）から、時刻以外の一部だけを差し替えた統計を作る
+    /// 各引数は json の値をそのまま書く（そのキーごと省くなら None）
+    fn stats_from_parts(
+        read: &str,
+        memory_stats: Option<&str>,
+        networks: Option<&str>,
+        blkio: Option<&str>,
+    ) -> Stats {
+        let mut parts = vec![format!(r#""read":"{}""#, read)];
+        if let Some(v) = memory_stats {
+            parts.push(format!(r#""memory_stats":{}"#, v));
+        }
+        if let Some(v) = networks {
+            parts.push(format!(r#""networks":{}"#, v));
+        }
+        if let Some(v) = blkio {
+            parts.push(format!(
+                r#""blkio_stats":{{"io_service_bytes_recursive":{}}}"#, v,
+            ));
+        }
+        parse_stats_response(&format!(
+            "HTTP/1.1 200 OK\r\n\r\n{{{}}}\n", parts.join(","),
+        )).unwrap()
+    }
+
+    const T0: &str = "2026-01-01T00:00:00Z";
+    const T10: &str = "2026-01-01T00:00:10Z";
+
+    /// 前回と今回の統計から、web の使用率を求める
+    fn usage_between(prev: Stats, now: Stats) -> Usage {
+        let prev = stats_map(vec![("web", prev)]);
+        let now = stats_map(vec![("web", now)]);
+        calc_usages(TICK_MILLIS, &now, &prev).unwrap()
+            .usages.remove("web").unwrap()
+    }
+
+    fn memory_of(memory_stats: Option<&str>) -> MemoryUsage {
+        usage_between(
+            stats_from_parts(T0, memory_stats, None, None),
+            stats_from_parts(T10, memory_stats, None, None),
+        ).memory
+    }
+
+    #[test]
+    fn memory_follows_the_docker_cli_rule() {
+        // cgroup v1: total_inactive_file を引く（cache と inactive_file は見ない）
+        let v1 = memory_of(Some(concat!(
+            r#"{"usage":500000,"limit":2000000,"stats":{"cache":300000,"#,
+            r#""inactive_file":7,"total_cache":300000,"total_inactive_file":100000}}"#,
+        )));
+        assert_eq!(v1.used, Some(400_000));
+        assert_eq!(v1.available, Some(2_000_000));
+        assert_eq!(v1.percentage, Some(20.0));
+
+        // cgroup v2: cache が無く、inactive_file を引く
+        let v2 = memory_of(Some(concat!(
+            r#"{"usage":500000,"limit":2000000,"stats":{"anon":150000,"#,
+            r#""file":350000,"active_file":50000,"inactive_file":300000}}"#,
+        )));
+        assert_eq!(v2.used, Some(200_000));
+        assert_eq!(v2.percentage, Some(10.0));
+
+        // どちらも無ければ usage のまま。cache があっても引かない
+        for stats in [
+            r#"{"usage":500000,"limit":2000000,"stats":{"cache":300000,"anon":150000}}"#,
+            r#"{"usage":500000,"limit":2000000,"stats":{}}"#,
+            r#"{"usage":500000,"limit":2000000}"#,
+        ] {
+            let plain = memory_of(Some(stats));
+            assert_eq!(plain.used, Some(500_000), "{}", stats);
+            assert_eq!(plain.percentage, Some(25.0), "{}", stats);
+        }
+    }
+
+    #[test]
+    fn memory_ignores_a_value_not_smaller_than_usage() {
+        // 引く値が usage 以上なら使わない（同じ値も含む）
+        for stats in [
+            r#"{"usage":500000,"limit":2000000,"stats":{"total_inactive_file":500000}}"#,
+            r#"{"usage":500000,"limit":2000000,"stats":{"total_inactive_file":900000}}"#,
+            r#"{"usage":500000,"limit":2000000,"stats":{"inactive_file":500000}}"#,
+            r#"{"usage":500000,"limit":2000000,"stats":{"inactive_file":900000}}"#,
+        ] {
+            let memory = memory_of(Some(stats));
+            assert_eq!(memory.used, Some(500_000), "{}", stats);
+            assert_eq!(memory.percentage, Some(25.0), "{}", stats);
+        }
+        // total_inactive_file が使えなければ、inactive_file を見る
+        let fallback = memory_of(Some(concat!(
+            r#"{"usage":500000,"limit":2000000,"#,
+            r#""stats":{"total_inactive_file":900000,"inactive_file":100000}}"#,
+        )));
+        assert_eq!(fallback.used, Some(400_000));
+        // 引く値がちょうど usage より 1 小さい
+        let edge = memory_of(Some(
+            r#"{"usage":500000,"limit":2000000,"stats":{"inactive_file":499999}}"#,
+        ));
+        assert_eq!(edge.used, Some(1));
+    }
+
+    #[test]
+    fn memory_without_a_limit_is_null() {
+        // limit が 0
+        let zero = memory_of(Some(
+            r#"{"usage":500000,"limit":0,"stats":{"inactive_file":100000}}"#,
+        ));
+        assert_eq!(zero.percentage, None);
+        assert_eq!(zero.used, Some(400_000));
+        // usage も 0（0 / 0）
+        let both_zero = memory_of(Some(r#"{"usage":0,"limit":0}"#));
+        assert_eq!(both_zero.percentage, None);
+        // limit が無い
+        let no_limit = memory_of(Some(
+            r#"{"usage":500000,"stats":{"inactive_file":100000}}"#,
+        ));
+        assert_eq!(no_limit.percentage, None);
+        assert_eq!(no_limit.available, None);
+        // memory_stats が空、または無い
+        for stats in [Some("{}"), None] {
+            let none = memory_of(stats);
+            assert_eq!(none.percentage, None);
+            assert_eq!(none.used, None);
+        }
+        // ログの1行が json として読め、null で出る
+        let usage = usage_between(
+            stats_from_parts(T0, Some(r#"{"usage":5,"limit":0}"#), None, None),
+            stats_from_parts(T10, Some(r#"{"usage":5,"limit":0}"#), None, None),
+        );
+        let line = usage.to_string();
+        assert!(json::parse(&line).is_ok(), "{}", line);
+        assert!(line.contains(
+            r#""memory":{"percentage":null,"used":5,"available":0}"#
+        ), "{}", line);
+    }
+
+    #[test]
+    fn network_sums_every_interface() {
+        // インターフェース 1 つ
+        let single = stats_from_parts(
+            T0, None, Some(r#"{"eth0":{"rx_bytes":3000,"tx_bytes":4000}}"#), None,
+        );
+        assert_eq!(single.net.recv, Some(3000));
+        assert_eq!(single.net.send, Some(4000));
+
+        // 複数は合算する。eth0 という名前が無くてもよい
+        let multi = stats_from_parts(T10, None, Some(concat!(
+            r#"{"eth1":{"rx_bytes":10000,"rx_packets":9,"tx_bytes":20000},"#,
+            r#""eth2":{"rx_bytes":2000,"tx_bytes":300},"#,
+            r#""enp3s0":{"rx_bytes":1,"tx_bytes":2}}"#,
+        )), None);
+        assert_eq!(multi.net.recv, Some(12_001));
+        assert_eq!(multi.net.send, Some(20_302));
+
+        // 速度は、インターフェースごとの差分の合算
+        // recv: (9000 + 0 + 1) / 10000 ms、send: (16000 + 300 + 2) / 10000 ms
+        let before = stats_from_parts(T0, None, Some(concat!(
+            r#"{"eth1":{"rx_bytes":1000,"tx_bytes":4000},"#,
+            r#""eth2":{"rx_bytes":2000,"tx_bytes":0}}"#,
+        )), None);
+        let usage = usage_between(before, multi);
+        assert_eq!(usage.net.recvkB, Some(12));
+        assert_eq!(usage.net.sendkB, Some(20));
+        let line = usage.to_string();
+        assert!(line.contains(
+            r#""net":{"recvkB":12,"sendkB":20,"recvkBps":0.90,"sendkBps":1.63}"#
+        ), "{}", line);
+    }
+
+    #[test]
+    fn missing_networks_are_null() {
+        // ホストネットワークなど。networks が無い、または null
+        for networks in [None, Some("null")] {
+            let prev = stats_from_parts(T0, None, networks, None);
+            assert_eq!(prev.net.recv, None);
+            assert_eq!(prev.net.send, None);
+            let usage = usage_between(prev, stats_from_parts(T10, None, networks, None));
+            assert_eq!(usage.net.recvkBps, None);
+            assert_eq!(usage.net.sendkBps, None);
+            let line = usage.to_string();
+            assert!(line.contains(
+                r#""net":{"recvkB":null,"sendkB":null,"recvkBps":null,"sendkBps":null}"#
+            ), "{}", line);
+        }
+    }
+
+    #[test]
+    fn io_sums_every_device() {
+        // デバイス 1 つ
+        let single = stats_from_parts(T0, None, None, Some(concat!(
+            r#"[{"major":8,"minor":0,"op":"read","value":1000},"#,
+            r#"{"major":8,"minor":0,"op":"write","value":2000}]"#,
+        )));
+        assert_eq!(single.io.read, Some(1000));
+        assert_eq!(single.io.write, Some(2000));
+
+        // 複数は合算する
+        let multi = stats_from_parts(T10, None, None, Some(concat!(
+            r#"[{"major":8,"minor":0,"op":"read","value":5000},"#,
+            r#"{"major":8,"minor":0,"op":"write","value":6000},"#,
+            r#"{"major":8,"minor":16,"op":"read","value":700},"#,
+            r#"{"major":8,"minor":16,"op":"write","value":80},"#,
+            r#"{"major":253,"minor":0,"op":"write","value":9}]"#,
+        )));
+        assert_eq!(multi.io.read, Some(5700));
+        assert_eq!(multi.io.write, Some(6089));
+
+        // 速度も合算した値の差分: (5700 - 1000) / 10000 ms、(6089 - 2000) / 10000 ms
+        let usage = usage_between(single, multi);
+        let line = usage.to_string();
+        assert!(line.contains(
+            r#""io":{"readkB":5,"writekB":6,"readkBps":0.47,"writekBps":0.41}"#
+        ), "{}", line);
+    }
+
+    #[test]
+    fn io_op_is_case_insensitive_and_other_ops_are_ignored() {
+        // cgroup v1 の形: op が大文字始まりで、read / write 以外も混じる
+        let v1 = stats_from_parts(T0, None, None, Some(concat!(
+            r#"[{"major":8,"minor":0,"op":"Read","value":1000},"#,
+            r#"{"major":8,"minor":0,"op":"Write","value":2000},"#,
+            r#"{"major":8,"minor":0,"op":"Sync","value":40000},"#,
+            r#"{"major":8,"minor":0,"op":"Async","value":50000},"#,
+            r#"{"major":8,"minor":0,"op":"Discard","value":60000},"#,
+            r#"{"major":8,"minor":0,"op":"Total","value":70000},"#,
+            r#"{"major":8,"minor":16,"op":"Read","value":30},"#,
+            r#"{"major":8,"minor":16,"op":"Write","value":4},"#,
+            r#"{"major":8,"minor":16,"op":"Total","value":34}]"#,
+        )));
+        assert_eq!(v1.io.read, Some(1030));
+        assert_eq!(v1.io.write, Some(2004));
+
+        // 小文字に read / write 以外が混じる形、大文字だけの形
+        let mixed = stats_from_parts(T0, None, None, Some(concat!(
+            r#"[{"op":"sync","value":40000},{"op":"read","value":10},"#,
+            r#"{"op":"total","value":70000},{"op":"WRITE","value":20},"#,
+            r#"{"op":"READ","value":1},{"op":"readahead","value":999},"#,
+            r#"{"value":888},{"op":null,"value":777}]"#,
+        )));
+        assert_eq!(mixed.io.read, Some(11));
+        assert_eq!(mixed.io.write, Some(20));
+    }
+
+    #[test]
+    fn missing_io_entries_are_null() {
+        // 配列が空、null、キーごと無い
+        for blkio in [Some("[]"), Some("null"), None] {
+            let prev = stats_from_parts(T0, None, None, blkio);
+            assert_eq!(prev.io.read, None, "{:?}", blkio);
+            assert_eq!(prev.io.write, None, "{:?}", blkio);
+            let usage = usage_between(prev, stats_from_parts(T10, None, None, blkio));
+            let line = usage.to_string();
+            assert!(line.contains(
+                r#""io":{"readkB":null,"writekB":null,"readkBps":null,"writekBps":null}"#
+            ), "{:?} {}", blkio, line);
+        }
+        // read / write の要素が1つも無ければ、同じく null
+        let others = stats_from_parts(
+            T0, None, None, Some(r#"[{"op":"sync","value":1},{"op":"total","value":2}]"#),
+        );
+        assert_eq!(others.io.read, None);
+        assert_eq!(others.io.write, None);
+    }
+
+    #[test]
+    fn rates_below_one_kb_per_second_are_kept() {
+        // 10秒で 3,500 バイト → 0.35 kB/s（整数に切り捨てていた頃は 0）
+        let before = || stats_at(T0, 0, 0, (1000, 2000), (3000, 4000));
+        let after = || stats_at(T10, 0, 0, (4500, 2000), (3050, 7500));
+        let usage = usage_between(before(), after());
+        let close = |value: Option<f32>, expected: f32| {
+            value.is_some_and(|v| (v - expected).abs() < 1e-6)
+        };
+        assert!(close(usage.io.readkBps, 0.35), "{:?}", usage.io.readkBps);
+        // 増えていなければ 0
+        assert_eq!(usage.io.writekBps, Some(0.0));
+        // 小数2桁に満たない値も、持っている間は 0 にしない（書き出すときに丸める）
+        assert!(close(usage.net.recvkBps, 0.005), "{:?}", usage.net.recvkBps);
+        assert!(close(usage.net.sendkBps, 0.35), "{:?}", usage.net.sendkBps);
+
+        // ログの1行: 速度は小数2桁、積算値（kB）は整数のまま
+        let line = usage.to_string();
+        assert!(line.contains(
+            r#""io":{"readkB":4,"writekB":2,"readkBps":0.35,"writekBps":0.00}"#
+        ), "{}", line);
+        assert!(line.contains(r#""net":{"recvkB":3,"sendkB":7,"#), "{}", line);
+        assert!(line.contains(r#""sendkBps":0.35}"#), "{}", line);
+
+        // 算出 → ログの1行 → 復元 → API の要素、と通しても 0.35 のまま
+        let prev = stats_map(vec![("web", before())]);
+        let now = stats_map(vec![("web", after())]);
+        let usages = calc_usages(TICK_MILLIS, &now, &prev).unwrap();
+        let (summary, cache) = restore((usages.to_string() + "\r\n").as_bytes(), 0);
+        assert_eq!(summary, RestoreSummary { lines: 1, restored: 1 });
+        let lock = cache.read().unwrap();
+        let point = &lock.get("web").unwrap()[0];
+        assert_eq!(point.read_kbps, Some(0.35));
+        assert_eq!(
+            Series::IoRead.point_to_json(point),
+            r#"{"time":"2026-01-01T00:00:10.000Z","readkBps":0.35,"writekBps":0.00}"#,
+        );
+        let net = Series::NetSend.point_to_json(point);
+        assert!(net.ends_with(r#""sendkBps":0.35}"#), "{}", net);
+    }
+
+    #[test]
+    fn cpu_delta_below_one_millisecond_is_not_zero() {
+        // total の差分は 900,000 ns（0.9 ms）。system の差分は 10秒 × 2 cores
+        // 0.0009 s / 20 s × 2 cores × 100 = 0.009 %
+        let usage = usage_between(
+            stats_at(T0, 5_000_400_000, 70_000_000_000, (0, 0), (0, 0)),
+            stats_at(T10, 5_001_300_000, 90_000_000_000, (0, 0), (0, 0)),
+        );
+        let percentage = usage.cpu.percentage.unwrap();
+        assert!(percentage > 0.0);
+        assert!((percentage - 0.009).abs() < 1e-6, "{}", percentage);
+        // ログの total / system は ms の整数のまま（差分を ms に丸めた値）
+        assert_eq!(usage.cpu.total, Some(0));
+        assert_eq!(usage.cpu.system, Some(20_000));
+        let line = usage.to_string();
+        assert!(line.contains(
+            r#""cpu":{"percentage":0.01,"total":0,"system":20000,"ncpu":2}"#
+        ), "{}", line);
+
+        // ms の境界をまたがない 0.4 ms の差分が続いても、毎回 0 にならない
+        // (ms に丸めてから差を取っていた頃は、0 と 1 ms 分の値が混じっていた)
+        let step = |i: u64| stats_at(
+            &format!("2026-01-01T00:00:{:02}Z", i * 10),
+            5_000_000_000 + i * 400_000, 70_000_000_000 + i * 20_000_000_000,
+            (0, 0), (0, 0),
+        );
+        for i in 1..5 {
+            let usage = usage_between(step(i - 1), step(i));
+            let percentage = usage.cpu.percentage.unwrap();
+            assert!((percentage - 0.004).abs() < 1e-6, "{}: {}", i, percentage);
+            assert_eq!(usage.cpu.total, Some(0));
+        }
+
+        // ms 未満の端数を含む差分でも、比は ns で求める: 1.5 ms / 10,000.5 ms × 2 × 100
+        let usage = usage_between(
+            stats_at(T0, 0, 0, (0, 0), (0, 0)),
+            stats_at(T10, 1_500_000, 10_000_500_000, (0, 0), (0, 0)),
+        );
+        let expected = (1_500_000_f64 / 10_000_500_000_f64 * 200.0) as f32;
+        assert_eq!(usage.cpu.percentage, Some(expected));
+        assert_eq!(usage.cpu.total, Some(1));
+        assert_eq!(usage.cpu.system, Some(10_000));
+    }
+
+    fn net_stats(read: &str, networks: &str) -> Stats {
+        stats_from_parts(read, None, Some(networks), None)
+    }
+
+    fn io_stats(read: &str, blkio: &str) -> Stats {
+        stats_from_parts(read, None, None, Some(blkio))
+    }
+
+    #[test]
+    fn removed_interface_does_not_hide_the_traffic_of_the_others() {
+        // eth1 は大きな積算値を持つ。次の tick までに外され、eth0 だけが残る
+        let usage = usage_between(
+            net_stats(T0, concat!(
+                r#"{"eth0":{"rx_bytes":0,"tx_bytes":500},"#,
+                r#""eth1":{"rx_bytes":1000000,"tx_bytes":2000000}}"#,
+            )),
+            net_stats(T10, r#"{"eth0":{"rx_bytes":1000,"tx_bytes":4000}}"#),
+        );
+        // eth0 の増分（1,000 / 3,500 バイト）が、合計の減少に埋もれずに残る
+        // 合計同士の差（1,000 - 1,000,000）だと 0 になっていた
+        assert_eq!(usage.net.recvkBps, Some(0.1));
+        assert_eq!(usage.net.sendkBps, Some(0.35));
+        // 積算値は、その時点で残っているインターフェースの合計
+        assert_eq!(usage.net.recvkB, Some(1));
+        assert_eq!(usage.net.sendkB, Some(4));
+        let line = usage.to_string();
+        assert!(line.contains(
+            r#""net":{"recvkB":1,"sendkB":4,"recvkBps":0.10,"sendkBps":0.35}"#
+        ), "{}", line);
+    }
+
+    #[test]
+    fn added_interface_counts_from_zero() {
+        // eth1 が追加された。新しいインターフェースの積算値は 0 から始まるので、
+        // 今回の値がそのまま増分になる
+        let usage = usage_between(
+            net_stats(T0, r#"{"eth0":{"rx_bytes":50000,"tx_bytes":60000}}"#),
+            net_stats(T10, concat!(
+                r#"{"eth0":{"rx_bytes":51000,"tx_bytes":60000},"#,
+                r#""eth1":{"rx_bytes":2000,"tx_bytes":500}}"#,
+            )),
+        );
+        // (1,000 + 2,000) / 10,000 ms、(0 + 500) / 10,000 ms
+        assert_eq!(usage.net.recvkBps, Some(0.3));
+        assert_eq!(usage.net.sendkBps, Some(0.05));
+
+        // 入れ替わった場合: 外された分は数えず、追加された分は 0 から数える
+        let usage = usage_between(
+            net_stats(T0, r#"{"eth0":{"rx_bytes":900000,"tx_bytes":900000}}"#),
+            net_stats(T10, r#"{"eth1":{"rx_bytes":2000,"tx_bytes":0}}"#),
+        );
+        assert_eq!(usage.net.recvkBps, Some(0.2));
+        assert_eq!(usage.net.sendkBps, Some(0.0));
+    }
+
+    #[test]
+    fn counter_reset_of_one_interface_does_not_cancel_the_others() {
+        // eth1 の積算値だけが戻った（つなぎ直しなど）。eth1 の差分だけを 0 とし、
+        // eth0 の増分は残す
+        let usage = usage_between(
+            net_stats(T0, concat!(
+                r#"{"eth0":{"rx_bytes":1000,"tx_bytes":1000},"#,
+                r#""eth1":{"rx_bytes":800000,"tx_bytes":800000}}"#,
+            )),
+            net_stats(T10, concat!(
+                r#"{"eth0":{"rx_bytes":6000,"tx_bytes":1000},"#,
+                r#""eth1":{"rx_bytes":300,"tx_bytes":0}}"#,
+            )),
+        );
+        assert_eq!(usage.net.recvkBps, Some(0.5));
+        assert_eq!(usage.net.sendkBps, Some(0.0));
+    }
+
+    #[test]
+    fn first_interfaces_count_from_zero_and_no_interface_is_null() {
+        let some = r#"{"eth0":{"rx_bytes":1000,"tx_bytes":3500}}"#;
+        // 前回は networks が無かった（null・空も同じ）。今回の値を 0 からの増分として数える
+        for before in [
+            stats_from_parts(T0, None, None, None),
+            net_stats(T0, "null"),
+            net_stats(T0, "{}"),
+        ] {
+            let usage = usage_between(before, net_stats(T10, some));
+            assert_eq!(usage.net.recvkBps, Some(0.1));
+            assert_eq!(usage.net.sendkBps, Some(0.35));
+        }
+        // 今回は networks が無い。値そのものが無いので null
+        for after in [
+            stats_from_parts(T10, None, None, None),
+            net_stats(T10, "{}"),
+        ] {
+            let usage = usage_between(net_stats(T0, some), after);
+            assert_eq!(usage.net.recvkBps, None);
+            assert_eq!(usage.net.sendkBps, None);
+            assert_eq!(usage.net.recvkB, None);
+        }
+    }
+
+    #[test]
+    fn first_io_of_an_op_counts_from_zero() {
+        let read_only = r#"[{"major":8,"minor":0,"op":"read","value":1000}]"#;
+        let both = concat!(
+            r#"[{"major":8,"minor":0,"op":"read","value":2000},"#,
+            r#"{"major":8,"minor":0,"op":"write","value":3500}]"#,
+        );
+        // 前回は read の要素だけ。今回初めて write の要素が現れた
+        let usage = usage_between(io_stats(T0, read_only), io_stats(T10, both));
+        assert_eq!(usage.io.readkBps, Some(0.1));
+        assert_eq!(usage.io.writekBps, Some(0.35));
+        let line = usage.to_string();
+        assert!(line.contains(
+            r#""io":{"readkB":2,"writekB":3,"readkBps":0.10,"writekBps":0.35}"#
+        ), "{}", line);
+
+        // 前回は IO の要素が1つも無かった（空・null・キーごと無い・ほかの op だけ）
+        // まだ読み書きしていなかったコンテナの、最初の読み書きにあたる
+        for before in [
+            io_stats(T0, "[]"),
+            io_stats(T0, "null"),
+            stats_from_parts(T0, None, None, None),
+            io_stats(T0, r#"[{"major":8,"minor":0,"op":"total","value":99999}]"#),
+        ] {
+            let usage = usage_between(before, io_stats(T10, both));
+            assert_eq!(usage.io.readkBps, Some(0.2));
+            assert_eq!(usage.io.writekBps, Some(0.35));
+        }
+
+        // 今回の要素が無い op は、従来どおり null（増分 0 ではない）
+        let usage = usage_between(io_stats(T0, both), io_stats(T10, read_only));
+        assert_eq!(usage.io.readkBps, Some(0.0));
+        assert_eq!(usage.io.writekBps, None);
+        assert_eq!(usage.io.writekB, None);
+    }
+
+    #[test]
+    fn first_io_reaches_the_log_and_the_cache() {
+        // 起動直後で IO の無いコンテナが、3 tick 目に初めて書き込む
+        let io = |read: &str, blkio: &str| Some(io_stats(read, blkio));
+        let wrote = r#"[{"major":8,"minor":0,"op":"write","value":3500}]"#;
+        let mut logger = Logger::new();
+        assert!(!logger.tick(Ok(collected(vec![("web", io(T0, "null"))]))).unwrap());
+        assert!(logger.tick(Ok(collected(vec![("web", io(T10, "null"))]))).unwrap());
+        assert!(logger.tick(Ok(collected(vec![
+            ("web", io("2026-01-01T00:00:20Z", wrote)),
+        ]))).unwrap());
+        assert!(logger.tick(Ok(collected(vec![
+            ("web", io("2026-01-01T00:00:30Z", wrote)),
+        ]))).unwrap());
+        // IO が無い間は null、最初の書き込みは 0 からの増分、そのあとは 0
+        assert_eq!(logger.writes("web"), vec![
+            ("2026-01-01T00:00:10.000Z".to_string(), None),
+            ("2026-01-01T00:00:20.000Z".to_string(), Some(0.35)),
+            ("2026-01-01T00:00:30.000Z".to_string(), Some(0.0)),
+        ]);
+        assert!(logger.lines[1].contains(r#""writekBps":0.35"#), "{}", logger.lines[1]);
+    }
+
+    #[test]
+    fn removed_device_does_not_hide_the_io_of_the_others() {
+        // 8:16 は大きな積算値を持つ。次の tick までに要素が消え、8:0 だけが残る
+        let usage = usage_between(
+            io_stats(T0, concat!(
+                r#"[{"major":8,"minor":0,"op":"read","value":1000},"#,
+                r#"{"major":8,"minor":0,"op":"write","value":2000},"#,
+                r#"{"major":8,"minor":16,"op":"read","value":5000000},"#,
+                r#"{"major":8,"minor":16,"op":"write","value":6000000}]"#,
+            )),
+            io_stats(T10, concat!(
+                r#"[{"major":8,"minor":0,"op":"read","value":4500},"#,
+                r#"{"major":8,"minor":0,"op":"write","value":3000}]"#,
+            )),
+        );
+        assert_eq!(usage.io.readkBps, Some(0.35));
+        assert_eq!(usage.io.writekBps, Some(0.1));
+        assert_eq!(usage.io.readkB, Some(4));
+    }
+
+    #[test]
+    fn io_increase_is_taken_per_device() {
+        // 追加されたデバイス（253:0）は 0 から数える
+        // major が同じで minor が違うデバイスは、別のものとして扱う
+        let usage = usage_between(
+            io_stats(T0, concat!(
+                r#"[{"major":8,"minor":0,"op":"Read","value":1000},"#,
+                r#"{"major":8,"minor":16,"op":"Read","value":700000},"#,
+                r#"{"major":8,"minor":0,"op":"Write","value":0}]"#,
+            )),
+            io_stats(T10, concat!(
+                r#"[{"major":8,"minor":0,"op":"read","value":2000},"#,
+                // 積算値が戻ったデバイス。このデバイスの差分だけを 0 とする
+                r#"{"major":8,"minor":16,"op":"read","value":100},"#,
+                r#"{"major":253,"minor":0,"op":"read","value":500},"#,
+                r#"{"major":8,"minor":0,"op":"write","value":0},"#,
+                r#"{"major":253,"minor":0,"op":"write","value":3500}]"#,
+            )),
+        );
+        // read: 1,000 + 0 + 500、write: 0 + 3,500
+        assert_eq!(usage.io.readkBps, Some(0.15));
+        assert_eq!(usage.io.writekBps, Some(0.35));
+
+        // 同じデバイスの要素が複数あれば、足してから差を取る
+        let stats = io_stats(T0, concat!(
+            r#"[{"major":8,"minor":0,"op":"read","value":10},"#,
+            r#"{"major":8,"minor":0,"op":"Read","value":5}]"#,
+        ));
+        assert_eq!(stats.io.read, Some(15));
+        assert_eq!(stats.io.read_by_device, vec![("8:0".to_string(), 15)]);
+    }
+
+    #[test]
+    fn interface_removed_while_stats_were_carried_over() {
+        // 採れなかった tick をまたいでも、内訳ごとの前回値で差分を取る
+        let net = |read: &str, networks: &str| Some(net_stats(read, networks));
+        let mut logger = Logger::new();
+        logger.tick(Ok(collected(vec![("web", net(T0, concat!(
+            r#"{"eth0":{"rx_bytes":0,"tx_bytes":0},"#,
+            r#""eth1":{"rx_bytes":9000000,"tx_bytes":9000000}}"#,
+        )))]))).unwrap();
+        assert!(!logger.tick(Ok(collected(vec![("web", None)]))).unwrap());
+        // 20秒後。eth1 は外されている。eth0 の 7,000 バイトを 20秒で割る
+        assert!(logger.tick(Ok(collected(vec![("web", net(
+            "2026-01-01T00:00:20Z", r#"{"eth0":{"rx_bytes":7000,"tx_bytes":0}}"#,
+        ))]))).unwrap());
+        let lock = logger.cache.read().unwrap();
+        let point = lock.get("web").unwrap()[0];
+        assert_eq!(point.recv_kbps, Some(0.35));
+        assert_eq!(point.send_kbps, Some(0.0));
     }
 }

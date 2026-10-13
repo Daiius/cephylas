@@ -477,11 +477,11 @@ mod tests {
             let mut lock = cache.write().unwrap();
             for name in ["web", "db"] {
                 for i in 0..npoints {
-                    let v = (i % 7) as u32;
+                    let v = (i % 7) as f32;
                     assert!(lock.insert(name, UsagePoint {
                         time_ms: time_of(i),
-                        cpu: Some(v as f32),
-                        memory: Some(v as f32 + 0.5),
+                        cpu: Some(v),
+                        memory: Some(v + 0.5),
                         read_kbps: Some(v),
                         write_kbps: None,
                         recv_kbps: None,
@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn response_bodies_keep_their_exact_shape() {
         // 時刻はミリ秒精度の ISO 8601 (UTC、Z 終端)
-        // 小数は2桁、整数はそのまま、欠損は null
+        // 値は小数2桁（1 kB/s 未満の速度も 0 にならない）、欠損は null
         let cache = create_shared_cache();
         {
             let mut lock = cache.write().unwrap();
@@ -574,10 +574,10 @@ mod tests {
                 time_ms: BASE_MS + 10_023,
                 cpu: Some(0.125),
                 memory: Some(3.64),
-                read_kbps: Some(0),
-                write_kbps: Some(1234),
+                read_kbps: Some(0.0),
+                write_kbps: Some(1234.0),
                 recv_kbps: None,
-                send_kbps: Some(5),
+                send_kbps: Some(0.35),
             });
             lock.insert("web", UsagePoint {
                 time_ms: BASE_MS + 20_000,
@@ -585,7 +585,7 @@ mod tests {
                 memory: Some(100.0),
                 read_kbps: None,
                 write_kbps: None,
-                recv_kbps: Some(7),
+                recv_kbps: Some(12.345),
                 send_kbps: None,
             });
         }
@@ -609,14 +609,14 @@ mod tests {
             ),
         );
         let io = concat!(
-            r#"[{"time":"2026-01-01T00:00:10.023Z","readkBps":0,"writekBps":1234},"#,
+            r#"[{"time":"2026-01-01T00:00:10.023Z","readkBps":0.00,"writekBps":1234.00},"#,
             r#"{"time":"2026-01-01T00:00:20.000Z","readkBps":null,"writekBps":null}]"#,
         );
         assert_eq!(body_of("/containers/web/io/read"), io);
         assert_eq!(body_of("/containers/web/io/write"), io);
         let net = concat!(
-            r#"[{"time":"2026-01-01T00:00:10.023Z","recvkBps":null,"sendkBps":5},"#,
-            r#"{"time":"2026-01-01T00:00:20.000Z","recvkBps":7,"sendkBps":null}]"#,
+            r#"[{"time":"2026-01-01T00:00:10.023Z","recvkBps":null,"sendkBps":0.35},"#,
+            r#"{"time":"2026-01-01T00:00:20.000Z","recvkBps":12.35,"sendkBps":null}]"#,
         );
         assert_eq!(body_of("/containers/web/net/recv"), net);
         assert_eq!(body_of("/containers/web/net/send"), net);
@@ -1095,15 +1095,15 @@ mod tests {
             for c in 0..NCONTAINERS {
                 for i in 0..crate::log_cache::MAX_LOG_LENGTH {
                     let name = format!("c{}", c);
-                    let v = (i % 13) as u32;
+                    let v = (i % 13) as f32;
                     assert!(lock.insert(&name, UsagePoint {
                         time_ms: time_ms_at(i),
-                        cpu: Some(v as f32),
-                        memory: Some(v as f32),
+                        cpu: Some(v),
+                        memory: Some(v),
                         read_kbps: Some(v),
-                        write_kbps: Some(1),
+                        write_kbps: Some(1.0),
                         recv_kbps: Some(v),
-                        send_kbps: Some(1),
+                        send_kbps: Some(1.0),
                     }));
                 }
             }

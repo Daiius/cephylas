@@ -37,10 +37,10 @@ classDiagram
         time_ms: i64
         cpu: Option(f32)
         memory: Option(f32)
-        read_kbps: Option(u32)
-        write_kbps: Option(u32)
-        recv_kbps: Option(u32)
-        send_kbps: Option(u32)
+        read_kbps: Option(f32)
+        write_kbps: Option(f32)
+        recv_kbps: Option(f32)
+        send_kbps: Option(f32)
     }
     Usages --> Usage : コンテナ名ごと
     UsageCache --> UsagePoint : コンテナ名ごとに時刻順
