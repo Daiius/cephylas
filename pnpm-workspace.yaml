@@ -1,4 +1,6 @@
 packages:
   - "next"
+allowBuilds:
+  sharp: true
 onlyBuiltDependencies:
   - sharp
