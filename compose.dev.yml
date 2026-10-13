@@ -1,0 +1,14 @@
+# dev 用の上書き。`pnpm dev` / `pnpm dev:core` が compose.yml に重ねて読む。
+# 本番は compose.yml と compose.prod.yml だけを読むので、このファイルは本番に影響しない。
+services:
+  cephylas:
+    deploy:
+      resources:
+        limits:
+          # compose.yml の 50M は本番向け。dev は cargo build がコンテナ内で走るので緩める。
+          memory: 2G
+    volumes:
+      # core は /var/run/docker.sock から統計を読む。
+      # rootless Docker などソケットの場所が違う環境では DOCKER_SOCK で指定する
+      # （例: DOCKER_SOCK=/run/user/1000/docker.sock）。
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
