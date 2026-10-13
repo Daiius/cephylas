@@ -261,6 +261,21 @@ fn respond(
     }
 }
 
+/// 次の1回のreadで待つ時間の上限を変えられるストリーム
+///
+/// リクエスト行の読み取りを合計時間で打ち切るために使います
+/// (readごとの固定のタイムアウトだけでは、期限の直前に届いたデータで
+///  待ち時間が延び、合計が上限を超えてしまう)
+trait ReadDeadline {
+    fn limit_next_read(&mut self, timeout: Duration) -> std::io::Result<()>;
+}
+
+impl ReadDeadline for std::net::TcpStream {
+    fn limit_next_read(&mut self, timeout: Duration) -> std::io::Result<()> {
+        self.set_read_timeout(Some(timeout))
+    }
+}
+
 /// リクエスト行の読み取り結果
 enum RequestLine {
     /// 1バイトも受け取らずに終わった
@@ -273,10 +288,10 @@ enum RequestLine {
 
 /// 最初の改行までを読みます。ヘッダは解釈しません
 ///
-/// timeout はリクエスト行を読み切るまでの上限です
-/// (1回のreadの待ち時間はaccept側がソケットに設定します。
-///  少しずつ送り続けて接続を占有されないよう、合計でも区切ります)
-fn read_request_line<R: Read>(
+/// timeout はリクエスト行を読み切るまでの合計の上限です
+/// 少しずつ送り続けて接続を占有されないよう、readのたびに残り時間だけ待ち、
+/// 期限を過ぎてから届いた分は（改行やEOFであっても）受け付けません
+fn read_request_line<R: Read + ReadDeadline>(
     stream: &mut R,
     timeout: Duration,
 ) -> Result<RequestLine, error::Error> {
@@ -284,7 +299,23 @@ fn read_request_line<R: Read>(
     let mut received: Vec<u8> = Vec::new();
     let mut chunk = [0; 1024];
 
+    // 期限切れ。1バイトも受け取っていなければエラーとして扱わない
+    let timed_out = |received: &Vec<u8>| {
+        if received.is_empty() {
+            Ok(RequestLine::Closed)
+        } else {
+            Err("timed out while reading the request line".into())
+        }
+    };
+
     loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return timed_out(&received);
+        }
+        if let Err(e) = stream.limit_next_read(remaining) {
+            return Err(e.into());
+        }
         let n = match stream.read(&mut chunk) {
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -293,6 +324,9 @@ fn read_request_line<R: Read>(
             Err(_) if received.is_empty() => return Ok(RequestLine::Closed),
             Err(e) => return Err(e.into()),
         };
+        if started.elapsed() > timeout {
+            return timed_out(&received);
+        }
         if n == 0 {
             if received.is_empty() {
                 return Ok(RequestLine::Closed);
@@ -308,9 +342,6 @@ fn read_request_line<R: Read>(
         if received.len() > MAX_REQUEST_LINE_BYTES {
             return Ok(RequestLine::TooLong);
         }
-        if started.elapsed() > timeout {
-            return Err("timed out while reading the request line".into());
-        }
     }
 
     if received.len() > MAX_REQUEST_LINE_BYTES {
@@ -321,9 +352,10 @@ fn read_request_line<R: Read>(
 
 /// 1本の接続を処理します。1接続につき1リクエストです
 ///
-/// TcpStream固有の操作（タイムアウトの設定など）はaccept側で行い、
-/// ここは Read + Write だけに依存させています（メモリ上のストリームで試験するため）
-fn handle_connection<S: Read + Write>(
+/// TcpStream固有の操作（書き込みのタイムアウトの設定など）はaccept側で行い、
+/// ここは Read + Write と ReadDeadline だけに依存させています
+/// （メモリ上のストリームで試験するため）
+fn handle_connection<S: Read + Write + ReadDeadline>(
     stream: &mut S,
     log_cache: &log_cache::SharedUsageCache,
     timeout: Duration,
@@ -641,6 +673,10 @@ mod tests {
         assert_eq!(exchange(&small_cache(), b""), "");
     }
 
+    impl ReadDeadline for MemoryStream {
+        fn limit_next_read(&mut self, _: Duration) -> std::io::Result<()> { Ok(()) }
+    }
+
     /// 先に prefix を返し、その後のreadはタイムアウトとして失敗するストリーム
     struct StallingStream {
         prefix: std::io::Cursor<Vec<u8>>,
@@ -659,6 +695,111 @@ mod tests {
             self.output.write(buf)
         }
         fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    impl ReadDeadline for StallingStream {
+        fn limit_next_read(&mut self, _: Duration) -> std::io::Result<()> { Ok(()) }
+    }
+
+    /// 1回目のreadで first を返し、2回目のreadは delay だけ待ってから rest を返す
+    /// 待つ時間は limit_next_read で渡された上限で打ち切り、タイムアウトとして失敗する
+    struct SlowStream {
+        chunks: Vec<Vec<u8>>,
+        delay: Duration,
+        limit: Option<Duration>,
+        limits_seen: Vec<Duration>,
+        output: Vec<u8>,
+    }
+    impl SlowStream {
+        fn new(first: &[u8], rest: &[u8], delay: Duration) -> Self {
+            SlowStream {
+                chunks: vec![rest.to_vec(), first.to_vec()],
+                delay,
+                limit: None,
+                limits_seen: Vec::new(),
+                output: Vec::new(),
+            }
+        }
+    }
+    impl Read for SlowStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.chunks.len() == 1 {
+                match self.limit {
+                    Some(limit) if limit < self.delay => {
+                        std::thread::sleep(limit);
+                        return Err(std::io::ErrorKind::WouldBlock.into());
+                    }
+                    _ => std::thread::sleep(self.delay),
+                }
+            }
+            match self.chunks.pop() {
+                Some(chunk) => {
+                    buf[..chunk.len()].copy_from_slice(&chunk);
+                    Ok(chunk.len())
+                }
+                None => Ok(0),
+            }
+        }
+    }
+    impl Write for SlowStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    impl ReadDeadline for SlowStream {
+        fn limit_next_read(&mut self, timeout: Duration) -> std::io::Result<()> {
+            self.limit = Some(timeout);
+            self.limits_seen.push(timeout);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn request_line_deadline_is_a_total() {
+        let cache = small_cache();
+        let timeout = Duration::from_millis(100);
+
+        // 期限内に残りが届けば処理する
+        let mut in_time = SlowStream::new(
+            b"GET /cont", b"ainers HTTP/1.1\r\n\r\n", Duration::from_millis(10),
+        );
+        handle_connection(&mut in_time, &cache, timeout).unwrap();
+        assert_json_ok(&String::from_utf8(in_time.output).unwrap());
+
+        // 改行が届くのが期限の後なら、処理せずに打ち切る
+        // 2回目のreadで待つのは残り時間までで、合計が期限を大きく超えない
+        let mut late = SlowStream::new(
+            b"GET /cont", b"ainers HTTP/1.1\r\n\r\n", Duration::from_millis(1000),
+        );
+        let started = Instant::now();
+        assert!(handle_connection(&mut late, &cache, timeout).is_err());
+        assert!(late.output.is_empty());
+        assert!(started.elapsed() < Duration::from_millis(700), "{:?}", started.elapsed());
+        assert!(late.limits_seen.iter().all(|limit| *limit <= timeout));
+        assert!(late.limits_seen.windows(2).all(|w| w[1] <= w[0]));
+
+        // 上限を渡せないストリームでも、期限を過ぎて届いた改行は受け付けない
+        struct Unlimited(SlowStream);
+        impl Read for Unlimited {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.read(buf)
+            }
+        }
+        impl Write for Unlimited {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        impl ReadDeadline for Unlimited {
+            fn limit_next_read(&mut self, _: Duration) -> std::io::Result<()> { Ok(()) }
+        }
+        let mut unlimited = Unlimited(SlowStream::new(
+            b"GET /cont", b"ainers HTTP/1.1\r\n\r\n", Duration::from_millis(150),
+        ));
+        assert!(handle_connection(&mut unlimited, &cache, timeout).is_err());
+        assert!(unlimited.0.output.is_empty());
     }
 
     #[test]
@@ -983,5 +1124,24 @@ mod tests {
         // (16本を超えて同時に処理していれば、待たずに返ってきてしまう)
         assert_json_ok(&tcp_get_containers(addr));
         assert!(started.elapsed() >= TEST_TIMEOUT / 2, "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn late_request_line_is_not_served_over_tcp() {
+        let addr = spawn_server(TEST_TIMEOUT);
+
+        // 期限の少し前に一部だけ送り、期限を過ぎてから残りを送る
+        // (readごとのタイムアウトだけだと、ここで待ち時間が延びて処理されてしまう)
+        let mut stream = connect(addr);
+        std::thread::sleep(TEST_TIMEOUT * 2 / 3);
+        stream.write_all(b"GET /cont").unwrap();
+        std::thread::sleep(TEST_TIMEOUT * 2 / 3);
+        // サーバ側はすでに閉じているので、書き込みも読み取りも失敗しうる
+        let _ = stream.write_all(b"ainers HTTP/1.1\r\n\r\n");
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        assert_eq!(response, "");
+
+        assert_json_ok(&tcp_get_containers(addr));
     }
 }
