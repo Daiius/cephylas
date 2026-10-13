@@ -25,7 +25,7 @@ export const IoChart = async ({
 
   // 並列フェッチ。read + write × N コンテナを全部同時に発射する。
   // core は接続ごとにスレッドを起こして並列に処理する
-  // (同時 16 本まで。超えた分は 503 になり、このチャートは「取得中」の表示に落ちる)。
+  // (同時 16 本まで。超えた分は断られず、枠が空くまで core 側で待つ)。
   const [reads, writes] = await Promise.all([
     Promise.all(containerNames.map((name) => fetchIoStatus(name, 'read'))),
     Promise.all(containerNames.map((name) => fetchIoStatus(name, 'write'))),
