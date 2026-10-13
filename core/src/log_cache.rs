@@ -20,10 +20,10 @@ pub struct UsagePoint {
     pub time_ms: i64,
     pub cpu: Option<f32>,
     pub memory: Option<f32>,
-    pub read_kbps: Option<u32>,
-    pub write_kbps: Option<u32>,
-    pub recv_kbps: Option<u32>,
-    pub send_kbps: Option<u32>,
+    pub read_kbps: Option<f32>,
+    pub write_kbps: Option<f32>,
+    pub recv_kbps: Option<f32>,
+    pub send_kbps: Option<f32>,
 }
 
 /// APIが返す系列の種類
@@ -308,10 +308,10 @@ mod tests {
             time_ms,
             cpu: Some(value as f32),
             memory: Some(value as f32),
-            read_kbps: Some(value),
-            write_kbps: Some(value),
-            recv_kbps: Some(value),
-            send_kbps: Some(value),
+            read_kbps: Some(value as f32),
+            write_kbps: Some(value as f32),
+            recv_kbps: Some(value as f32),
+            send_kbps: Some(value as f32),
         }
     }
 
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn point_is_small() {
-        // 時刻 8 + Option<f32> 8 × 2 + Option<u32> 8 × 4
+        // 時刻 8 + Option<f32> 8 × 6（速度を小数にしても、整数のときと変わらない）
         assert_eq!(std::mem::size_of::<UsagePoint>(), 56);
     }
 
@@ -645,15 +645,34 @@ mod tests {
     }
 
     #[test]
+    fn fractional_rates_drive_the_downsampling() {
+        // 1 kB/s 未満の山も、縦軸の値として効く（0 に潰れていると選ばれない）
+        let mut cache = UsageCache::new();
+        let spike = BASE_MS + 4321 * TICK_MS;
+        for i in 0..(MAX_LOG_LENGTH as i64) {
+            let t = BASE_MS + i * TICK_MS;
+            let mut p = point(t, 0);
+            if t == spike {
+                p.send_kbps = Some(0.35);
+            }
+            cache.insert("web", p);
+        }
+        let sampled = cache
+            .downsample("web", &DownsampleOption::default(), Series::NetSend)
+            .unwrap();
+        assert!(sampled.iter().any(|p| p.time_ms == spike && p.send_kbps == Some(0.35)));
+    }
+
+    #[test]
     fn point_to_json_shapes() {
         let p = UsagePoint {
             time_ms: BASE_MS + 10_023,
             cpu: Some(1.234),
             memory: None,
-            read_kbps: Some(12),
+            read_kbps: Some(12.0),
             write_kbps: None,
-            recv_kbps: Some(0),
-            send_kbps: Some(3456),
+            recv_kbps: Some(0.35),
+            send_kbps: Some(3456.789),
         };
         assert_eq!(
             Series::Cpu.point_to_json(&p),
@@ -666,13 +685,13 @@ mod tests {
         for series in [Series::IoRead, Series::IoWrite] {
             assert_eq!(
                 series.point_to_json(&p),
-                r#"{"time":"2026-01-01T00:00:10.023Z","readkBps":12,"writekBps":null}"#,
+                r#"{"time":"2026-01-01T00:00:10.023Z","readkBps":12.00,"writekBps":null}"#,
             );
         }
         for series in [Series::NetRecv, Series::NetSend] {
             assert_eq!(
                 series.point_to_json(&p),
-                r#"{"time":"2026-01-01T00:00:10.023Z","recvkBps":0,"sendkBps":3456}"#,
+                r#"{"time":"2026-01-01T00:00:10.023Z","recvkBps":0.35,"sendkBps":3456.79}"#,
             );
         }
     }
