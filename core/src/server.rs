@@ -10,9 +10,21 @@ use super::log_cache;
 const LISTEN_ADDR: &str = "0.0.0.0:7878";
 /// 同時に処理する接続数の上限。超えた接続は枠が空くまで待たせる
 const MAX_CONNECTIONS: usize = 16;
-/// 1回の読み書きの待ち時間の上限
+/// 1回の読み取りの待ち時間の上限
 /// リクエスト行とヘッダ（空行まで）を読み切るまでの、合計の上限も兼ねる
+/// (接続の処理を始めた時点から数える。応答後の読み捨てもこの期限の残りまで)
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// 応答の書き込みの、合計の上限。書き込みを始めた時点から数える
+/// (値は読み取りの期限と同じだが、数え始める時点が違う。別の期限である)
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 応答を書くときに、1回のwriteに渡すバイト数の上限
+/// (writeのたびに期限を確かめるので、1回で渡す量を抑える)
+const WRITE_CHUNK_BYTES: usize = 64 * 1024;
+/// /usages/{kind} の本文の枠が空くのを待つ時間の上限。待ち始めた時点から数える
+/// 過ぎたら、応答せずに接続を閉じる
+const BODY_BUDGET_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// エラー出力に載せるパスの長さ（文字数）の上限
+const MAX_LOGGED_PATH_CHARS: usize = 128;
 /// リクエスト行（1行目）の長さの上限。超えたら400を返す
 const MAX_REQUEST_LINE_BYTES: usize = 1024;
 /// リクエスト行とヘッダを合わせた長さ（空行まで）の上限。超えたら431を返す
@@ -82,6 +94,7 @@ impl StatusCode {
 /// 全コンテナ分の本文は1本で数百kB〜数MBになり、送り終えるまで接続ごとに持ち続ける
 /// 同時接続の上限（16本）まで並ぶとメモリの上限を超えうるので、合計で抑える
 /// 超える分は断らず、先の応答が送り終わるまで待たせる
+/// (待つのは BODY_BUDGET_WAIT_TIMEOUT まで。過ぎたら応答せずに閉じる)
 const MAX_BULK_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// プロセス全体で1つの、/usages/{kind} の本文の枠
@@ -104,20 +117,30 @@ impl BodyBudget {
     }
 
     /// bytes 分の枠を取ります。合計が上限を超えるなら、空くまで待ちます
+    /// deadline までに空かなければ、枠を取らずに None を返します
     ///
     /// ほかに誰も枠を持っていなければ、上限より大きくても通します
     /// (1本で上限を超える本文を、永久に返せなくならないようにするため)
     /// 待つことがあるので、キャッシュのlockを持ったまま呼ばないこと
-    fn reserve(&'static self, bytes: usize) -> BodyReservation {
+    fn reserve_until(
+        &'static self,
+        bytes: usize,
+        deadline: Instant,
+    ) -> Option<BodyReservation> {
         // lockを持ったままpanicする箇所は無いが、poisonされていても止まらない
         let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
         while *used > 0 && used.saturating_add(bytes) > self.max {
-            used = self.released.wait(used)
-                .unwrap_or_else(|e| e.into_inner());
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            used = self.released.wait_timeout(used, remaining)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
         *used = used.saturating_add(bytes);
 
-        BodyReservation { budget: self, bytes }
+        Some(BodyReservation { budget: self, bytes })
     }
 }
 
@@ -184,10 +207,78 @@ impl Response {
     }
 }
 
-fn write_response<W: Write>(
+/// 次の1回のwriteで待つ時間の上限を変えられるストリーム
+///
+/// 応答の書き込みを合計時間で打ち切るために使います
+/// (writeごとの固定のタイムアウトだけでは、相手が少しずつ読み続けるかぎり
+///  writeが毎回進み、合計が上限を超えてしまう)
+/// timeout に 0 は渡しません
+trait WriteDeadline {
+    fn limit_next_write(&mut self, timeout: Duration) -> std::io::Result<()>;
+}
+
+impl WriteDeadline for std::net::TcpStream {
+    fn limit_next_write(&mut self, timeout: Duration) -> std::io::Result<()> {
+        self.set_write_timeout(Some(timeout))
+    }
+}
+
+/// 応答を書けなかった理由
+#[derive(Debug)]
+enum WriteError {
+    /// 書き込みの合計の期限を過ぎた（相手が読むのが遅すぎる）
+    TimedOut,
+    /// それ以外の失敗（相手が切った、など）
+    Io(std::io::Error),
+}
+
+/// data を最後まで書きます。合計の期限を過ぎたら、残りを書かずにやめます
+///
+/// started は書き込みを始めた時点で、timeout はそこからの期限です
+/// writeは WRITE_CHUNK_BYTES ずつ呼び、そのたびに残り時間だけ待ちます
+/// 残り時間が無ければ、writeを呼ばずに打ち切ります
+/// 1回のwriteが一部しか書けなかった場合は、残りを続けて書きます
+fn write_within<W: Write + WriteDeadline>(
+    stream: &mut W,
+    mut data: &[u8],
+    started: Instant,
+    timeout: Duration,
+) -> Result<(), WriteError> {
+    while !data.is_empty() {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(WriteError::TimedOut);
+        }
+        stream.limit_next_write(remaining).map_err(WriteError::Io)?;
+        let room = data.len().min(WRITE_CHUNK_BYTES);
+        match stream.write(&data[..room]) {
+            Ok(0) => return Err(WriteError::Io(std::io::ErrorKind::WriteZero.into())),
+            // n は room 以下だが、守らない実装でもpanicしないよう切り詰める
+            Ok(n) => data = &data[n.min(room)..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // 残り時間いっぱい待っても書けなかった
+            // (ソケットのタイムアウトは、OSによってどちらの種別でも返る)
+            Err(e) if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut,
+            ) => return Err(WriteError::TimedOut),
+            Err(e) => return Err(WriteError::Io(e)),
+        }
+    }
+
+    Ok(())
+}
+
+/// 応答を書き出します
+///
+/// timeout は、書き込みを始めてから書き終えるまでの合計の上限です
+/// 過ぎたら途中でやめます（応答は途中で切れる。呼び出し側が接続を閉じること）
+fn write_response<W: Write + WriteDeadline>(
     stream: &mut W,
     response: &Response,
-) -> Result<(), error::Error> {
+    timeout: Duration,
+) -> Result<(), WriteError> {
+    let started = Instant::now();
     let body_bytes = response.body.as_bytes();
     let head = format!(
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -197,9 +288,9 @@ fn write_response<W: Write>(
     );
     // ヘッダと本文を1つのバッファにまとめない
     // (本文が数MBになる応答で、送る間だけ本文の複製を持つことになるため)
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(body_bytes)?;
-    stream.flush()?;
+    write_within(stream, head.as_bytes(), started, timeout)?;
+    write_within(stream, body_bytes, started, timeout)?;
+    stream.flush().map_err(WriteError::Io)?;
 
     Ok(())
 }
@@ -386,14 +477,20 @@ fn usages_json_within(
 /// 待つ間にキャッシュが変わって本文が長くなっていたら、領域は伸ばさず、
 /// 枠を返してから、数え直した長さで取り直します
 /// 枠は応答に持たせ、送り終えて破棄されるまで返しません
+///
+/// 枠を待つのは、ここに入ってから wait_timeout までです（取り直しの分も合わせて数える）
+/// 過ぎても空かなければ、枠を取らずに RouteError::BodyBudgetTimedOut を返します
 fn usages_response(
     log_cache: &log_cache::SharedUsageCache,
     kind: log_cache::UsageKind,
     mut needed: usize,
     budget: &'static BodyBudget,
-) -> Result<Response, error::Error> {
+    wait_timeout: Duration,
+) -> Result<Response, RouteError> {
+    let deadline = Instant::now() + wait_timeout;
     for _ in 0..MAX_BULK_BUILD_ATTEMPTS {
-        let reservation = budget.reserve(needed);
+        let reservation = budget.reserve_until(needed, deadline)
+            .ok_or(RouteError::BodyBudgetTimedOut)?;
         let cache = log_cache.read().map_err(|e| e.to_string())?;
         if let Some(body) = usages_json_within(&cache, kind, needed) {
             return Ok(Response::reserved_json(body, reservation));
@@ -405,13 +502,60 @@ fn usages_response(
     Err("the cache kept growing while waiting for the body budget".into())
 }
 
+/// 応答を決められなかった理由
+#[derive(Debug)]
+enum RouteError {
+    /// 処理に失敗した（500を返す）
+    Internal(error::Error),
+    /// 本文の枠が期限までに空かなかった（応答せずに接続を閉じる）
+    BodyBudgetTimedOut,
+}
+
+impl From<String> for RouteError {
+    fn from(value: String) -> Self {
+        RouteError::Internal(value.into())
+    }
+}
+impl From<&str> for RouteError {
+    fn from(value: &str) -> Self {
+        RouteError::Internal(value.into())
+    }
+}
+
+/// 接続の処理で使う期限と、本文の枠
+#[derive(Clone, Copy)]
+struct Limits {
+    /// 接続の処理を始めてから、リクエスト行とヘッダを読み切るまでの期限
+    /// 応答後の読み捨ても、この期限の残りまで
+    read_timeout: Duration,
+    /// 応答の書き込みを始めてから、書き終えるまでの期限
+    write_timeout: Duration,
+    /// /usages/{kind} の本文の枠を待つ時間の上限
+    body_wait_timeout: Duration,
+    /// /usages/{kind} の本文の枠
+    body_budget: &'static BodyBudget,
+}
+
+impl Limits {
+    /// 本番の値
+    fn production() -> Self {
+        Limits {
+            read_timeout: IO_TIMEOUT,
+            write_timeout: WRITE_TIMEOUT,
+            body_wait_timeout: BODY_BUDGET_WAIT_TIMEOUT,
+            body_budget: &BULK_BODY_BUDGET,
+        }
+    }
+}
+
 /// パスから応答を決めます。ストリームには触りません
 /// 経路・コンテナ名・種別のどれかに一致しなければ404、
-/// 処理に失敗すればError型を返します（呼び出し側で500にします）
+/// 処理に失敗すれば RouteError::Internal を返します（呼び出し側で500にします）
 fn route(
     uri: &str,
     log_cache: &log_cache::SharedUsageCache,
-) -> Result<Response, error::Error> {
+    limits: &Limits,
+) -> Result<Response, RouteError> {
     let parts: Vec<&str> = uri.split('/')
         .filter(|s| !s.is_empty())
         .collect();
@@ -438,7 +582,10 @@ fn route(
                 let needed = usages_json_len(&cache, kind);
                 // 本文の枠を待つことがあるので、lockを手放してから取りにいく
                 drop(cache);
-                return usages_response(log_cache, kind, needed, &BULK_BODY_BUDGET);
+                return usages_response(
+                    log_cache, kind, needed,
+                    limits.body_budget, limits.body_wait_timeout,
+                );
             }
             None => None,
         },
@@ -452,23 +599,40 @@ fn route(
 }
 
 /// リクエスト行から応答を決めます
+/// 本文の枠が期限までに空かなかった場合は None を返します（応答せずに閉じる）
 fn respond(
     request_line: &str,
     log_cache: &log_cache::SharedUsageCache,
-) -> Response {
+    limits: &Limits,
+) -> Option<Response> {
     let request = match Request::try_from(request_line) {
         Ok(request) => request,
-        Err(_) => return Response::empty(StatusCode::BadRequest),
+        Err(_) => return Some(Response::empty(StatusCode::BadRequest)),
     };
     if request.method != "GET" {
-        return Response::empty(StatusCode::MethodNotAllowed);
+        return Some(Response::empty(StatusCode::MethodNotAllowed));
     }
-    match route(request.uri, log_cache) {
-        Ok(response) => response,
-        Err(e) => {
+    match route(request.uri, log_cache, limits) {
+        Ok(response) => Some(response),
+        Err(RouteError::Internal(e)) => {
             eprintln!("server: failed to handle request: {}", e);
-            Response::internal_error()
+            Some(Response::internal_error())
         }
+        Err(RouteError::BodyBudgetTimedOut) => None,
+    }
+}
+
+/// エラー出力に載せる、リクエストのパス
+///
+/// 外から来た文字列なので、制御文字は ? に置き換え、長さを切り詰めます
+/// リクエスト行が無い、または解釈できない場合は - にします
+fn logged_path(request_line: Option<&str>) -> String {
+    match request_line.map(Request::try_from) {
+        Some(Ok(request)) => request.uri.chars()
+            .take(MAX_LOGGED_PATH_CHARS)
+            .map(|c| if c.is_control() { '?' } else { c })
+            .collect(),
+        _ => "-".to_string(),
     }
 }
 
@@ -666,30 +830,49 @@ fn discard_until_closed<R: Read + ReadDeadline>(
 /// 応答は、ヘッダを空行まで読み捨ててから書きます（read_request_head）
 /// 期限内に空行まで届かなければ、応答せずにエラーを返します
 /// 応答を書き終えたら true、何も送らなかった相手に何も返さなかったら false を返します
-/// 応答（と、その本文の枠）は、戻る前に破棄します
+/// 応答（と、その本文の枠）は、戻る前に破棄します（途中で打ち切った場合も）
 ///
-/// started は接続の処理を始めた時点で、timeout はそこからの期限です
+/// started は接続の処理を始めた時点で、limits.read_timeout はそこからの期限です
+/// 応答の書き込みには、書き始めてからの合計の期限（limits.write_timeout）があります
+/// 過ぎたら書くのをやめてエラーを返します（応答は途中で切れる）
+/// 本文の枠が limits.body_wait_timeout までに空かなければ、応答せずにエラーを返します
+/// どちらのエラーにも、経路が分かるようにパスを載せます
 ///
-/// TcpStream固有の操作（書き込みのタイムアウトの設定、書き込み側を閉じる操作など）は
-/// accept側で行い、ここは Read + Write と ReadDeadline だけに依存させています
+/// TcpStream固有の操作（書き込み側を閉じる操作など）はaccept側で行い、
+/// ここは Read + Write と ReadDeadline・WriteDeadline だけに依存させています
 /// （メモリ上のストリームで試験するため）
-fn handle_connection<S: Read + Write + ReadDeadline>(
+fn handle_connection<S: Read + Write + ReadDeadline + WriteDeadline>(
     stream: &mut S,
     log_cache: &log_cache::SharedUsageCache,
     started: Instant,
-    timeout: Duration,
+    limits: &Limits,
 ) -> Result<bool, error::Error> {
-    let response = match read_request_head(stream, started, timeout)? {
+    let (line, response) = match read_request_head(stream, started, limits.read_timeout)? {
         // 何も送らなかった相手には何も返さない
         RequestHead::Closed => return Ok(false),
-        RequestHead::LineTooLong => Response::empty(StatusCode::BadRequest),
+        RequestHead::LineTooLong =>
+            (None, Some(Response::empty(StatusCode::BadRequest))),
         RequestHead::TooLarge =>
-            Response::empty(StatusCode::RequestHeaderFieldsTooLarge),
-        RequestHead::Line(line) => respond(&line, log_cache),
+            (None, Some(Response::empty(StatusCode::RequestHeaderFieldsTooLarge))),
+        RequestHead::Line(line) => {
+            let response = respond(&line, log_cache, limits);
+            (Some(line), response)
+        }
     };
-    write_response(stream, &response)?;
-
-    Ok(true)
+    let Some(response) = response else {
+        return Err(format!(
+            "gave up waiting for the body budget: {}",
+            logged_path(line.as_deref()),
+        ).into());
+    };
+    match write_response(stream, &response, limits.write_timeout) {
+        Ok(()) => Ok(true),
+        Err(WriteError::TimedOut) => Err(format!(
+            "timed out while writing the response: {}",
+            logged_path(line.as_deref()),
+        ).into()),
+        Err(WriteError::Io(e)) => Err(e.into()),
+    }
 }
 
 /// 同時に処理する接続数を数えるセマフォ
@@ -742,10 +925,11 @@ fn dispatch(
     mut stream: std::net::TcpStream,
     slot: ConnectionSlot,
     log_cache: &log_cache::SharedUsageCache,
-    timeout: Duration,
+    limits: Limits,
 ) {
-    if let Err(e) = stream.set_read_timeout(Some(timeout))
-        .and_then(|_| stream.set_write_timeout(Some(timeout)))
+    // どちらも、読み書きのたびに残り時間で設定し直す（ここで入れるのは初期値）
+    if let Err(e) = stream.set_read_timeout(Some(limits.read_timeout))
+        .and_then(|_| stream.set_write_timeout(Some(limits.write_timeout)))
     {
         eprintln!("server: failed to set timeouts: {}", e);
         return;
@@ -759,14 +943,14 @@ fn dispatch(
         .spawn(move || {
             let _slot = slot;
             let started = Instant::now();
-            match handle_connection(&mut stream, &log_cache, started, timeout) {
+            match handle_connection(&mut stream, &log_cache, started, &limits) {
                 // 応答を書き終えたら、書き込み側を先に閉じる（送り終わりを相手に伝える）
                 // そのあと、相手が閉じるまで残りの入力を読み捨ててから閉じる
                 // (応答と本文の枠は、ここに戻った時点で破棄されている)
                 // 相手がすでに切っていれば失敗するが、できることは無いので無視する
                 Ok(true) => {
                     if stream.shutdown(std::net::Shutdown::Write).is_ok() {
-                        discard_until_closed(&mut stream, started, timeout);
+                        discard_until_closed(&mut stream, started, limits.read_timeout);
                     }
                 }
                 Ok(false) => {}
@@ -786,14 +970,13 @@ fn dispatch(
 fn serve(
     listener: std::net::TcpListener,
     log_cache: &log_cache::SharedUsageCache,
-    timeout: Duration,
+    limits: Limits,
+    limiter: &Arc<ConnectionLimiter>,
 ) -> Result<(), error::Error> {
-    let limiter = ConnectionLimiter::new(MAX_CONNECTIONS);
-
     loop {
         let slot = limiter.acquire();
         match listener.accept() {
-            Ok((stream, _)) => dispatch(stream, slot, log_cache, timeout),
+            Ok((stream, _)) => dispatch(stream, slot, log_cache, limits),
             Err(e) => {
                 eprintln!("server: failed to accept a connection: {}", e);
                 drop(slot);
@@ -808,7 +991,10 @@ pub fn start_server(
 ) -> Result<(), error::Error> {
     let listener = std::net::TcpListener::bind(LISTEN_ADDR)?;
 
-    serve(listener, log_cache, IO_TIMEOUT)
+    serve(
+        listener, log_cache, Limits::production(),
+        &ConnectionLimiter::new(MAX_CONNECTIONS),
+    )
 }
 
 #[cfg(test)]
@@ -833,6 +1019,32 @@ mod tests {
             self.output.write(buf)
         }
         fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    /// 試験で本文の枠を待つ時間の上限（待ちきれずに打ち切られることが無い長さ）
+    const LONG_WAIT: Duration = Duration::from_secs(60);
+
+    /// 読み取りと書き込みの期限を timeout にそろえた設定。本文の枠はプロセス全体のもの
+    fn limits_of(timeout: Duration) -> Limits {
+        Limits {
+            read_timeout: timeout,
+            write_timeout: timeout,
+            body_wait_timeout: LONG_WAIT,
+            body_budget: &BULK_BODY_BUDGET,
+        }
+    }
+
+    impl BodyBudget {
+        /// 期限を気にせずに枠を取る
+        fn reserve(&'static self, bytes: usize) -> BodyReservation {
+            self.reserve_until(bytes, Instant::now() + LONG_WAIT)
+                .expect("the budget should be released within the test")
+        }
+    }
+
+    // 書き込み先がメモリなら、待つことが無い
+    impl WriteDeadline for Vec<u8> {
+        fn limit_next_write(&mut self, _: Duration) -> std::io::Result<()> { Ok(()) }
     }
 
     /// 2026-01-01T00:00:00Z
@@ -884,7 +1096,7 @@ mod tests {
             input: std::io::Cursor::new(input.to_vec()),
             output: Vec::new(),
         };
-        handle_connection(&mut stream, cache, Instant::now(), IO_TIMEOUT)
+        handle_connection(&mut stream, cache, Instant::now(), &limits_of(IO_TIMEOUT))
             .expect("handle_connection should not fail on a memory stream");
         String::from_utf8(stream.output).unwrap()
     }
@@ -1496,7 +1708,7 @@ mod tests {
             };
 
             // 取った枠・確保した領域・本文の長さが一致する
-            let response = usages_response(&cache, kind, len, budget).unwrap();
+            let response = usages_response(&cache, kind, len, budget, LONG_WAIT).unwrap();
             assert_eq!(response.body.len(), len);
             assert_eq!(response.body.capacity(), len);
             assert_eq!(used_bytes(budget), len);
@@ -1614,7 +1826,7 @@ mod tests {
         let kind = crate::log_cache::UsageKind::Io;
         let len = io_len(&cache);
 
-        let response = usages_response(&cache, kind, len, budget).unwrap();
+        let response = usages_response(&cache, kind, len, budget, LONG_WAIT).unwrap();
         assert_eq!(response.status, StatusCode::Ok);
         // 取った枠・確保した領域・本文の長さが一致する
         assert_eq!(response.body.len(), len);
@@ -1623,7 +1835,7 @@ mod tests {
 
         // 応答を書き出しても、破棄するまでは枠を持ち続ける
         let mut output = Vec::new();
-        write_response(&mut output, &response).unwrap();
+        write_response(&mut output, &response, IO_TIMEOUT).unwrap();
         assert_eq!(used_bytes(budget), len);
         drop(response);
         assert_eq!(used_bytes(budget), 0);
@@ -1631,14 +1843,14 @@ mod tests {
         // 数えたあとでキャッシュが伸びていた場合（渡された長さでは足りない）は、
         // 小さい枠のまま書かずに、数え直した長さで枠を取り直す
         for stale in [0, 1, len - 1] {
-            let response = usages_response(&cache, kind, stale, budget).unwrap();
+            let response = usages_response(&cache, kind, stale, budget, LONG_WAIT).unwrap();
             assert_eq!(response.body.capacity(), len);
             assert_eq!(used_bytes(budget), len);
             drop(response);
             assert_eq!(used_bytes(budget), 0);
         }
         // 縮んでいた場合は、取った枠の中に収める（枠は取った大きさのまま）
-        let response = usages_response(&cache, kind, len + 10, budget).unwrap();
+        let response = usages_response(&cache, kind, len + 10, budget, LONG_WAIT).unwrap();
         assert_eq!(response.body.len(), len);
         assert_eq!(response.body.capacity(), len + 10);
         assert_eq!(used_bytes(budget), len + 10);
@@ -1646,7 +1858,7 @@ mod tests {
 
         // 失敗したときは枠を残さない
         poison(&cache);
-        assert!(usages_response(&cache, kind, 1000, budget).is_err());
+        assert!(usages_response(&cache, kind, 1000, budget, LONG_WAIT).is_err());
         assert_eq!(used_bytes(budget), 0);
     }
 
@@ -1677,7 +1889,7 @@ mod tests {
             };
             std::thread::spawn(move || {
                 let kind = crate::log_cache::UsageKind::Io;
-                let response = usages_response(&cache, kind, needed, budget).unwrap();
+                let response = usages_response(&cache, kind, needed, budget, LONG_WAIT).unwrap();
                 // 実際に確保されている領域の合計を、枠とは別に数える
                 let capacity = response.body.capacity();
                 assert_eq!(capacity, len);
@@ -1757,7 +1969,7 @@ mod tests {
         let waiting_cache = Arc::clone(&cache);
         let waiter = std::thread::spawn(move || {
             let kind = crate::log_cache::UsageKind::Cpu;
-            usages_response(&waiting_cache, kind, 50, budget).unwrap().body
+            usages_response(&waiting_cache, kind, 50, budget, LONG_WAIT).unwrap().body
         });
         // 待ちに入るまで待つ（待っている間、使用量は変わらない）
         std::thread::sleep(Duration::from_millis(100));
@@ -1786,7 +1998,7 @@ mod tests {
         // ヘッダと本文を分けて書いても、届くバイト列は同じ
         let response = Response::json(r#"{"a":1}"#.to_string());
         let mut output = Vec::new();
-        write_response(&mut output, &response).unwrap();
+        write_response(&mut output, &response, IO_TIMEOUT).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
             concat!(
@@ -1906,6 +2118,9 @@ mod tests {
     impl ReadDeadline for MemoryStream {
         fn limit_next_read(&mut self, _: Duration) -> std::io::Result<()> { Ok(()) }
     }
+    impl WriteDeadline for MemoryStream {
+        fn limit_next_write(&mut self, _: Duration) -> std::io::Result<()> { Ok(()) }
+    }
 
     /// 先に prefix を返し、その後のreadはタイムアウトとして失敗するストリーム
     struct StallingStream {
@@ -1929,6 +2144,9 @@ mod tests {
 
     impl ReadDeadline for StallingStream {
         fn limit_next_read(&mut self, _: Duration) -> std::io::Result<()> { Ok(()) }
+    }
+    impl WriteDeadline for StallingStream {
+        fn limit_next_write(&mut self, _: Duration) -> std::io::Result<()> { Ok(()) }
     }
 
     /// 1回目のreadで first を返し、2回目のreadは delay だけ待ってから rest を返す
@@ -1984,6 +2202,9 @@ mod tests {
             Ok(())
         }
     }
+    impl WriteDeadline for SlowStream {
+        fn limit_next_write(&mut self, _: Duration) -> std::io::Result<()> { Ok(()) }
+    }
 
     #[test]
     fn request_line_deadline_is_a_total() {
@@ -1994,7 +2215,7 @@ mod tests {
         let mut in_time = SlowStream::new(
             b"GET /cont", b"ainers HTTP/1.1\r\n\r\n", Duration::from_millis(10),
         );
-        handle_connection(&mut in_time, &cache, Instant::now(), timeout).unwrap();
+        handle_connection(&mut in_time, &cache, Instant::now(), &limits_of(timeout)).unwrap();
         assert_json_ok(&String::from_utf8(in_time.output).unwrap());
 
         // 改行が届くのが期限の後なら、処理せずに打ち切る
@@ -2003,7 +2224,7 @@ mod tests {
             b"GET /cont", b"ainers HTTP/1.1\r\n\r\n", Duration::from_millis(1000),
         );
         let started = Instant::now();
-        assert!(handle_connection(&mut late, &cache, Instant::now(), timeout).is_err());
+        assert!(handle_connection(&mut late, &cache, Instant::now(), &limits_of(timeout)).is_err());
         assert!(late.output.is_empty());
         assert!(started.elapsed() < Duration::from_millis(700), "{:?}", started.elapsed());
         assert!(late.limits_seen.iter().all(|limit| *limit <= timeout));
@@ -2025,10 +2246,13 @@ mod tests {
         impl ReadDeadline for Unlimited {
             fn limit_next_read(&mut self, _: Duration) -> std::io::Result<()> { Ok(()) }
         }
+        impl WriteDeadline for Unlimited {
+            fn limit_next_write(&mut self, _: Duration) -> std::io::Result<()> { Ok(()) }
+        }
         let mut unlimited = Unlimited(SlowStream::new(
             b"GET /cont", b"ainers HTTP/1.1\r\n\r\n", Duration::from_millis(150),
         ));
-        assert!(handle_connection(&mut unlimited, &cache, Instant::now(), timeout).is_err());
+        assert!(handle_connection(&mut unlimited, &cache, Instant::now(), &limits_of(timeout)).is_err());
         assert!(unlimited.0.output.is_empty());
     }
 
@@ -2040,7 +2264,7 @@ mod tests {
             prefix: std::io::Cursor::new(Vec::new()),
             output: Vec::new(),
         };
-        assert!(handle_connection(&mut silent, &cache, Instant::now(), IO_TIMEOUT).is_ok());
+        assert!(handle_connection(&mut silent, &cache, Instant::now(), &limits_of(IO_TIMEOUT)).is_ok());
         assert!(silent.output.is_empty());
 
         // 途中まで受け取ってから失敗した接続は、エラーとして報告する
@@ -2048,7 +2272,7 @@ mod tests {
             prefix: std::io::Cursor::new(b"GET /cont".to_vec()),
             output: Vec::new(),
         };
-        assert!(handle_connection(&mut partial, &cache, Instant::now(), IO_TIMEOUT).is_err());
+        assert!(handle_connection(&mut partial, &cache, Instant::now(), &limits_of(IO_TIMEOUT)).is_err());
         assert!(partial.output.is_empty());
     }
 
@@ -2222,10 +2446,20 @@ mod tests {
         cache: SharedUsageCache,
         timeout: Duration,
     ) -> std::net::SocketAddr {
+        spawn_observed_server(cache, limits_of(timeout)).0
+    }
+
+    /// 接続の枠の使用数を外から見られるようにして serve を動かす
+    fn spawn_observed_server(
+        cache: SharedUsageCache,
+        limits: Limits,
+    ) -> (std::net::SocketAddr, Arc<ConnectionLimiter>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || serve(listener, &cache, timeout));
-        addr
+        let limiter = ConnectionLimiter::new(MAX_CONNECTIONS);
+        let serving = Arc::clone(&limiter);
+        std::thread::spawn(move || serve(listener, &cache, limits, &serving));
+        (addr, limiter)
     }
 
     fn connect(addr: std::net::SocketAddr) -> std::net::TcpStream {
@@ -2463,6 +2697,9 @@ mod tests {
     impl ReadDeadline for OneByteStream {
         fn limit_next_read(&mut self, _: Duration) -> std::io::Result<()> { Ok(()) }
     }
+    impl WriteDeadline for OneByteStream {
+        fn limit_next_write(&mut self, _: Duration) -> std::io::Result<()> { Ok(()) }
+    }
 
     /// 合計が total バイトちょうどになる、/containers へのリクエスト（空行まで）
     fn request_of_exactly(total: usize) -> Vec<u8> {
@@ -2525,7 +2762,7 @@ mod tests {
 
                     // 1バイトずつ届いても同じで、空行まで読んでから応答する
                     let mut stream = OneByteStream::new(request.as_bytes());
-                    handle_connection(&mut stream, &cache, Instant::now(), IO_TIMEOUT).unwrap();
+                    handle_connection(&mut stream, &cache, Instant::now(), &limits_of(IO_TIMEOUT)).unwrap();
                     assert_eq!(stream.consumed, request.len());
                     assert_status(&String::from_utf8(stream.output).unwrap(), status);
                 }
@@ -2545,7 +2782,7 @@ mod tests {
             ("GET /containers HTTP/1.1\n\n", "HTTP/1.1 200 OK"),
         ] {
             let mut stream = OneByteStream::new(format!("{}body body", head).as_bytes());
-            handle_connection(&mut stream, &cache, Instant::now(), IO_TIMEOUT).unwrap();
+            handle_connection(&mut stream, &cache, Instant::now(), &limits_of(IO_TIMEOUT)).unwrap();
             assert_eq!(stream.consumed, head.len());
             assert_status(&String::from_utf8(stream.output).unwrap(), status);
         }
@@ -2566,7 +2803,7 @@ mod tests {
         // 上限を超えたところで読むのをやめる（残りを読み続けない）
         let huge = request_of_exactly(MAX_REQUEST_HEAD_BYTES * 8);
         let mut stream = OneByteStream::new(&huge);
-        handle_connection(&mut stream, &cache, Instant::now(), IO_TIMEOUT).unwrap();
+        handle_connection(&mut stream, &cache, Instant::now(), &limits_of(IO_TIMEOUT)).unwrap();
         assert_eq!(stream.consumed, MAX_REQUEST_HEAD_BYTES + 1);
         assert_status(&String::from_utf8(stream.output).unwrap(), TOO_LARGE);
 
@@ -2581,7 +2818,7 @@ mod tests {
         let long_line = "a".repeat(MAX_REQUEST_HEAD_BYTES * 2);
         assert_status(&exchange(&cache, long_line.as_bytes()), "HTTP/1.1 400 Bad Request");
         let mut stream = OneByteStream::new(long_line.as_bytes());
-        handle_connection(&mut stream, &cache, Instant::now(), IO_TIMEOUT).unwrap();
+        handle_connection(&mut stream, &cache, Instant::now(), &limits_of(IO_TIMEOUT)).unwrap();
         assert_eq!(stream.consumed, MAX_REQUEST_HEAD_BYTES + 1);
     }
 
@@ -2595,7 +2832,7 @@ mod tests {
             "c".repeat(3000),
         );
         let mut stream = OneByteStream::new(request.as_bytes());
-        handle_connection(&mut stream, &cache, Instant::now(), IO_TIMEOUT).unwrap();
+        handle_connection(&mut stream, &cache, Instant::now(), &limits_of(IO_TIMEOUT)).unwrap();
         assert_eq!(stream.consumed, request.len());
         assert_status(
             &String::from_utf8(stream.output).unwrap(),
@@ -2617,7 +2854,7 @@ mod tests {
                 prefix: std::io::Cursor::new(prefix.to_vec()),
                 output: Vec::new(),
             };
-            assert!(handle_connection(&mut stalled, &cache, Instant::now(), IO_TIMEOUT).is_err());
+            assert!(handle_connection(&mut stalled, &cache, Instant::now(), &limits_of(IO_TIMEOUT)).is_err());
             assert!(stalled.output.is_empty());
         }
     }
@@ -2631,7 +2868,7 @@ mod tests {
         let mut in_time = SlowStream::new(
             b"GET /containers HTTP/1.1\r\nHost: x\r\n", b"\r\n", Duration::from_millis(10),
         );
-        handle_connection(&mut in_time, &cache, Instant::now(), timeout).unwrap();
+        handle_connection(&mut in_time, &cache, Instant::now(), &limits_of(timeout)).unwrap();
         assert_json_ok(&String::from_utf8(in_time.output).unwrap());
 
         // 空行が届くのが期限の後なら、応答せずに打ち切る
@@ -2640,7 +2877,7 @@ mod tests {
             b"GET /containers HTTP/1.1\r\nHost: x\r\n", b"\r\n", Duration::from_millis(1000),
         );
         let started = Instant::now();
-        assert!(handle_connection(&mut late, &cache, Instant::now(), timeout).is_err());
+        assert!(handle_connection(&mut late, &cache, Instant::now(), &limits_of(timeout)).is_err());
         assert!(late.output.is_empty());
         assert!(started.elapsed() < Duration::from_millis(700), "{:?}", started.elapsed());
         assert_eq!(late.limits_seen.len(), 2);
@@ -2660,7 +2897,7 @@ mod tests {
             (b"garbage", true),
         ] {
             let mut stream = OneByteStream::new(input);
-            let result = handle_connection(&mut stream, &cache, Instant::now(), IO_TIMEOUT);
+            let result = handle_connection(&mut stream, &cache, Instant::now(), &limits_of(IO_TIMEOUT));
             assert_eq!(result.unwrap(), responded);
             assert_eq!(stream.output.is_empty(), !responded);
         }
@@ -2674,7 +2911,7 @@ mod tests {
         let request = format!("{}{}", head, "b".repeat(10_000));
         let mut stream = OneByteStream::new(request.as_bytes());
         let started = Instant::now();
-        assert!(handle_connection(&mut stream, &cache, started, IO_TIMEOUT).unwrap());
+        assert!(handle_connection(&mut stream, &cache, started, &limits_of(IO_TIMEOUT)).unwrap());
         assert_eq!(stream.consumed, head.len());
         assert_eq!(discard_until_closed(&mut stream, started, IO_TIMEOUT), 10_000);
         assert_eq!(stream.consumed, request.len());
@@ -2988,5 +3225,393 @@ mod tests {
         let started = Instant::now();
         assert_json_ok(&tcp_get_containers(addr));
         assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    }
+
+    // ---- 応答の書き込みの期限 ----
+
+    /// 書き込みが少しずつしか進まないストリーム
+    ///
+    /// writeのたびに delay だけ待ち、多くても step バイトしか受け取らない
+    /// limit_next_write で渡された上限より delay が長ければ、上限まで待って
+    /// 1バイトも受け取らずにタイムアウトとして失敗する（ソケットと同じ振る舞い）
+    struct TrickleStream {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+        step: usize,
+        delay: Duration,
+        limit: Option<Duration>,
+        /// limit_next_write で渡された上限
+        limits_seen: Vec<Duration>,
+        /// 1回のwriteに渡された長さの最大
+        longest_write: usize,
+    }
+    impl TrickleStream {
+        fn new(input: &[u8], step: usize, delay: Duration) -> Self {
+            TrickleStream {
+                input: std::io::Cursor::new(input.to_vec()),
+                output: Vec::new(),
+                step,
+                delay,
+                limit: None,
+                limits_seen: Vec::new(),
+                longest_write: 0,
+            }
+        }
+    }
+    impl Read for TrickleStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+    impl Write for TrickleStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.longest_write = self.longest_write.max(buf.len());
+            match self.limit {
+                Some(limit) if limit < self.delay => {
+                    std::thread::sleep(limit);
+                    Err(std::io::ErrorKind::WouldBlock.into())
+                }
+                _ => {
+                    std::thread::sleep(self.delay);
+                    let n = buf.len().min(self.step);
+                    self.output.extend_from_slice(&buf[..n]);
+                    Ok(n)
+                }
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    impl ReadDeadline for TrickleStream {
+        fn limit_next_read(&mut self, _: Duration) -> std::io::Result<()> { Ok(()) }
+    }
+    impl WriteDeadline for TrickleStream {
+        fn limit_next_write(&mut self, timeout: Duration) -> std::io::Result<()> {
+            // TcpStream は 0 を渡すと失敗する
+            if timeout.is_zero() {
+                return Err(std::io::ErrorKind::InvalidInput.into());
+            }
+            self.limit = Some(timeout);
+            self.limits_seen.push(timeout);
+            Ok(())
+        }
+    }
+
+    /// 速い相手に届くバイト列（メモリにそのまま書いた結果）
+    fn bytes_of(response: &Response) -> Vec<u8> {
+        let mut output = Vec::new();
+        write_response(&mut output, response, IO_TIMEOUT).unwrap();
+        output
+    }
+
+    #[test]
+    fn partial_writes_deliver_every_byte_in_order() {
+        let body: String = (0..5000).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        let response = Response::json(body);
+        let expected = bytes_of(&response);
+
+        // 1回のwriteが 1 / 7 / 4096 バイトしか進まなくても、同じバイト列が届く
+        for step in [1, 7, 4096, usize::MAX] {
+            let mut stream = TrickleStream::new(b"", step, Duration::ZERO);
+            write_response(&mut stream, &response, IO_TIMEOUT).unwrap();
+            assert_eq!(stream.output, expected, "step = {}", step);
+            // writeのたびに、0 でない残り時間を設定している
+            assert!(!stream.limits_seen.is_empty());
+            assert!(stream.limits_seen.iter().all(|l| !l.is_zero() && *l <= IO_TIMEOUT));
+        }
+    }
+
+    #[test]
+    fn large_body_is_written_in_bounded_chunks() {
+        let response = Response::json("x".repeat(WRITE_CHUNK_BYTES * 3 + 123));
+        let mut stream = TrickleStream::new(b"", usize::MAX, Duration::ZERO);
+        write_response(&mut stream, &response, IO_TIMEOUT).unwrap();
+        assert_eq!(stream.output, bytes_of(&response));
+        assert_eq!(stream.longest_write, WRITE_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn write_is_cut_off_at_the_total_deadline_even_while_it_keeps_progressing() {
+        // 5ミリ秒ごとに 10 バイトずつ進む。writeは毎回成功するが、合計の期限で打ち切る
+        // (writeごとのタイムアウトだけなら、10kB を書き終える 5 秒後まで続いてしまう)
+        let timeout = Duration::from_millis(60);
+        let response = Response::json("x".repeat(10_000));
+        let total = bytes_of(&response).len();
+        let mut stream = TrickleStream::new(b"", 10, Duration::from_millis(5));
+
+        let started = Instant::now();
+        let result = write_response(&mut stream, &response, timeout);
+        let elapsed = started.elapsed();
+
+        assert!(matches!(result, Err(WriteError::TimedOut)), "{:?}", result);
+        assert!(elapsed >= timeout / 2, "{:?}", elapsed);
+        assert!(elapsed < timeout * 2, "{:?}", elapsed);
+        // 途中までは届いていて、そこで切れている（順序は保たれている）
+        assert!(!stream.output.is_empty() && stream.output.len() < total);
+        assert_eq!(stream.output[..], bytes_of(&response)[..stream.output.len()]);
+        // 残り時間は減っていき、0 は渡さない
+        assert!(stream.limits_seen.windows(2).all(|w| w[1] <= w[0]));
+        assert!(stream.limits_seen.iter().all(|l| !l.is_zero() && *l <= timeout));
+    }
+
+    #[test]
+    fn write_that_does_not_progress_is_cut_off_at_the_deadline() {
+        // 相手がまったく読まない。残り時間いっぱい待って、タイムアウトで失敗する
+        let timeout = Duration::from_millis(40);
+        let response = Response::json("x".repeat(100));
+        let mut stream = TrickleStream::new(b"", 10, Duration::from_secs(60));
+
+        let started = Instant::now();
+        let result = write_response(&mut stream, &response, timeout);
+        assert!(matches!(result, Err(WriteError::TimedOut)), "{:?}", result);
+        assert!(started.elapsed() < timeout * 3, "{:?}", started.elapsed());
+        assert_eq!(stream.output, b"");
+
+        // 期限が 0 なら、1回も書かずに打ち切る（0 のタイムアウトを設定しにいかない）
+        let mut stream = TrickleStream::new(b"", 10, Duration::ZERO);
+        let result = write_response(&mut stream, &response, Duration::ZERO);
+        assert!(matches!(result, Err(WriteError::TimedOut)), "{:?}", result);
+        assert!(stream.limits_seen.is_empty());
+        assert_eq!(stream.output, b"");
+    }
+
+    #[test]
+    fn write_failures_other_than_the_deadline_are_io_errors() {
+        struct Broken(std::io::Result<usize>);
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                match &self.0 {
+                    Ok(n) => Ok(*n),
+                    Err(e) => Err(e.kind().into()),
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        impl WriteDeadline for Broken {
+            fn limit_next_write(&mut self, _: Duration) -> std::io::Result<()> { Ok(()) }
+        }
+
+        let response = Response::json("x".repeat(100));
+        // 相手が切った
+        let mut reset = Broken(Err(std::io::ErrorKind::ConnectionReset.into()));
+        assert!(matches!(
+            write_response(&mut reset, &response, IO_TIMEOUT),
+            Err(WriteError::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionReset,
+        ));
+        // 1バイトも受け取らないwriteで、回り続けない
+        let mut zero = Broken(Ok(0));
+        assert!(matches!(
+            write_response(&mut zero, &response, IO_TIMEOUT),
+            Err(WriteError::Io(e)) if e.kind() == std::io::ErrorKind::WriteZero,
+        ));
+        // 渡した長さより多く書いたと返す実装でも、panicしない
+        let mut liar = Broken(Ok(usize::MAX));
+        assert!(write_response(&mut liar, &response, IO_TIMEOUT).is_ok());
+    }
+
+    #[test]
+    fn write_deadline_returns_the_budget_and_reports_the_path() {
+        let cache = cache_with(2000, time_ms_at);
+        let budget = leaked_budget(MAX_BULK_BODY_BYTES);
+        let limits = Limits {
+            read_timeout: IO_TIMEOUT,
+            write_timeout: Duration::from_millis(40),
+            body_wait_timeout: LONG_WAIT,
+            body_budget: budget,
+        };
+        let mut stream = TrickleStream::new(
+            b"GET /usages/io HTTP/1.1\r\nHost: x\r\n\r\n", 10, Duration::from_millis(5),
+        );
+
+        let error = handle_connection(&mut stream, &cache, Instant::now(), &limits)
+            .expect_err("the write should be cut off")
+            .to_string();
+        // どの経路かと、期限切れであることが分かる。本文は出さない
+        assert!(error.contains("timed out while writing the response"), "{}", error);
+        assert!(error.contains("/usages/io"), "{}", error);
+        assert!(!error.contains("container"), "{}", error);
+        assert!(error.len() < 200, "{}", error);
+        // 途中で打ち切っても、本文の枠は返っている
+        assert_eq!(used_bytes(budget), 0);
+        assert!(!stream.output.is_empty());
+        assert!(stream.output.len() < io_len(&cache));
+    }
+
+    #[test]
+    fn logged_path_is_bounded_and_has_no_control_characters() {
+        assert_eq!(logged_path(Some("GET /containers/web/cpu HTTP/1.1")), "/containers/web/cpu");
+        assert_eq!(logged_path(Some("GET /a\u{1b}[31m\tb HTTP/1.1")), "/a?[31m?b");
+        assert_eq!(logged_path(Some("garbage")), "-");
+        assert_eq!(logged_path(None), "-");
+        let long = format!("GET /{} HTTP/1.1", "é".repeat(1000));
+        assert_eq!(logged_path(Some(&long)).chars().count(), MAX_LOGGED_PATH_CHARS);
+    }
+
+    // ---- 本文の枠を待つ時間の上限 ----
+
+    #[test]
+    fn body_budget_wait_gives_up_at_the_deadline() {
+        let budget = leaked_budget(100);
+        let held = budget.reserve(80);
+
+        // 空かなければ、期限で諦める。枠は増えない
+        let wait = Duration::from_millis(40);
+        let started = Instant::now();
+        assert!(budget.reserve_until(30, Instant::now() + wait).is_none());
+        assert!(started.elapsed() >= wait, "{:?}", started.elapsed());
+        assert!(started.elapsed() < wait * 5, "{:?}", started.elapsed());
+        assert_eq!(used_bytes(budget), 80);
+        // 期限が過去でも、待たずに入る分は通す
+        assert!(budget.reserve_until(20, Instant::now()).is_some());
+        assert!(budget.reserve_until(30, Instant::now()).is_none());
+
+        // 期限までに空けば通る
+        let waiter = std::thread::spawn(move || {
+            budget.reserve_until(30, Instant::now() + LONG_WAIT).is_some()
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        drop(held);
+        assert!(waiter.join().unwrap());
+        assert_eq!(used_bytes(budget), 0);
+    }
+
+    #[test]
+    fn request_that_cannot_get_the_budget_is_closed_without_a_response() {
+        let cache = small_cache();
+        let budget = leaked_budget(100);
+        let _held = budget.reserve(100);
+        let limits = Limits {
+            read_timeout: IO_TIMEOUT,
+            write_timeout: IO_TIMEOUT,
+            body_wait_timeout: Duration::from_millis(40),
+            body_budget: budget,
+        };
+        let request = |path: &str| MemoryStream {
+            input: std::io::Cursor::new(
+                format!("GET {} HTTP/1.1\r\nHost: x\r\n\r\n", path).into_bytes(),
+            ),
+            output: Vec::new(),
+        };
+
+        // 新しいステータスは返さない。何も書かずに、エラーとして閉じる
+        let mut waiting = request("/usages/cpu");
+        let error = handle_connection(&mut waiting, &cache, Instant::now(), &limits)
+            .expect_err("the wait should be given up")
+            .to_string();
+        assert!(error.contains("gave up waiting for the body budget"), "{}", error);
+        assert!(error.contains("/usages/cpu"), "{}", error);
+        assert_eq!(waiting.output, b"");
+        assert_eq!(used_bytes(budget), 100);
+
+        // 枠を使わない経路は、枠が埋まっていても待たされない
+        let mut other = request("/containers");
+        assert!(handle_connection(&mut other, &cache, Instant::now(), &limits).unwrap());
+        assert_json_ok(&String::from_utf8(other.output).unwrap());
+    }
+
+    // ---- 応答の書き込みの期限（実際のTCP） ----
+
+    /// condition が成り立つまで待ち、掛かった時間を返す。give_up までに成り立たなければ None
+    fn wait_until<F: Fn() -> bool>(condition: F, give_up: Duration) -> Option<Duration> {
+        let started = Instant::now();
+        while started.elapsed() < give_up {
+            if condition() {
+                return Some(started.elapsed());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        None
+    }
+
+    #[test]
+    fn slow_reader_is_cut_off_at_the_write_deadline_and_frees_its_slot_and_budget() {
+        use std::sync::atomic::{ AtomicBool, Ordering };
+
+        // ループバックのバッファに収まらない本文を、少しずつ読み続ける相手に送る
+        // writeは毎回進むので、writeごとのタイムアウトだけでは読み終わるまで続いてしまう
+        let cache = widest_cache(64, 600);
+        let len = io_len(&cache);
+        assert!(len > 3_000_000, "{}", len);
+        // 1本分の枠。遅い相手が持っている間、次の /usages は枠待ちになる
+        let budget = leaked_budget(len);
+        let limits = Limits {
+            read_timeout: IO_TIMEOUT,
+            write_timeout: TEST_TIMEOUT,
+            body_wait_timeout: LONG_WAIT,
+            body_budget: budget,
+        };
+        let (addr, limiter) = spawn_observed_server(cache, limits);
+        const REQUEST: &[u8] = b"GET /usages/io HTTP/1.1\r\nHost: x\r\n\r\n";
+        // acceptのループが、次の接続のために枠を1つ持っている
+        const IDLE: usize = 1;
+
+        let mut slow = connect(addr);
+        slow.write_all(REQUEST).unwrap();
+        // 本文を作り終えて、書き込みが始まるまで待つ
+        wait_until(|| used_bytes(budget) == len, Duration::from_secs(10))
+            .expect("the slow reader should get the budget");
+        let write_started = Instant::now();
+
+        // 10ミリ秒ごとに 8kB ずつ読む（全部を読み切るには数秒掛かる速さ）
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_reading = Arc::clone(&stop);
+        let reader = std::thread::spawn(move || {
+            let mut received = 0;
+            let mut chunk = [0; 8 * 1024];
+            while !stop_reading.load(Ordering::SeqCst) {
+                match slow.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => received += n,
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            received
+        });
+
+        // その間に来た別の /usages。枠が空くまで待たされる
+        let other = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut stream = connect(addr);
+            stream.write_all(REQUEST).unwrap();
+            let mut first = [0; 1];
+            stream.read_exact(&mut first).unwrap();
+            let first_byte_after = started.elapsed();
+            let (rest, error) = read_until_closed(&mut stream);
+            (first_byte_after, 1 + rest.len(), error)
+        });
+        wait_until(|| active_count(&limiter) == IDLE + 2, Duration::from_secs(10))
+            .expect("both connections should be accepted");
+
+        // 遅い相手の接続は、期限の2倍以内に閉じられて、接続の枠が返る
+        let closed_after = wait_until(
+            || active_count(&limiter) < IDLE + 2,
+            (TEST_TIMEOUT * 2).saturating_sub(write_started.elapsed()),
+        ).map(|_| write_started.elapsed());
+        assert!(
+            closed_after.is_some(),
+            "the slow reader still holds its slot {:?} after the write started (deadline {:?})",
+            write_started.elapsed(), TEST_TIMEOUT,
+        );
+        // 期限より前に切ってはいない
+        assert!(closed_after.unwrap() >= TEST_TIMEOUT / 2, "{:?}", closed_after);
+
+        // 待っていた側は、期限 + 余裕の時間内に応答を受け取り、本文は最後まで届く
+        let (first_byte_after, received, error) = other.join().unwrap();
+        assert!(error.is_none(), "{:?}", error);
+        assert!(received > len, "{} <= {}", received, len);
+        assert!(
+            first_byte_after < TEST_TIMEOUT + Duration::from_secs(1),
+            "{:?}", first_byte_after,
+        );
+
+        // 遅い相手への応答は途中で切れている
+        stop.store(true, Ordering::SeqCst);
+        let slow_received = reader.join().unwrap();
+        assert!(slow_received < len, "{} >= {}", slow_received, len);
+
+        // 接続の枠も本文の枠も、すべて返っている
+        wait_until(
+            || active_count(&limiter) == IDLE && used_bytes(budget) == 0,
+            Duration::from_secs(10),
+        ).expect("every slot and the whole budget should be returned");
     }
 }
