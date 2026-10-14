@@ -4,7 +4,7 @@
 // - core の手前に置く Cloudflare Access を通るための、サービストークンのヘッダ
 //
 // 🔒 サーバ専用である。クライアントコンポーネントから import しない
-// (import してよいのは fetchers.ts と fetchers-legacy.ts だけ)。
+// (import してよいのは fetchers.ts だけ)。
 // 🔒 トークンの値を、ログ・エラーメッセージ・戻り値 (FetchResult や props) に含めない。
 // このモジュールが値を渡す先は、fetch の headers だけである。
 // 🔒 ヘッダを付ける fetch では、リダイレクトを追わない。独自のヘッダは別オリジンへの
@@ -13,12 +13,6 @@
 
 /** core への fetch 1 本の期限。応答のヘッダを待つ間と、本文を読む間の両方に効く。 */
 export const CORE_FETCH_TIMEOUT_MS = 5_000;
-
-/**
- * 互換の経路 (fetchers-legacy.ts) 全体の期限。`/containers` と、その後のコンテナ別の
- * リクエストのすべてで共有する。1 本ごとの期限と、この残り時間の短い方で打ち切られる。
- */
-export const LEGACY_PATH_TIMEOUT_MS = 10_000;
 
 export type AccessHeaders = {
   'CF-Access-Client-Id': string;
@@ -74,7 +68,7 @@ export type AccessFetchInit =
 export const toAccessFetchInit = (result: AccessHeadersResult): AccessFetchInit =>
   result.status === 'ok' ? { headers: result.headers, redirect: 'manual' } : {};
 
-// 警告はプロセスにつき 1 回だけ出す (リクエストのたびに出すと、互換の経路で数十行になる)。
+// 警告はプロセスにつき 1 回だけ出す (リクエストのたびに出すと、表示 1 回で 4 行になる)。
 let warned = false;
 
 // 環境変数を読んで、ヘッダとリダイレクトの指定を組み立てる。
@@ -99,28 +93,9 @@ const accessFetchInit = (): AccessFetchInit => {
 };
 
 /**
- * 複数のリクエストで共有する、全体の期限を張る。作った時点から数え始める。
- * 戻り値を coreFetch() の第 2 引数に渡す。
- */
-export const startCoreDeadline = (ms: number): AbortSignal => AbortSignal.timeout(ms);
-
-/**
- * 1 本の fetch に渡す signal を作る。作った時点から `timeoutMs` で切れる。
- * `overall` (全体の期限) があるときは、どちらか早い方で切れる。
- * `overall` がすでに切れていれば、最初から切れた signal になる (fetch は送らずに失敗する)。
- */
-export const coreFetchSignal = (
-  timeoutMs: number,
-  overall?: AbortSignal,
-): AbortSignal => {
-  const own = AbortSignal.timeout(timeoutMs);
-  return overall ? AbortSignal.any([own, overall]) : own;
-};
-
-/**
  * core へ GET を送る。core へのリクエストは、必ずこれを通す (fetch を直接呼ばない)。
  *
- * - **期限**: 1 本につき CORE_FETCH_TIMEOUT_MS。`overall` を渡すと、その期限とも連動する。
+ * - **期限**: 1 本につき CORE_FETCH_TIMEOUT_MS。
  *   期限は応答の本文の読み取り (`response.json()` など) にも効く。期限切れでは、
  *   fetch または本文の読み取りが `TimeoutError` (DOMException) で失敗する。
  *   文言は固定で、URL もヘッダの値も含まない。呼び出し側は接続の失敗と同じに扱う。
@@ -128,8 +103,8 @@ export const coreFetchSignal = (
  *   付けたリクエストが 3xx を受けたときは、追わずにその応答が返る (`ok` は false)。
  *   呼び出し側では「2xx 以外のステータス」として扱われる。
  */
-export const coreFetch = (url: string, overall?: AbortSignal): Promise<Response> =>
+export const coreFetch = (url: string): Promise<Response> =>
   fetch(url, {
     ...accessFetchInit(),
-    signal: coreFetchSignal(CORE_FETCH_TIMEOUT_MS, overall),
+    signal: AbortSignal.timeout(CORE_FETCH_TIMEOUT_MS),
   });
