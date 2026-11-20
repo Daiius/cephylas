@@ -1007,10 +1007,16 @@ fn calc_usages_with(
     Some(Usages { time: time.to_string(), millis, usages })
 }
 
+/// ログへの追記の間だけ持つロック
+/// 終了するスレッド（main）は、これを取ってからプロセスを終える
+/// (書き込みの途中で終了して、行が途中で切れたファイルを残さないため)
+pub static LOG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn log_daily<T: AsRef<std::path::Path>, S: AsRef<str>>(
     file_path: T,
     content: S,
 ) -> Result<(), error::Error> {
+    let _writing = LOG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1079,8 +1085,12 @@ fn store_usages(
     true
 }
 
+/// 止まれの印（shutdown）が立ったら、次の tick を始めずに戻ります
+/// tick の間の待ちの最中なら、待たずにすぐ戻ります
+/// tick の処理中（収集・追記）なら、その tick を終えてから戻ります
 pub fn log_json(
-    log_cache: &log_cache::SharedUsageCache
+    log_cache: &log_cache::SharedUsageCache,
+    shutdown: &crate::shutdown::Shutdown,
 ) -> Result<(), error::Error> {
     let socket_path = "/var/run/docker.sock";
 
@@ -1111,7 +1121,10 @@ pub fn log_json(
         };
         let (wait, _) = schedule.advance(now);
         println!("waiting {} millis...", wait.as_millis());
-        std::thread::sleep(wait);
+        if shutdown.wait_timeout(wait) {
+            println!("logger: stopped");
+            return Ok(());
+        }
 
         // 待ったあとの現在時刻。取れなければ、この tick では時間による削除をしない
         let now_millis = match get_now_as_millis() {

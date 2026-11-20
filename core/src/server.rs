@@ -5,6 +5,7 @@ use std::time::{ Duration, Instant };
 
 use super::error;
 use super::log_cache;
+use super::shutdown::Shutdown;
 
 /// 待ち受けるアドレス
 const LISTEN_ADDR: &str = "0.0.0.0:7878";
@@ -34,6 +35,9 @@ const MAX_LINGER_BYTES: usize = 64 * 1024;
 /// accept自体が失敗したときに次を試すまでの待ち時間
 /// (ファイル記述子の枯渇などで失敗が続くときに空回りしないため)
 const ACCEPT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// 停止の合図のあと、処理中の接続が終わるのを待つ時間の上限
+/// (全体の上限 main::SHUTDOWN_TIMEOUT より短くする。過ぎた接続は、プロセスの終了で切れる)
+const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// 500応答の本文。内部のエラー文字列は標準エラー出力にだけ出す
 const INTERNAL_ERROR_BODY: &str = "internal server error";
 
@@ -903,6 +907,15 @@ impl ConnectionLimiter {
 
         ConnectionSlot { limiter: Arc::clone(self) }
     }
+
+    /// 使用中の枠が 0 になるまで、最長 timeout だけ待ちます。0 になれば true
+    fn wait_idle(&self, timeout: Duration) -> bool {
+        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let (active, _) = self.released
+            .wait_timeout_while(active, timeout, |active| *active > 0)
+            .unwrap_or_else(|e| e.into_inner());
+        *active == 0
+    }
 }
 
 /// 同時接続数の1枠。Dropで必ず返すので、ハンドラがpanicしても枠は戻る
@@ -915,7 +928,8 @@ impl Drop for ConnectionSlot {
         let mut active = self.limiter.active.lock()
             .unwrap_or_else(|e| e.into_inner());
         *active -= 1;
-        self.limiter.released.notify_one();
+        // acquire で待つスレッドと、wait_idle で待つスレッドの両方がいるので全員起こす
+        self.limiter.released.notify_all();
     }
 }
 
@@ -962,8 +976,41 @@ fn dispatch(
     }
 }
 
+/// 待ち受けているアドレスに繋がる、ループバックのアドレス
+/// (0.0.0.0 / :: で待ち受けていても、自分自身に繋げるように)
+fn loopback_of(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    let ip = match addr.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() =>
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() =>
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    std::net::SocketAddr::new(ip, addr.port())
+}
+
+/// 止まれの印が立ったら、自分自身に1本繋いで、acceptで止まっているループを起こすスレッド
+fn spawn_waker(
+    listener: &std::net::TcpListener,
+    shutdown: &Arc<Shutdown>,
+) -> Result<(), error::Error> {
+    let addr = loopback_of(listener.local_addr()?);
+    let shutdown = Arc::clone(shutdown);
+    std::thread::Builder::new()
+        .name("accept-waker".to_string())
+        .spawn(move || {
+            shutdown.wait();
+            if let Err(e) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)) {
+                eprintln!("server: failed to wake the accept loop: {}", e);
+            }
+        })?;
+    Ok(())
+}
+
 /// 接続を受け付け続けます
 /// 1本の接続の失敗でも、accept自体の失敗でもループを抜けません
+/// 止まれの印（shutdown）が立ったら、新しい接続を受け付けずに戻ります
+/// (acceptで止まっている間は、spawn_waker が自分自身に繋いで起こす)
 ///
 /// 枠を取ってからacceptするので、上限に達している間に来た接続は
 /// 断られずにOSのbacklogで待ちます
@@ -972,10 +1019,17 @@ fn serve(
     log_cache: &log_cache::SharedUsageCache,
     limits: Limits,
     limiter: &Arc<ConnectionLimiter>,
+    shutdown: &Arc<Shutdown>,
 ) -> Result<(), error::Error> {
+    spawn_waker(&listener, shutdown)?;
     loop {
         let slot = limiter.acquire();
-        match listener.accept() {
+        let accepted = listener.accept();
+        if shutdown.is_triggered() {
+            // 受け付けた接続（起こすための接続か、印のあとに来たもの）は処理せずに閉じる
+            return Ok(());
+        }
+        match accepted {
             Ok((stream, _)) => dispatch(stream, slot, log_cache, limits),
             Err(e) => {
                 eprintln!("server: failed to accept a connection: {}", e);
@@ -986,15 +1040,20 @@ fn serve(
     }
 }
 
+/// 待ち受けを始め、止まれの印が立つまで接続を受け付けます
+/// 印が立ったら、処理中の接続が終わるのを最長 CONNECTION_DRAIN_TIMEOUT だけ待って戻ります
 pub fn start_server(
-    log_cache: &log_cache::SharedUsageCache
+    log_cache: &log_cache::SharedUsageCache,
+    shutdown: &Arc<Shutdown>,
 ) -> Result<(), error::Error> {
     let listener = std::net::TcpListener::bind(LISTEN_ADDR)?;
+    let limiter = ConnectionLimiter::new(MAX_CONNECTIONS);
 
-    serve(
-        listener, log_cache, Limits::production(),
-        &ConnectionLimiter::new(MAX_CONNECTIONS),
-    )
+    serve(listener, log_cache, Limits::production(), &limiter, shutdown)?;
+    if !limiter.wait_idle(CONNECTION_DRAIN_TIMEOUT) {
+        eprintln!("server: some connections were still open at shutdown");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2458,8 +2517,53 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let limiter = ConnectionLimiter::new(MAX_CONNECTIONS);
         let serving = Arc::clone(&limiter);
-        std::thread::spawn(move || serve(listener, &cache, limits, &serving));
+        // 止めない（印を立てない）。スレッドは試験プロセスの終了まで残る
+        let shutdown = Shutdown::new();
+        std::thread::spawn(move || serve(listener, &cache, limits, &serving, &shutdown));
         (addr, limiter)
+    }
+
+    #[test]
+    fn serve_returns_when_shutdown_is_triggered() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let limiter = ConnectionLimiter::new(MAX_CONNECTIONS);
+        let serving = Arc::clone(&limiter);
+        let shutdown = Shutdown::new();
+        let stopping = Arc::clone(&shutdown);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = serve(
+                listener, &small_cache(), limits_of(TEST_TIMEOUT), &serving, &stopping,
+            );
+            done_tx.send(result.is_ok()).unwrap();
+        });
+
+        // 止める前は応答する
+        let response = try_tcp_exchange(addr, b"GET /containers HTTP/1.1\r\n\r\n").unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{}", response);
+
+        // 処理中の接続（何も送らない）を1本持ったまま止める
+        let idle = connect(addr);
+        std::thread::sleep(Duration::from_millis(50));
+        shutdown.trigger();
+        let returned = done_rx.recv_timeout(Duration::from_secs(5))
+            .expect("serve did not return after shutdown");
+        assert!(returned);
+
+        // 処理中の接続は読み取りの期限で閉じ、枠が空く
+        assert!(limiter.wait_idle(Duration::from_secs(5)));
+        drop(idle);
+    }
+
+    #[test]
+    fn loopback_of_replaces_unspecified_addresses() {
+        let v4: std::net::SocketAddr = "0.0.0.0:7878".parse().unwrap();
+        assert_eq!(loopback_of(v4), "127.0.0.1:7878".parse().unwrap());
+        let v6: std::net::SocketAddr = "[::]:7878".parse().unwrap();
+        assert_eq!(loopback_of(v6), "[::1]:7878".parse().unwrap());
+        let other: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert_eq!(loopback_of(other), other);
     }
 
     fn connect(addr: std::net::SocketAddr) -> std::net::TcpStream {

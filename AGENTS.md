@@ -71,6 +71,11 @@ core 単体は `core/` で `cargo build` / `cargo run` できる。カレント�
 🔒 テストで `./log/` に書き込まない。`/var/run/docker.sock` に依存するテストを書かない
 （ソケットやファイルを使う処理は、文字列や `BufRead` を受け取る関数に切り出して試す）。
 
+core は SIGTERM / SIGINT を受けると、受け付けをやめ、処理中の接続を最長 5 秒待ち、logger の tick を
+終えてから終了コード 0 で終わる（全体の上限 8 秒。docker の猶予 10 秒に収める）。合図の処理は依存を
+足さず、libc の `signal` を `core/src/shutdown.rs` で直接呼んでいる。止める処理を足すときは、
+合図ではなく `Shutdown`（止まれの印）を受け取る形にしてテストする。詳細は [prd/02-core.md](./prd/02-core.md) §停止。
+
 ### dev 用の compose
 
 `pnpm dev` / `pnpm dev:core` / `pnpm down` は、`compose.yml` に `compose.dev.yml` を重ねて読む。

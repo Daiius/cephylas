@@ -27,6 +27,19 @@ server スレッドは接続を受け付けるだけで、リクエストの処�
 動き続ける（§gap）。起動時のログの復元に失敗した場合は、スレッドを起こす前にプロセスが終了する
 （§キャッシュ）。
 
+### 停止
+
+**SIGTERM / SIGINT を受けたら、自分から終了コード 0 で終わる**（`core/src/shutdown.rs`・`main.rs`）。
+コンテナの中ではこのバイナリが PID 1 で、ハンドラが無いと合図は無視され、`docker stop` の猶予の
+あとに SIGKILL される。合図のハンドラは印を立てるだけで、main のスレッドが 100 ms ごとに見て、
+各スレッドに止まれの印（`Shutdown`）を知らせる。
+
+- server は新しい接続を受け付けずに accept のループを抜け（自分自身に 1 本繋いで accept を起こす）、
+  処理中の接続が終わるのを最長 5 秒待つ（`CONNECTION_DRAIN_TIMEOUT`）。
+- logger は tick の間の待ちの最中ならすぐ戻り、tick の処理中ならその tick を終えてから戻る。
+- 全体の上限は 8 秒（`SHUTDOWN_TIMEOUT`。docker の既定の猶予 10 秒に収める）。過ぎたら待たずに終える。
+  どちらの場合も、ログへの追記のロック（`LOG_WRITE_LOCK`）を取ってから終えるので、追記の途中で終わらない。
+
 ## 収集
 
 **Docker Engine API を `/var/run/docker.sock` 越しに叩く。** HTTP クライアントは使わず、
