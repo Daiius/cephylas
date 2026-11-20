@@ -1007,19 +1007,36 @@ fn calc_usages_with(
     Some(Usages { time: time.to_string(), millis, usages })
 }
 
+/// ログに1行追記します
+///
+/// ファイルが空でなく、末尾が改行で終わっていなければ（前の追記が途中で切れていれば）、
+/// 先に行の区切りを書いてから追記します。書きかけの行は、起動のときの復元で
+/// その1行だけ読み飛ばされ、今回の行は独立した行として読める
+/// 末尾の確かめと追記は同じハンドルで行う（開き直さないので、ローテーションと競合しない）
 fn log_daily<T: AsRef<std::path::Path>, S: AsRef<str>>(
     file_path: T,
     content: S,
 ) -> Result<(), error::Error> {
+    use std::io::{ Read, Seek };
+
     let mut file = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
-        .write(true)
         .open(file_path)?;
-    std::io::Write::write_all(
-        &mut file, 
-        ("".to_string() + content.as_ref() + "\r\n").as_bytes()
-    )?;
+    let mut line = String::new();
+    if file.metadata()?.len() > 0 {
+        let mut last = [0u8; 1];
+        file.seek(std::io::SeekFrom::End(-1))?;
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            line.push_str("\r\n");
+        }
+    }
+    line.push_str(content.as_ref());
+    line.push_str("\r\n");
+    // append で開いているので、読む位置に関わらず末尾に書かれる
+    std::io::Write::write_all(&mut file, line.as_bytes())?;
 
     Ok(())
 }
@@ -1079,8 +1096,12 @@ fn store_usages(
     true
 }
 
+/// 止まれの印（shutdown）が立ったら、次の tick を始めずに戻ります
+/// tick の間の待ちの最中なら、待たずにすぐ戻ります
+/// tick の処理中（収集・追記）なら、その tick を終えてから戻ります
 pub fn log_json(
-    log_cache: &log_cache::SharedUsageCache
+    log_cache: &log_cache::SharedUsageCache,
+    shutdown: &crate::shutdown::Shutdown,
 ) -> Result<(), error::Error> {
     let socket_path = "/var/run/docker.sock";
 
@@ -1111,7 +1132,10 @@ pub fn log_json(
         };
         let (wait, _) = schedule.advance(now);
         println!("waiting {} millis...", wait.as_millis());
-        std::thread::sleep(wait);
+        if shutdown.wait_timeout(wait) {
+            println!("logger: stopped");
+            return Ok(());
+        }
 
         // 待ったあとの現在時刻。取れなければ、この tick では時間による削除をしない
         let now_millis = match get_now_as_millis() {
@@ -2312,6 +2336,56 @@ mod tests {
         ]))).unwrap();
         logger.tick(Ok(collected(vec![]))).unwrap();
         assert_eq!(names(&logger), vec!["web"]);
+    }
+
+    /// 試験用のログのパス（一時ディレクトリ。./log には書かない）
+    fn temp_log_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "cephylas-test-{}-{}-{:?}",
+            name, std::process::id(), std::thread::current().id(),
+        ))
+    }
+
+    #[test]
+    fn log_daily_starts_a_new_line_after_a_truncated_line() {
+        let path = temp_log_path("truncated-log");
+        let ok = log_line("2026-01-01T00:00:10Z", &[("web", 1.0, 11)]);
+        // 前の追記が途中で切れた（行の区切りが無い）
+        let truncated = &log_line("2026-01-01T00:00:20Z", &[("web", 2.0, 12)])[..40];
+        std::fs::write(&path, format!("{}{}", ok, truncated)).unwrap();
+
+        let next = log_line("2026-01-01T00:00:30Z", &[("web", 3.0, 13)]);
+        log_daily(&path, next.trim_end()).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(written, format!("{}{}\r\n{}", ok, truncated, next));
+        let (summary, cache) = restore(written.as_bytes(), 0);
+        assert_eq!(summary.restored, 2);
+        assert_eq!(
+            restored_times(&cache, "web"),
+            vec!["2026-01-01T00:00:10.000Z", "2026-01-01T00:00:30.000Z"],
+        );
+    }
+
+    #[test]
+    fn log_daily_adds_no_separator_to_an_empty_or_complete_file() {
+        let path = temp_log_path("complete-log");
+        let first = log_line("2026-01-01T00:00:10Z", &[("web", 1.0, 11)]);
+        let second = log_line("2026-01-01T00:00:20Z", &[("web", 2.0, 12)]);
+        // 無いファイル（作られる）
+        log_daily(&path, first.trim_end()).unwrap();
+        // 末尾が正常なファイル
+        log_daily(&path, second.trim_end()).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, format!("{}{}", first, second));
+
+        // 空のファイル
+        std::fs::write(&path, "").unwrap();
+        log_daily(&path, first.trim_end()).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(written, first);
     }
 
     #[test]
