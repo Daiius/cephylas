@@ -69,7 +69,9 @@ fn main() -> Result<(), error::Error> {
     let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
     stop.trigger();
     // 出力は別のスレッドで行う（標準エラー出力が詰まっても、main の待ちと終了を止めない）
-    std::thread::spawn(|| eprintln!("received a stop signal, shutting down"));
+    // スレッドを作れなくても（スレッド数・メモリの枯渇）、通知を省いて待ちへ進む（`thread::spawn` は失敗で panic する。OCL-76D9099D）
+    let _ = std::thread::Builder::new()
+        .spawn(|| eprintln!("received a stop signal, shutting down"));
     // logger は tick の途中ならそれを終えて、server は処理中の接続を待って（上限あり）戻る
     let all_finished = || {
         logger_handle.as_ref().is_none_or(|h| h.is_finished()) && server_handle.is_finished()
