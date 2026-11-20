@@ -10,17 +10,13 @@ use std::time::{ Duration, Instant };
 
 use log_cache::create_shared_cache;
 
-/// 停止の合図に気づいてから、プロセスを終えるまでの上限（追記のロックを待つ分を含む）
+/// 停止の合図に気づいてから、プロセスを終えるまでの上限
 /// docker stop の猶予（既定 10 秒）を過ぎると SIGKILL されるので、それより短くする
 /// (server が処理中の接続を待つ上限 5 秒に、余裕を足した値)
 /// 合図に気づくまでの POLL_INTERVAL と、ポーリングの刻みを足しても 8.2 秒ほどで、9 秒に収まる
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
-/// SHUTDOWN_TIMEOUT のうち、最後に追記のロックを待つために残しておく時間
-const LOG_LOCK_RESERVE: Duration = Duration::from_millis(500);
 /// main のスレッドが、合図とスレッドの終了を確かめる間隔
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// 追記のロックを取り直す間隔
-const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// スレッドの本体が失敗で終わっていたら、その内容を標準エラー出力に出します
 ///
@@ -70,43 +66,19 @@ fn main() -> Result<(), error::Error> {
         std::thread::sleep(POLL_INTERVAL);
     }
 
-    eprintln!("received a stop signal, shutting down");
     let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
     stop.trigger();
+    // 出力は別のスレッドで行う（標準エラー出力が詰まっても、main の待ちと終了を止めない）
+    std::thread::spawn(|| eprintln!("received a stop signal, shutting down"));
     // logger は tick の途中ならそれを終えて、server は処理中の接続を待って（上限あり）戻る
     let all_finished = || {
         logger_handle.as_ref().is_none_or(|h| h.is_finished()) && server_handle.is_finished()
     };
-    while !all_finished() && Instant::now() + LOG_LOCK_RESERVE < deadline {
+    while !all_finished() && Instant::now() < deadline {
         std::thread::sleep(POLL_INTERVAL);
     }
-    if !all_finished() {
-        eprintln!("shutdown timed out, exiting anyway");
-    }
-
-    // 追記の途中で終えない。ロックを取ったら、解放せずにプロセスを終える
-    // (logger がまだ動いていても、次の追記はこのロックで止まる)
-    // ロックは上限の残りまでしか待たない。取れなければ（ログの I/O が止まっているなど）
-    // あきらめて終える。そのときは書きかけの行が残りうる（復元のときに、その行は読み飛ばされる）
-    loop {
-        match log::LOG_WRITE_LOCK.try_lock() {
-            Ok(guard) => {
-                std::mem::forget(guard);
-                break;
-            }
-            Err(std::sync::TryLockError::Poisoned(e)) => {
-                std::mem::forget(e.into_inner());
-                break;
-            }
-            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                std::thread::sleep(LOCK_RETRY_INTERVAL);
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {
-                eprintln!("could not wait for the log write to finish, exiting anyway");
-                break;
-            }
-        }
-    }
+    // 上限に達しても、ここでは何も出力しない（出力が詰まると終了が止まる）
+    // そのとき logger が追記の途中なら行が途中で切れうるが、次の追記は新しい行から始まる（log_daily）
     Ok(())
 }
 
